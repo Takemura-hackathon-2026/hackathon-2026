@@ -1,8 +1,5 @@
-markdown_content = """# プロジェクト名 (Project Name)
+#ハッカソン2026-大型ディスプレイ編
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-
-> ここにプロダクトを一言で表すキャッチコピーを記載します（例：画像認識を活用した新しい〇〇体験を提供するアプリ）
 
 ## 💡 エレベーターピッチ (Elevator Pitch)
 ハッカソンの審査員に向けて、解決したい課題とプロダクトの魅力を簡潔に伝えます。
@@ -10,7 +7,6 @@ markdown_content = """# プロジェクト名 (Project Name)
 
 ## 🎥 デモ・スクリーンショット (Demo)
 （ここにプロダクトの実際の画面や、動作しているGIFアニメーション、YouTubeのデモ動画リンクなどを貼ります。ハッカソンでは**ビジュアルで動いていること**を示すのが非常に重要です）
-![Demo](https://via.placeholder.com/600x400?text=App+Screenshot+or+GIF)
 
 ## 🔥 特徴 (Features)
 - **特徴1**: コンピュータビジョンを用いた〇〇の自動解析
