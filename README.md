@@ -3,9 +3,13 @@
 32×32 RGB LED パネル 72 枚（6列×12段、論理解像度 192×384）を、Ubuntu 主機の集中処理と
 Raspberry Pi 4 台の外部同期で駆動する縦型ディスプレー・ゲームのリポジトリ。
 
-現在の内容は **最小単位（表示経路の検証まで）** に限定している。計画書 §13 の実装開始条件のうち
-1〜3（DVD テストモード、FC6 全色パターン、MSX16 全色パターン）と、その 4 分割 UDP 送信までを実装済み。
-ゲーム本体・カメラ入力・Pi クライアント・M5 同期はまだ実装していない。
+現在の内容は **表示経路の検証** に限定している。計画書 §13 の実装開始条件のうち
+1〜3（DVD テストモード、FC6 全色パターン、MSX16 全色パターン）とその 4 分割 UDP 送信、
+加えて主機側テストモード 4 種（TEST1〜4）と Pi 常駐表示クライアントの同期段階 A
+（受信 → CRC 確認 → LUT 変換 → HUB75 出力）までを実装済み。
+
+未実装: READY バリア（同期段階 B）、M5 の物理同期パルス、ゲーム本体、カメラ入力。
+実機（LED パネル・Pi・M5）での確認も未実施。
 
 ## デモ
 
@@ -25,6 +29,8 @@ cd host/test_mode && python3 test_mode.py --render-mode mask --color-style solid
 .
 ├── docs/
 │   ├── RGB_LEDインタラクティブゲーム開発計画書.md   # 計画書（v1.2 + 52色化の注記）
+│   ├── NETWORK.md                                  # セグメント・IP・ポート設計、設定コマンド
+│   ├── nat.conf                                    # Mac→親機のインターネット共有用 pf ルール
 │   └── assets/                                     # 構成図・同期図・パレット見本・デモGIF
 ├── host/                       # Ubuntu 主機側
 │   ├── palettes.py             # FC6(52色) / MSX16(16色) 定義
@@ -32,12 +38,21 @@ cd host/test_mode && python3 test_mode.py --render-mode mask --color-style solid
 │   ├── palettes.json           # 機械可読定義
 │   ├── fc6.pal / msx16.pal     # 生 RGB パレット（156 byte / 48 byte）
 │   └── test_mode/
-│       ├── test_mode.py        # WebP を DVD ロゴ風に反射移動・量子化・4分割 UDP 送信
+│       ├── test_mode.py        # TEST1: WebP を DVD ロゴ風に反射移動・量子化・4分割 UDP 送信
+│       ├── test2_status.py     # TEST2: 主機と各 Pi の状態を文字で交互表示（死活受信付き）
+│       ├── test3_quad.py       # TEST3: 4帯それぞれへ同じ画像を出す個体確認モード
+│       ├── test4_super.py      # TEST4(SUPERTESTMODE): 斜めN字配置の仮想画面 576×192
 │       ├── palette_check.py    # 全色テストパターン
 │       ├── udp_preview.py      # 1台PCで4領域を再結合する開発用プレビュー
 │       ├── selftest.py         # 機械的検証（0 errors が完了条件）
-│       └── test.webp           # 動作確認用素材（64×64）
+│       ├── test.webp           # 動作確認用素材（64×64）
+│       └── color_bar.webp      # TEST3 の既定素材（カラーバー）
+├── pi-client/                  # Raspberry Pi 常駐表示クライアント（C++ / rpi-rgb-led-matrix）
+│   ├── pi_client.cc            # UDP受信 → CRC確認 → LUT変換 → HUB75 出力、UDP 5101 へ死活報告
+│   ├── Makefile                # RGB_LIB_DISTRIBUTION で rpi-rgb-led-matrix を指す
+│   └── README.md               # ビルド手順・オプション・死活報告の形式
 ├── requirements.txt
+├── LICENSE                     # AGPL-3.0
 └── README.md
 ```
 
@@ -70,12 +85,42 @@ Ubuntu 主機ではディストリビューションのパッケージでもよ�
 sudo apt install python3-numpy python3-opencv
 ```
 
-## 実行
+## テストモード
 
-ローカルプレビュー（DVD テストモード）:
+主機側に 4 種類のテストモードがある。いずれも `--send --pi ...`（4 個）で 4 台の Pi へ送信でき、
+省略するとローカルプレビューのみになる。
+
+| モード | スクリプト | 内容 | 主な確認対象 |
+|---|---|---|---|
+| TEST1 | `test_mode.py` | WebP を 192×384 内で DVD ロゴ風に反射移動 | パレット量子化・4分割・伝送経路 |
+| TEST2 | `test2_status.py` | 主機 → PI1 → … → PI4 とページを切り替えて状態を文字表示 | 各 Pi の死活・FPS・欠損（UDP 5101 の報告） |
+| TEST3 | `test3_quad.py` | 192×96 の 4 帯すべてへ同じ画像を描く | 1 台ごとの色再現・向き・欠け |
+| TEST4 | `test4_super.py` | 斜めN字配置の仮想画面 576×192 で反射移動 | 縦一列でない物理配置の割り当て |
+
+TEST1（DVD テストモード）:
 
 ```bash
 cd host/test_mode && python3 test_mode.py --image test.webp --palette fc6
+```
+
+TEST2（状態表示。各 Pi の死活報告を UDP 5101 で受ける）:
+
+```bash
+cd host/test_mode && python3 test2_status.py --send \
+  --pi 192.168.10.101:5000 --pi 192.168.10.102:5000 \
+  --pi 192.168.10.103:5000 --pi 192.168.10.104:5000
+```
+
+TEST3（4 帯へ同じ画像。既定素材は `color_bar.webp`）:
+
+```bash
+cd host/test_mode && python3 test3_quad.py --palette fc6
+```
+
+TEST4（SUPERTESTMODE。配置は `test4_super.py` の `LAYOUT` で定義）:
+
+```bash
+cd host/test_mode && python3 test4_super.py --image test.webp
 ```
 
 全色テストパターン:
@@ -97,18 +142,62 @@ cd host/test_mode && python3 test_mode.py --no-preview --send \
 
 詳細は [host/test_mode/README.md](host/test_mode/README.md)。
 
+## Pi 常駐表示クライアント
+
+`pi-client/` は Raspberry Pi 上で動く C++ の表示専用プロセス。UDP 5000 で 192×96 の
+パレットインデックス配列を受け、CRC32 とパレット範囲を確認してから固定 LUT で RGB へ
+変換し、HUB75 へ出力する。1 秒ごとに UDP 5101 へ死活報告（`PIHEALTH ...`）を返し、
+TEST2 がそれを受けて表示する。
+
+ビルドには [rpi-rgb-led-matrix](https://github.com/hzeller/rpi-rgb-led-matrix) が必要。
+
+```bash
+cd pi-client && make RGB_LIB_DISTRIBUTION=$HOME/rpi-rgb-led-matrix
+```
+
+```bash
+sudo ./pi_client --target-id 0
+```
+
+詳細・オプションは [pi-client/README.md](pi-client/README.md)。
+
 ## 検証
 
 ```bash
 cd host/test_mode && python3 selftest.py
 ```
 
-`0 errors` を完了条件とする。実機（LED パネル・Pi・M5）での確認は未実施。
+`0 errors` を完了条件とする。selftest が見るのは主機側の送出経路（パレット範囲、量子化距離、
+4 分割の再結合一致、UDP ヘッダー＋CRC32 の往復、反射移動の画面内保持）で、TEST2〜4 と
+`pi-client` は対象外。実機（LED パネル・Pi・M5）での確認も未実施。
+
+## ネットワーク
+
+セグメント構成・Piのアドレス割当・ポート・設定コマンドは [docs/NETWORK.md](docs/NETWORK.md) にまとめてある。
+
+| セグメント | 用途 | ネットワーク |
+|---|---|---|
+| A | フレーム配信（親機 `enp2s0` — スイッチ — Pi×4） | `192.168.10.0/24`、Piは `.101`〜`.104`（`target_id` = 第4オクテット − 101） |
+| B | 開発機直結（親機 `enp3s0` — Mac `en7`） | `192.168.20.0/24` |
 
 ## 次のステップ（計画書 §9.1 の優先順位）
 
-1. Pi 常駐表示クライアント（`pi-client/`: UDP 受信 → CRC 確認 → READY → GPIO 同期待機 → HUB75 出力）
-2. 4 台の論理フレーム同期（READY バリア、`frame_id` 一致）
-3. M5StickC Plus の物理同期パルスと走査位相の評価
+1. 実機での表示確認（`pi-client` のビルドと 4 台での TEST1〜4）
+2. 4 台の論理フレーム同期（READY 返送・UDP 5100 のバリア、`frame_id` 一致）
+3. M5StickC Plus の物理同期パルスと GPIO 同期待機、走査位相の評価
 4. ゲーム本体
 5. USB カメラ入力（背景差分による LEFT/RIGHT/JUMP 判定）
+
+## ライセンス
+
+GNU Affero General Public License v3.0 以降（AGPL-3.0-or-later）。全文は [LICENSE](LICENSE) を参照。
+
+Copyright (C) 2026 eightman
+
+このプログラムはフリーソフトウェアです。フリーソフトウェアファウンデーションが公開する
+GNU Affero General Public License（バージョン3、またはそれ以降のバージョン）の
+条件に従って、再配布および改変ができます。
+
+このプログラムは有用であることを願って配布されますが、**無保証**です。商品性や特定目的
+への適合性の保証も含め、いかなる保証もありません。詳細は GNU Affero General Public
+License を参照してください。
