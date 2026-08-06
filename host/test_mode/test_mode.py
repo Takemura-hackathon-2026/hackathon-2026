@@ -424,11 +424,33 @@ class UdpFrameSender:
         self.socket.close()
 
     def send(self, frame_id: int, palette_mode: PaletteMode, indexed: np.ndarray) -> None:
+        """192x384 の全画面を上から 96 行ずつ 4 分割して送る。"""
         if indexed.shape != (CANVAS_HEIGHT, CANVAS_WIDTH):
             raise ValueError(f"想定外のフレーム形状: {indexed.shape}")
+        slices = [
+            indexed[target_id * PI_HEIGHT:(target_id + 1) * PI_HEIGHT, :]
+            for target_id in range(PI_COUNT)
+        ]
+        self.send_slices(frame_id, palette_mode, slices)
+
+    def send_slices(
+        self,
+        frame_id: int,
+        palette_mode: PaletteMode,
+        slices: Sequence[np.ndarray],
+    ) -> None:
+        """target_id 順に並べた 192x96 のスライスをそのまま送る。
+
+        論理画面の並びが縦一列でない特殊配置でも、割り当てだけを差し替えて
+        同じ伝送経路を使えるようにする。
+        """
+        if len(slices) != PI_COUNT:
+            raise ValueError(f"スライスは {PI_COUNT} 枚必要: {len(slices)}")
         for target_id, destination in enumerate(self.destinations):
-            y0 = target_id * PI_HEIGHT
-            payload = indexed[y0:y0 + PI_HEIGHT, :].tobytes(order="C")
+            piece = slices[target_id]
+            if piece.shape != (PI_HEIGHT, CANVAS_WIDTH):
+                raise ValueError(f"想定外のスライス形状: {piece.shape}")
+            payload = np.ascontiguousarray(piece).tobytes(order="C")
             chunk_count = math.ceil(len(payload) / self.chunk_size)
             for chunk_id in range(chunk_count):
                 start = chunk_id * self.chunk_size
