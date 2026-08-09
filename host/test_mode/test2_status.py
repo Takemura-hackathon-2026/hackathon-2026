@@ -33,6 +33,11 @@ from palettes import (  # noqa: E402
     MSX16_BLACK,
     PaletteMode,
 )
+from profiler import (  # noqa: E402
+    Profiler,
+    add_profile_arguments,
+    finish_profile,
+)
 from test_mode import (  # noqa: E402
     CANVAS_HEIGHT,
     CANVAS_WIDTH,
@@ -250,6 +255,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chunk-size", type=int, default=1200)
     parser.add_argument("--preview-scale", type=int, default=2)
     parser.add_argument("--no-preview", action="store_true")
+    add_profile_arguments(parser)
     return parser
 
 
@@ -258,12 +264,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     palette_mode = PaletteMode.FC6 if args.palette == "fc6" else PaletteMode.MSX16
 
     destinations = [parse_pi(item) for item in args.pi] if args.pi else []
+    profiler = Profiler(enabled=args.profile, label="TEST2")
     sender: UdpFrameSender | None = None
     if args.send:
         if len(destinations) != PI_COUNT:
             print("error: --send には --pi をちょうど 4 個指定する", file=sys.stderr)
             return 2
-        sender = UdpFrameSender(destinations, args.chunk_size)
+        sender = UdpFrameSender(destinations, args.chunk_size, profiler)
 
     renderer = StatusRenderer(
         palette_mode, [host for host, _port in destinations] or ["-"] * PI_COUNT
@@ -298,41 +305,47 @@ def main(argv: Sequence[str] | None = None) -> int:
             now = time.monotonic()
             if args.seconds > 0 and now - started >= args.seconds:
                 break
-            health.poll()
+            with profiler.span("health"):
+                health.poll()
 
             page = int((now - started) / args.page_seconds) % page_count
-            if page == 0:
-                indexed = renderer.render_host(frame_id, send_fps)
-            else:
-                target = page - 1
-                state, fields, age = health.status(target)
-                host = health.source.get(
-                    target,
-                    destinations[target][0] if target < len(destinations) else "-",
-                )
-                indexed = renderer.render_pi(target, state, fields, age, host)
+            with profiler.span("render"):
+                if page == 0:
+                    indexed = renderer.render_host(frame_id, send_fps)
+                else:
+                    target = page - 1
+                    state, fields, age = health.status(target)
+                    host = health.source.get(
+                        target,
+                        destinations[target][0] if target < len(destinations) else "-",
+                    )
+                    indexed = renderer.render_pi(target, state, fields, age, host)
 
             if args.boundary:
                 for index in range(1, PI_COUNT):
                     indexed[index * PI_HEIGHT, :] = DIM_COLOR[palette_mode]
 
             if sender is not None:
-                sender.send(frame_id, palette_mode, indexed)
+                with profiler.span("send"):
+                    sender.send(frame_id, palette_mode, indexed)
 
             if not args.no_preview:
-                preview = renderer.rgb_preview(indexed)
-                if args.preview_scale != 1:
-                    preview = cv2.resize(
-                        preview,
-                        (CANVAS_WIDTH * args.preview_scale,
-                         CANVAS_HEIGHT * args.preview_scale),
-                        interpolation=cv2.INTER_NEAREST,
-                    )
-                cv2.imshow("TEST2 status", preview)
-                if (cv2.waitKey(1) & 0xFF) in (27, ord("q")):
-                    running = False
+                with profiler.span("preview"):
+                    preview = renderer.rgb_preview(indexed)
+                    if args.preview_scale != 1:
+                        preview = cv2.resize(
+                            preview,
+                            (CANVAS_WIDTH * args.preview_scale,
+                             CANVAS_HEIGHT * args.preview_scale),
+                            interpolation=cv2.INTER_NEAREST,
+                        )
+                    cv2.imshow("TEST2 status", preview)
+                with profiler.span("waitkey"):
+                    if (cv2.waitKey(1) & 0xFF) in (27, ord("q")):
+                        running = False
 
             frame_id += 1
+            profiler.frame()
             fps_window_frames += 1
             if now - fps_window_start >= 1.0:
                 send_fps = fps_window_frames / (now - fps_window_start)
@@ -342,15 +355,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             next_deadline += frame_period
             sleep_time = next_deadline - time.monotonic()
             if sleep_time > 0:
-                time.sleep(sleep_time)
-            elif sleep_time < -frame_period:
-                next_deadline = time.monotonic()
+                profiler.count("slack_us", int(sleep_time * 1e6))
+                with profiler.span("sleep"):
+                    time.sleep(sleep_time)
+            else:
+                profiler.count("late_frames")
+                if sleep_time < -frame_period:
+                    next_deadline = time.monotonic()
     finally:
         if sender is not None:
             sender.close()
         health.close()
         if not args.no_preview:
             cv2.destroyAllWindows()
+        finish_profile(profiler, args.profile_json)
     return 0
 
 

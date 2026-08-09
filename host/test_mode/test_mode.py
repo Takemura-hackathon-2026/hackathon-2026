@@ -40,6 +40,11 @@ from palettes import (  # noqa: E402
     MSX16_TRANSPARENT,
     PaletteMode,
 )
+from profiler import (  # noqa: E402
+    Profiler,
+    add_profile_arguments,
+    finish_profile,
+)
 
 CANVAS_WIDTH = 192
 CANVAS_HEIGHT = 384
@@ -410,13 +415,20 @@ def record_gif(
 # UDP 送信
 # ---------------------------------------------------------------------------
 class UdpFrameSender:
-    def __init__(self, destinations: Sequence[tuple[str, int]], chunk_size: int) -> None:
+    def __init__(
+        self,
+        destinations: Sequence[tuple[str, int]],
+        chunk_size: int,
+        profiler: Profiler | None = None,
+    ) -> None:
         if len(destinations) != PI_COUNT:
             raise ValueError(f"Pi の宛先はちょうど {PI_COUNT} 件必要")
         if not 256 <= chunk_size <= 1400:
             raise ValueError("チャンクサイズは 256〜1400 バイト")
         self.destinations = destinations
         self.chunk_size = chunk_size
+        # 計測は既定で無効。無効な Profiler は span() が素通りする。
+        self.profiler = profiler if profiler is not None else Profiler(enabled=False)
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
 
@@ -446,16 +458,19 @@ class UdpFrameSender:
         """
         if len(slices) != PI_COUNT:
             raise ValueError(f"スライスは {PI_COUNT} 枚必要: {len(slices)}")
+        profiler = self.profiler
         for target_id, destination in enumerate(self.destinations):
             piece = slices[target_id]
             if piece.shape != (PI_HEIGHT, CANVAS_WIDTH):
                 raise ValueError(f"想定外のスライス形状: {piece.shape}")
-            payload = np.ascontiguousarray(piece).tobytes(order="C")
+            with profiler.span("tobytes"):
+                payload = np.ascontiguousarray(piece).tobytes(order="C")
             chunk_count = math.ceil(len(payload) / self.chunk_size)
             for chunk_id in range(chunk_count):
                 start = chunk_id * self.chunk_size
                 chunk = payload[start:start + self.chunk_size]
-                crc = zlib.crc32(chunk) & 0xFFFFFFFF
+                with profiler.span("crc32"):
+                    crc = zlib.crc32(chunk) & 0xFFFFFFFF
                 header = HEADER.pack(
                     MAGIC,
                     frame_id & 0xFFFFFFFF,
@@ -466,7 +481,13 @@ class UdpFrameSender:
                     len(chunk),
                     crc,
                 )
-                self.socket.sendto(header + chunk, destination)
+                packet = header + chunk
+                with profiler.span("sendto"):
+                    self.socket.sendto(packet, destination)
+                profiler.count("tx_packets")
+                profiler.count("tx_bytes", len(packet))
+                # 実際に線に乗るバイト数（Ethernet 18 + preamble/IFG 20 + IP 20 + UDP 8）。
+                profiler.count("wire_bytes", len(packet) + 66)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -519,6 +540,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gif-seconds", type=float, default=8.0, help="GIF の長さ [秒]")
     parser.add_argument("--gif-fps", type=float, default=20.0, help="GIF のフレームレート")
     parser.add_argument("--gif-scale", type=int, default=2, help="GIF の拡大率（最近傍）")
+    add_profile_arguments(parser)
     return parser
 
 
@@ -582,13 +604,17 @@ def main(argv: Iterable[str] | None = None) -> int:
         )
         return 0
 
+    profiler = Profiler(enabled=args.profile, label="TEST1")
+
     sender: UdpFrameSender | None = None
     if args.send:
         if len(args.pi) != PI_COUNT:
             print("error: --send には --pi HOST[:PORT] をちょうど 4 個指定する", file=sys.stderr)
             return 2
         try:
-            sender = UdpFrameSender([parse_pi(item) for item in args.pi], args.chunk_size)
+            sender = UdpFrameSender(
+                [parse_pi(item) for item in args.pi], args.chunk_size, profiler
+            )
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
@@ -623,25 +649,30 @@ def main(argv: Iterable[str] | None = None) -> int:
             dt = min(0.1, max(0.0, now - last_update))
             last_update = now
             if not paused:
-                renderer.update(dt)
+                with profiler.span("update"):
+                    renderer.update(dt)
 
-            indexed = renderer.render(now)
+            with profiler.span("render"):
+                indexed = renderer.render(now)
             if sender is not None:
-                sender.send(frame_id, renderer.palette_mode, indexed)
+                with profiler.span("send"):
+                    sender.send(frame_id, renderer.palette_mode, indexed)
 
             if not args.no_preview:
-                preview = renderer.rgb_preview(indexed)
-                if args.preview_scale != 1:
-                    preview = cv2.resize(
-                        preview,
-                        (
-                            CANVAS_WIDTH * args.preview_scale,
-                            CANVAS_HEIGHT * args.preview_scale,
-                        ),
-                        interpolation=cv2.INTER_NEAREST,
-                    )
-                cv2.imshow("RGB LED test mode", preview)
-                key = cv2.waitKey(1) & 0xFF
+                with profiler.span("preview"):
+                    preview = renderer.rgb_preview(indexed)
+                    if args.preview_scale != 1:
+                        preview = cv2.resize(
+                            preview,
+                            (
+                                CANVAS_WIDTH * args.preview_scale,
+                                CANVAS_HEIGHT * args.preview_scale,
+                            ),
+                            interpolation=cv2.INTER_NEAREST,
+                        )
+                    cv2.imshow("RGB LED test mode", preview)
+                with profiler.span("waitkey"):
+                    key = cv2.waitKey(1) & 0xFF
                 if key in (27, ord("q")):
                     running = False
                 elif key == ord(" "):
@@ -658,18 +689,25 @@ def main(argv: Iterable[str] | None = None) -> int:
                     renderer.reset()
 
             frame_id += 1
+            profiler.frame()
             next_deadline += frame_period
             sleep_time = next_deadline - time.monotonic()
             if sleep_time > 0:
-                time.sleep(sleep_time)
-            elif sleep_time < -frame_period:
-                # 期限を過ぎた分は捨て、遅延フレームを連射しない。
-                next_deadline = time.monotonic()
+                # 余った時間。ここが 0 に近いなら主機が律速している。
+                profiler.count("slack_us", int(sleep_time * 1e6))
+                with profiler.span("sleep"):
+                    time.sleep(sleep_time)
+            else:
+                profiler.count("late_frames")
+                if sleep_time < -frame_period:
+                    # 期限を過ぎた分は捨て、遅延フレームを連射しない。
+                    next_deadline = time.monotonic()
     finally:
         if sender is not None:
             sender.close()
         if not args.no_preview:
             cv2.destroyAllWindows()
+        finish_profile(profiler, args.profile_json)
 
     return 0
 

@@ -32,6 +32,11 @@ from palettes import (  # noqa: E402
     MSX16_BLACK,
     PaletteMode,
 )
+from profiler import (  # noqa: E402
+    Profiler,
+    add_profile_arguments,
+    finish_profile,
+)
 from test_mode import (  # noqa: E402
     CANVAS_HEIGHT,
     CANVAS_WIDTH,
@@ -127,6 +132,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--preview-scale", type=int, default=2)
     parser.add_argument("--no-preview", action="store_true")
     parser.add_argument("--save", type=Path, default=None, help="プレビューをPNG保存して終了")
+    add_profile_arguments(parser)
     return parser
 
 
@@ -173,12 +179,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"saved: {args.save}")
         return 0
 
+    profiler = Profiler(enabled=args.profile, label="TEST3")
     sender: UdpFrameSender | None = None
     if args.send:
         if len(args.pi) != PI_COUNT:
             print("error: --send には --pi をちょうど 4 個指定する", file=sys.stderr)
             return 2
-        sender = UdpFrameSender([parse_pi(item) for item in args.pi], args.chunk_size)
+        sender = UdpFrameSender(
+            [parse_pi(item) for item in args.pi], args.chunk_size, profiler
+        )
 
     running = True
 
@@ -205,23 +214,32 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.seconds > 0 and now - started >= args.seconds:
                 break
             if sender is not None:
-                sender.send(frame_id, palette_mode, frame)
+                with profiler.span("send"):
+                    sender.send(frame_id, palette_mode, frame)
             if not args.no_preview:
-                cv2.imshow("TEST3 4分割", preview)
-                if (cv2.waitKey(1) & 0xFF) in (27, ord("q")):
-                    running = False
+                with profiler.span("preview"):
+                    cv2.imshow("TEST3 4分割", preview)
+                with profiler.span("waitkey"):
+                    if (cv2.waitKey(1) & 0xFF) in (27, ord("q")):
+                        running = False
             frame_id += 1
+            profiler.frame()
             next_deadline += frame_period
             sleep_time = next_deadline - time.monotonic()
             if sleep_time > 0:
-                time.sleep(sleep_time)
-            elif sleep_time < -frame_period:
-                next_deadline = time.monotonic()
+                profiler.count("slack_us", int(sleep_time * 1e6))
+                with profiler.span("sleep"):
+                    time.sleep(sleep_time)
+            else:
+                profiler.count("late_frames")
+                if sleep_time < -frame_period:
+                    next_deadline = time.monotonic()
     finally:
         if sender is not None:
             sender.close()
         if not args.no_preview:
             cv2.destroyAllWindows()
+        finish_profile(profiler, args.profile_json)
     return 0
 
 
