@@ -33,6 +33,12 @@ SKY, SKY_DOT, PADDLE, PADDLE_EDGE, BALL = 0x1C, 0x20, 0x1E, 0x22, FC6_WHITE
 TEXT, DIM = FC6_WHITE, 0x31
 BLOCK_COLORS = (0x00, 0x05, 0x0A, 0x0E, 0x12, 0x16, 0x1E, 0x22, 0x29, 0x2D)
 
+# cv2.waitKeyEx() の値はOS/バックエンドで異なる。ASCIIに加え、Linux/X11・
+# macOS/Cocoa・Windowsで使われる代表値を受け入れる。
+LEFT_KEYS = frozenset((81, 2424832, 65361, 63234))
+RIGHT_KEYS = frozenset((83, 2555904, 65363, 63235))
+UP_KEYS = frozenset((82, 2490368, 65362, 63232))
+
 
 @dataclass(frozen=True)
 class BodyMeasurement:
@@ -225,6 +231,22 @@ class GameInput:
     launch: bool = False
 
 
+def keyboard_action(key: int) -> str | None:
+    """OpenCVの拡張キーコードをゲーム操作へ正規化する。"""
+    ascii_key = key & 0xFF
+    if key in LEFT_KEYS or ascii_key in (ord("a"), ord("h")):
+        return "left"
+    if key in RIGHT_KEYS or ascii_key in (ord("d"), ord("l")):
+        return "right"
+    if key in UP_KEYS or ascii_key in (ord(" "), ord("w"), ord("k")):
+        return "launch"
+    if ascii_key == ord("r"):
+        return "reset"
+    if ascii_key == ord("q") or key == 27:
+        return "quit"
+    return None
+
+
 class BlockBreaker:
     paddle_width, paddle_height, paddle_y = 42.0, 6.0, 350.0
     ball_radius, paddle_speed, initial_speed = 3.0, 175.0, 175.0
@@ -373,9 +395,10 @@ def parse_roi(value: str) -> tuple[int, int, int, int]:
 
 
 def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(description="USBカメラで操作する192x384 LEDブロック崩し")
+    result = argparse.ArgumentParser(description="USBカメラまたはキーボードで操作する192x384 LEDブロック崩し")
     result.add_argument("--camera", type=int, default=0)
-    result.add_argument("--no-camera", action="store_true")
+    result.add_argument("--keyboard", action="store_true", help="カメラを使わず、プレビューをキーボードで操作")
+    result.add_argument("--no-camera", action="store_true", help="--keyboard の後方互換エイリアス")
     result.add_argument("--camera-width", type=int, default=640)
     result.add_argument("--camera-height", type=int, default=480)
     result.add_argument("--camera-background-seconds", type=float, default=2.0)
@@ -405,7 +428,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         return 2
     camera: CameraController | None = None
     try:
-        if not args.no_camera:
+        keyboard_mode = args.keyboard or args.no_camera
+        if not keyboard_mode:
             camera = CameraController(
                 args.camera,
                 args.camera_width,
@@ -416,7 +440,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             )
         sender = UdpFrameSender([parse_pi(value) for value in args.pi], args.chunk_size) if args.send else None
     except (RuntimeError, ValueError) as exc:
-        print(f"error: {exc}（開発用には --no-camera）", file=sys.stderr)
+        print(f"error: {exc}（開発用には --keyboard）", file=sys.stderr)
         return 2
     game, running, frame_id = BlockBreaker(), True, 0
     manual_lateral, manual_until, manual_jump = 0, 0.0, False
@@ -427,7 +451,10 @@ def main(argv: Iterable[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, stop)
     started = last = deadline = time.monotonic()
     period = 1 / args.fps
-    print(f"block breaker: canvas={CANVAS_WIDTH}x{CANVAS_HEIGHT} palette=FC6 camera={'off' if args.no_camera else args.camera} send={'yes' if sender else 'no'}")
+    input_label = "keyboard" if keyboard_mode else f"camera={args.camera}"
+    print(f"block breaker: canvas={CANVAS_WIDTH}x{CANVAS_HEIGHT} palette=FC6 input={input_label} send={'yes' if sender else 'no'}")
+    if not args.no_preview:
+        print("keys: A/D or LEFT/RIGHT = paddle, SPACE/W/UP = launch, R = reset, Q/ESC = quit")
     try:
         while running and (args.frames <= 0 or frame_id < args.frames):
             now = time.monotonic()
@@ -451,16 +478,16 @@ def main(argv: Iterable[str] | None = None) -> int:
                 cv2.imshow("RGB LED block breaker", display)
                 if args.debug_camera and camera:
                     camera.show_debug()
-                key = cv2.waitKey(1) & 0xFF
-                if key in (27, ord("q")):
+                action = keyboard_action(cv2.waitKeyEx(1))
+                if action == "quit":
                     running = False
-                elif key in (ord("a"), 81):
+                elif action == "left":
                     manual_lateral, manual_until = -1, now + .16
-                elif key in (ord("d"), 83):
+                elif action == "right":
                     manual_lateral, manual_until = 1, now + .16
-                elif key in (ord(" "), ord("w"), 82):
+                elif action == "launch":
                     manual_jump = True
-                elif key == ord("r"):
+                elif action == "reset":
                     game.reset(full=True)
             frame_id += 1
             deadline += period

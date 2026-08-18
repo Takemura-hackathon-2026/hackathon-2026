@@ -162,10 +162,12 @@ cd host/test_mode && python3 test_mode.py --no-preview --send \
 | 右へ移動 | パドルを右へ移動 |
 | ジャンプ | サーブ中のボールを発射 |
 
-開発機でカメラを使わずに確認する場合（`A`/`D`または矢印で移動、`Space`で発射）:
+キーボードだけで遊ぶ場合は`--keyboard`で起動する。ゲームのプレビュー画面を選択して、
+`A`/`D`・`H`/`L`・左右矢印でパドルを動かす。`Space`・`W`・`K`・上矢印でボールを発射し、
+`R`でリセット、`Q`または`Esc`で終了する。
 
 ```bash
-python3 host/block_breaker.py --no-camera
+python3 host/block_breaker.py --keyboard
 ```
 
 USBカメラとPi 4台を使う場合:

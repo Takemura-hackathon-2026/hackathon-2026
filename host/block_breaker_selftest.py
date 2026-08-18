@@ -6,7 +6,13 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from block_breaker import BodyMeasurement, BlockBreaker, GameInput, InputClassifier  # noqa: E402
+from block_breaker import (  # noqa: E402
+    BodyMeasurement,
+    BlockBreaker,
+    GameInput,
+    InputClassifier,
+    keyboard_action,
+)
 from palettes import FC6_LIMIT  # noqa: E402
 
 
@@ -24,6 +30,9 @@ def main() -> int:
     jump = classifier.update(BodyMeasurement(.5, .35, .77, .2), 1.2)
     if not jump.jump:
         errors.append("JUMPを確定しない")
+    for key, expected in ((ord("a"), "left"), (83, "right"), (ord(" "), "launch"), (ord("r"), "reset")):
+        if keyboard_action(key) != expected:
+            errors.append(f"キーボード操作の変換が不正: {key} -> {keyboard_action(key)}")
     game = BlockBreaker()
     start_x = game.paddle_x
     game.step(.1, GameInput(lateral=1), .1)
