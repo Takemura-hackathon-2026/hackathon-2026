@@ -491,9 +491,10 @@ def main(argv: Iterable[str] | None = None) -> int:
                     game.reset(full=True)
             frame_id += 1
             deadline += period
-            if deadline > time.monotonic():
-                time.sleep(deadline - time.monotonic())
-            elif deadline < time.monotonic() - period:
+            sleep_time = deadline - time.monotonic()
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+            elif sleep_time < -period:
                 deadline = time.monotonic()
     finally:
         if sender:
