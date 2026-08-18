@@ -1,0 +1,767 @@
+{
+  "format_version": 2,
+  "wire_format": {
+    "bytes_per_pixel": 1,
+    "fc6_valid_bits": "0b00111111",
+    "fc6_valid_range": "0x00-0x33",
+    "fc6_color_count": 52,
+    "msx16_valid_bits": "0b00001111",
+    "msx16_valid_range": "0x0-0xF",
+    "msx16_color_count": 16,
+    "note": "No bit packing. Upper bits are reserved to keep Raspberry Pi decoding deterministic. FC6 is the 52-color set specified on 2026-08-06 and is not index-compatible with the earlier 64-entry table."
+  },
+  "palettes": {
+    "FC6": [
+      {
+        "index": "00",
+        "value": 0,
+        "hex": "#AB0013",
+        "rgb": [
+          171,
+          0,
+          19
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "01",
+        "value": 1,
+        "hex": "#E7005B",
+        "rgb": [
+          231,
+          0,
+          91
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "02",
+        "value": 2,
+        "hex": "#FF77B7",
+        "rgb": [
+          255,
+          119,
+          183
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "03",
+        "value": 3,
+        "hex": "#FFC7DB",
+        "rgb": [
+          255,
+          199,
+          219
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "04",
+        "value": 4,
+        "hex": "#A70000",
+        "rgb": [
+          167,
+          0,
+          0
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "05",
+        "value": 5,
+        "hex": "#DB2B00",
+        "rgb": [
+          219,
+          43,
+          0
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "06",
+        "value": 6,
+        "hex": "#FF7763",
+        "rgb": [
+          255,
+          119,
+          99
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "07",
+        "value": 7,
+        "hex": "#FFBFB3",
+        "rgb": [
+          255,
+          191,
+          179
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "08",
+        "value": 8,
+        "hex": "#7F0B00",
+        "rgb": [
+          127,
+          11,
+          0
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "09",
+        "value": 9,
+        "hex": "#CB4F0F",
+        "rgb": [
+          203,
+          79,
+          15
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "0A",
+        "value": 10,
+        "hex": "#FF9B3B",
+        "rgb": [
+          255,
+          155,
+          59
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "0B",
+        "value": 11,
+        "hex": "#FFDBAB",
+        "rgb": [
+          255,
+          219,
+          171
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "0C",
+        "value": 12,
+        "hex": "#432F00",
+        "rgb": [
+          67,
+          47,
+          0
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "0D",
+        "value": 13,
+        "hex": "#8B7300",
+        "rgb": [
+          139,
+          115,
+          0
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "0E",
+        "value": 14,
+        "hex": "#F3BF3F",
+        "rgb": [
+          243,
+          191,
+          63
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "0F",
+        "value": 15,
+        "hex": "#FFE7A3",
+        "rgb": [
+          255,
+          231,
+          163
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "10",
+        "value": 16,
+        "hex": "#004700",
+        "rgb": [
+          0,
+          71,
+          0
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "11",
+        "value": 17,
+        "hex": "#009700",
+        "rgb": [
+          0,
+          151,
+          0
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "12",
+        "value": 18,
+        "hex": "#83D313",
+        "rgb": [
+          131,
+          211,
+          19
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "13",
+        "value": 19,
+        "hex": "#E3FFA3",
+        "rgb": [
+          227,
+          255,
+          163
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "14",
+        "value": 20,
+        "hex": "#005100",
+        "rgb": [
+          0,
+          81,
+          0
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "15",
+        "value": 21,
+        "hex": "#00AB00",
+        "rgb": [
+          0,
+          171,
+          0
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "16",
+        "value": 22,
+        "hex": "#4FDF4B",
+        "rgb": [
+          79,
+          223,
+          75
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "17",
+        "value": 23,
+        "hex": "#ABF3BF",
+        "rgb": [
+          171,
+          243,
+          191
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "18",
+        "value": 24,
+        "hex": "#003F17",
+        "rgb": [
+          0,
+          63,
+          23
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "19",
+        "value": 25,
+        "hex": "#00933B",
+        "rgb": [
+          0,
+          147,
+          59
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "1A",
+        "value": 26,
+        "hex": "#58F898",
+        "rgb": [
+          88,
+          248,
+          152
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "1B",
+        "value": 27,
+        "hex": "#B3FFCF",
+        "rgb": [
+          179,
+          255,
+          207
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "1C",
+        "value": 28,
+        "hex": "#1B3F5F",
+        "rgb": [
+          27,
+          63,
+          95
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "1D",
+        "value": 29,
+        "hex": "#00838B",
+        "rgb": [
+          0,
+          131,
+          139
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "1E",
+        "value": 30,
+        "hex": "#00EBDB",
+        "rgb": [
+          0,
+          235,
+          219
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "1F",
+        "value": 31,
+        "hex": "#9FFFF3",
+        "rgb": [
+          159,
+          255,
+          243
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "20",
+        "value": 32,
+        "hex": "#271B8F",
+        "rgb": [
+          39,
+          27,
+          143
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "21",
+        "value": 33,
+        "hex": "#0073EF",
+        "rgb": [
+          0,
+          115,
+          239
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "22",
+        "value": 34,
+        "hex": "#3FBFFF",
+        "rgb": [
+          63,
+          191,
+          255
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "23",
+        "value": 35,
+        "hex": "#ABE7FF",
+        "rgb": [
+          171,
+          231,
+          255
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "24",
+        "value": 36,
+        "hex": "#0000AB",
+        "rgb": [
+          0,
+          0,
+          171
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "25",
+        "value": 37,
+        "hex": "#233BEF",
+        "rgb": [
+          35,
+          59,
+          239
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "26",
+        "value": 38,
+        "hex": "#5F73FF",
+        "rgb": [
+          95,
+          115,
+          255
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "27",
+        "value": 39,
+        "hex": "#C7D7FF",
+        "rgb": [
+          199,
+          215,
+          255
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "28",
+        "value": 40,
+        "hex": "#47009F",
+        "rgb": [
+          71,
+          0,
+          159
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "29",
+        "value": 41,
+        "hex": "#8300F3",
+        "rgb": [
+          131,
+          0,
+          243
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "2A",
+        "value": 42,
+        "hex": "#A78BFD",
+        "rgb": [
+          167,
+          139,
+          253
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "2B",
+        "value": 43,
+        "hex": "#D7CBFF",
+        "rgb": [
+          215,
+          203,
+          255
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "2C",
+        "value": 44,
+        "hex": "#8F0077",
+        "rgb": [
+          143,
+          0,
+          119
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "2D",
+        "value": 45,
+        "hex": "#BF00BF",
+        "rgb": [
+          191,
+          0,
+          191
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "2E",
+        "value": 46,
+        "hex": "#F77BFF",
+        "rgb": [
+          247,
+          123,
+          255
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "2F",
+        "value": 47,
+        "hex": "#FFC7FF",
+        "rgb": [
+          255,
+          199,
+          255
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "30",
+        "value": 48,
+        "hex": "#000000",
+        "rgb": [
+          0,
+          0,
+          0
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "31",
+        "value": 49,
+        "hex": "#757575",
+        "rgb": [
+          117,
+          117,
+          117
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "32",
+        "value": 50,
+        "hex": "#BCBCBC",
+        "rgb": [
+          188,
+          188,
+          188
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "33",
+        "value": 51,
+        "hex": "#FFFFFF",
+        "rgb": [
+          255,
+          255,
+          255
+        ],
+        "alpha": 255
+      }
+    ],
+    "MSX16": [
+      {
+        "index": "0",
+        "value": 0,
+        "hex": "#000000",
+        "rgb": [
+          0,
+          0,
+          0
+        ],
+        "alpha": 0
+      },
+      {
+        "index": "1",
+        "value": 1,
+        "hex": "#000000",
+        "rgb": [
+          0,
+          0,
+          0
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "2",
+        "value": 2,
+        "hex": "#3EB849",
+        "rgb": [
+          62,
+          184,
+          73
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "3",
+        "value": 3,
+        "hex": "#74D07D",
+        "rgb": [
+          116,
+          208,
+          125
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "4",
+        "value": 4,
+        "hex": "#5955E0",
+        "rgb": [
+          89,
+          85,
+          224
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "5",
+        "value": 5,
+        "hex": "#8076F1",
+        "rgb": [
+          128,
+          118,
+          241
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "6",
+        "value": 6,
+        "hex": "#B95E51",
+        "rgb": [
+          185,
+          94,
+          81
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "7",
+        "value": 7,
+        "hex": "#65DBEF",
+        "rgb": [
+          101,
+          219,
+          239
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "8",
+        "value": 8,
+        "hex": "#DB6559",
+        "rgb": [
+          219,
+          101,
+          89
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "9",
+        "value": 9,
+        "hex": "#FF897D",
+        "rgb": [
+          255,
+          137,
+          125
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "A",
+        "value": 10,
+        "hex": "#CCC35E",
+        "rgb": [
+          204,
+          195,
+          94
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "B",
+        "value": 11,
+        "hex": "#DED087",
+        "rgb": [
+          222,
+          208,
+          135
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "C",
+        "value": 12,
+        "hex": "#3AA241",
+        "rgb": [
+          58,
+          162,
+          65
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "D",
+        "value": 13,
+        "hex": "#B766B5",
+        "rgb": [
+          183,
+          102,
+          181
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "E",
+        "value": 14,
+        "hex": "#CCCCCC",
+        "rgb": [
+          204,
+          204,
+          204
+        ],
+        "alpha": 255
+      },
+      {
+        "index": "F",
+        "value": 15,
+        "hex": "#FFFFFF",
+        "rgb": [
+          255,
+          255,
+          255
+        ],
+        "alpha": 255
+      }
+    ]
+  }
+}
