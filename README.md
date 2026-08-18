@@ -3,13 +3,17 @@
 32×32 RGB LED パネル 72 枚（6列×12段、論理解像度 192×384）を、Ubuntu 主機の集中処理と
 Raspberry Pi 4 台の外部同期で駆動する縦型ディスプレー・ゲームのリポジトリ。
 
-現在の内容は **表示経路の検証** に限定している。計画書 §13 の実装開始条件のうち
+現在の内容は表示経路の検証に加え、**主機側のブロック崩し試作**を含む。計画書 §13 の実装開始条件のうち
 1〜3（DVD テストモード、FC6 全色パターン、MSX16 全色パターン）とその 4 分割 UDP 送信、
 加えて主機側テストモード 4 種（TEST1〜4）と Pi 常駐表示クライアントの同期段階 A
 （受信 → CRC 確認 → LUT 変換 → HUB75 出力）までを実装済み。
 
-未実装: READY バリア（同期段階 B）、M5 の物理同期パルス、ゲーム本体、カメラ入力。
-実機（LED パネル・Pi・M5）での確認も未実施。
+`host/block_breaker.py` は、背景差分による `LEFT` / `RIGHT` / `JUMP` 判定、192×384の
+FC6描画、既存UDP経路への4分割送信を主機だけで行う。左右移動でパドルを動かし、ジャンプで
+ボールを発射する。人物映像・人物マスクはLEDへ送らない。
+
+READY バリア（同期段階 B）、M5 の物理同期パルス、実機（LEDパネル・Pi・M5）での確認は未実装。
+これらの同期試験が完了するまで、ゲームモードは主機プレビューおよび表示経路の試作として扱う。
 
 ## デモ
 
@@ -37,6 +41,8 @@ cd host/test_mode && python3 test_mode.py --render-mode mask --color-style solid
 │   ├── make_palette_sheet.py   # docs/assets のパレット見本画像を再生成
 │   ├── palettes.json           # 機械可読定義
 │   ├── fc6.pal / msx16.pal     # 生 RGB パレット（156 byte / 48 byte）
+│   ├── block_breaker.py         # カメラ操作ブロック崩し・FC6描画・UDP送信
+│   ├── block_breaker_selftest.py # カメラ不要のゲーム・入力分類器検証
 │   └── test_mode/
 │       ├── test_mode.py        # TEST1: WebP を DVD ロゴ風に反射移動・量子化・4分割 UDP 送信
 │       ├── test2_status.py     # TEST2: 主機と各 Pi の状態を文字で交互表示（死活受信付き）
@@ -142,6 +148,41 @@ cd host/test_mode && python3 test_mode.py --no-preview --send \
 
 詳細は [host/test_mode/README.md](host/test_mode/README.md)。
 
+## カメラ操作ブロック崩し
+
+通常ゲーム表示はFC6（52色）で固定する。主機が192×384の完成済みパレットインデックス配列を
+描き、既存の`UdpFrameSender`が上から192×96ずつ4台へ送る。Pi側のコードとUDP形式は変更しない。
+
+起動時は、まず誰も写さない状態で背景を約2秒学習する。次に参加者がカメラ正面で静止すると、
+立ち位置を校正する。校正後の操作は次の通り。
+
+| 身体操作 | ゲーム操作 |
+|---|---|
+| 左へ移動 | パドルを左へ移動 |
+| 右へ移動 | パドルを右へ移動 |
+| ジャンプ | サーブ中のボールを発射 |
+
+開発機でカメラを使わずに確認する場合（`A`/`D`または矢印で移動、`Space`で発射）:
+
+```bash
+python3 host/block_breaker.py --no-camera
+```
+
+USBカメラとPi 4台を使う場合:
+
+```bash
+python3 host/block_breaker.py --camera 0 --send \
+  --pi 192.168.10.101:5000 --pi 192.168.10.102:5000 \
+  --pi 192.168.10.103:5000 --pi 192.168.10.104:5000
+```
+
+カメラ画面と前景マスクは`--debug-camera`で主機だけに表示する。LEDへの送出内容はゲーム画面だけである。
+背景幕や床以外を検出対象から外すには、`--roi x,y,width,height`でカメラ画像内のROIを指定できる。
+
+```bash
+python3 host/block_breaker_selftest.py
+```
+
 ## Pi 常駐表示クライアント
 
 `pi-client/` は Raspberry Pi 上で動く C++ の表示専用プロセス。UDP 5000 で 192×96 の
@@ -185,8 +226,8 @@ cd host/test_mode && python3 selftest.py
 1. 実機での表示確認（`pi-client` のビルドと 4 台での TEST1〜4）
 2. 4 台の論理フレーム同期（READY 返送・UDP 5100 のバリア、`frame_id` 一致）
 3. M5StickC Plus の物理同期パルスと GPIO 同期待機、走査位相の評価
-4. ゲーム本体
-5. USB カメラ入力（背景差分による LEFT/RIGHT/JUMP 判定）
+4. 実機でのブロック崩し・カメラ入力の校正（左右・ジャンプの精度と遅延）
+5. 会場照明下での誤検出対策とゲーム難易度調整
 
 ## ライセンス
 
