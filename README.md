@@ -13,6 +13,17 @@ FC6描画、既存UDP経路への4分割送信を主機だけで行う。ゲー�
 左右移動でパドルを動かし、ジャンプでボスの口元からボールを発射する。人物映像・人物マスクは
 LEDへ送らない。
 
+ジャンプ判定は重心上昇0.05、下端上昇0.04（0〜1正規化）を既定値とする。カメラ設置や
+身体の映り方に合わせて、`--jump-rise-y-min` と `--jump-rise-bottom-min` で個別調整できる。
+
+ジャンプだけを確認する場合は、ゲーム更新・左右移動・LED送信を行わない専用CLIを使う。
+背景学習後にジャンプイベントを標準出力へ記録し、`--preview`指定時はカメラ画像とマスクを表示する。
+
+```bash
+python3 host/jump_detector.py --camera 0 --seconds 30 --preview
+python3 host/jump_detector_selftest.py
+```
+
 READY バリア（同期段階 B）、M5 の物理同期パルス、実機（LEDパネル・Pi・M5）での確認は未実装。
 これらの同期試験が完了するまで、ゲームモードは主機プレビューおよび表示経路の試作として扱う。
 
@@ -27,6 +38,30 @@ READY バリア（同期段階 B）、M5 の物理同期パルス、実機（LED
 cd host/test_mode && python3 test_mode.py --render-mode mask --color-style solid \
   --rainbow-hz 0 --speed-x 97 --speed-y 131 --gif-seconds 20 --gif demo.gif
 ```
+
+## ホスト常時起動の待機表示
+
+`host/standby.py` は、現在時刻と主機温度、Pi1〜Pi4の温度を192×384の縦画面へ表示し、
+4台のPiへ繰り返し送信する。`--mode palette`ではFC6全52色を左上から8×8のタイルへ
+並べた市松状グラデーション、`--mode logo`では`host/test_mode/single-eye-catch_2800x1040.png`
+のロゴ領域を表示する。
+
+ローカルで送出フレームを確認する場合:
+
+```bash
+.venv/bin/python host/standby.py --frames 1 --preview
+```
+
+oyakiへ送って常時起動する場合:
+
+```bash
+host/oyaki_camera_calibrate.sh deploy
+host/oyaki_camera_calibrate.sh standby-start
+host/oyaki_camera_calibrate.sh standby-status
+host/oyaki_camera_calibrate.sh standby-stop
+```
+
+`--mode logo --image PATH`で別ロゴ素材へ切り替えられる。既存の`start`／`foreground`はカメラ校正用として残している。
 
 ## 構成
 
@@ -44,8 +79,10 @@ cd host/test_mode && python3 test_mode.py --render-mode mask --color-style solid
 │   ├── fc6.pal / msx16.pal     # 生 RGB パレット（156 byte / 48 byte）
 │   ├── block_breaker.py         # カメラ操作ブロック崩し・FC6描画・UDP送信
 │   ├── block_breaker_selftest.py # カメラ不要のゲーム・入力分類器検証
+│   ├── standby.py                # 時刻・主機/Pi温度を表示する192x384縦画面のホスト常時起動
 │   └── test_mode/
 │       ├── test_mode.py        # TEST1: WebP を DVD ロゴ風に反射移動・量子化・4分割 UDP 送信
+│       ├── single-eye-catch_2800x1040.png # 常時起動時の既定ロゴ素材
 │       ├── test2_status.py     # TEST2: 主機と各 Pi の状態を文字で交互表示（死活受信付き）
 │       ├── test3_quad.py       # TEST3: 4帯それぞれへ同じ画像を出す個体確認モード
 │       ├── test4_super.py      # TEST4(SUPERTESTMODE): 斜めN字配置の仮想画面 576×192
@@ -200,6 +237,48 @@ python3 host/block_breaker.py --camera 0 --send \
 python3 host/block_breaker_selftest.py
 ```
 
+## カメラキャリブレーション
+
+`host/camera_calibrate.py` は、固定照明・床反射を背景として学習し、CENTER/STANCE、LEFT、RIGHT、JUMP、VALIDATEの順に姿勢・移動・ジャンプを約60〜90秒で計測する。回転、ROI、固定照明領域、各ステージ時間はCLIで指定できる。回転はROI・背景差分・計測より先に適用され、将来のoyaki標準例は`ccw`とする。LEDへ送るのは既存FC6の192×384インデックス画像だけで、カメラ映像やマスクは送らない。
+
+ローカルでカメラ・ネットワークなしの表示デモを実行する。各ステージ画面と背景/候補の代表PNGを指定先へ保存する。
+
+```bash
+python3 host/camera_calibrate.py --demo --demo-output /tmp/camera-calibrate-demo
+```
+
+固定照明の指定は処理後240×320画像の座標で行う。例えば`52,32,142,60`は`--fixed-light 52,32,142,60`と指定する。背景から抽出する安定高輝度マスクも併用するが、瞬間的な明るさの変化や白い服を一律には除外しない。
+
+oyaki上で実カメラと4台のPiへ接続するコマンド例:
+
+```bash
+python3 host/camera_calibrate.py --camera 0 --rotation ccw \
+  --fixed-light 52,32,142,60 --send \
+  --pi 192.168.10.101:5000 --pi 192.168.10.102:5000 \
+  --pi 192.168.10.103:5000 --pi 192.168.10.104:5000 \
+  --output camera_calibration.json
+```
+
+露出CLIの既定値は`1/312/2`で、カメラが返した実際の解像度・FPS・回転・露出readbackをJSONへ記録する。成功時は`camera_calibration.json`へatomic writeし、品質ゲートに失敗した結果は`camera_calibration.invalid.json`へatomic writeするため、既存のvalid JSONを上書きしない。JSONには`version`、`date`、`valid`、`camera`、`ROI`、`fixed_light`、`background`、`baseline`、`motion_stats`、`thresholds`、`quality`、`sample_counts`を含み、NaN/Infinityは許可しない。
+
+終了コードは、`0`=valid校正成功、`1`=RETRY/FAILまたは中止、`2`=引数・カメラ等の実行エラー。`/tmp`のデモ出力は揮発性なので、必要な診断PNGは別の保存先へコピーする。自己テストは`python3 host/camera_calibrate_selftest.py`でカメラ・ネットワークなしに実行できる。
+
+Macからは`host/oyaki_camera_calibrate.sh`でSSH操作できる。SSH鍵とHANDOFF記載のIPv6ゾーン指定を使い、秘密はスクリプトへ埋め込まない。`start`はPiクライアントを起動せず、既に4台が待受している前提で校正だけをバックグラウンド実行する。
+
+```bash
+host/oyaki_camera_calibrate.sh check
+host/oyaki_camera_calibrate.sh deploy
+host/oyaki_camera_calibrate.sh display-test 5
+host/oyaki_camera_calibrate.sh start
+host/oyaki_camera_calibrate.sh status
+host/oyaki_camera_calibrate.sh logs 80
+host/oyaki_camera_calibrate.sh result
+host/oyaki_camera_calibrate.sh stop
+host/oyaki_camera_calibrate.sh fetch /tmp/camera-calibration-result
+```
+
+今回の実機確認では、4台の`pi_client`を手動起動した後、FC6テスト送信でtarget 0〜3の`displayed`増加と`dropped=0`を確認した。本版キャリブレーションは`rotation=ccw`、640×480/30fps、露出readback 1/312/2で`valid=true`を生成した。背景のみスモークは安定状態で303フレーム中候補0だったが、照明変動時に誤候補が出た試行もあるため、設置後の再測定を推奨する。
+
 ## Pi 常駐表示クライアント
 
 `pi-client/` は Raspberry Pi 上で動く C++ の表示専用プロセス。UDP 5000 で 192×96 の
@@ -207,7 +286,9 @@ python3 host/block_breaker_selftest.py
 変換し、HUB75 へ出力する。1 秒ごとに UDP 5101 へ死活報告（`PIHEALTH ...`）を返し、
 TEST2 がそれを受けて表示する。
 
-ビルドには [rpi-rgb-led-matrix](https://github.com/hzeller/rpi-rgb-led-matrix) が必要。
+ビルドには [rpi-rgb-led-matrix](https://github.com/hzeller/rpi-rgb-led-matrix) が必要で、
+このライブラリは各Pi上の`pi_client`へリンクして使う。起動時に自動起動するsystemd設定と、
+主機から4台へ転送・ビルド・有効化する手順は [pi-client/README.md](pi-client/README.md) にまとめてある。
 
 ```bash
 cd pi-client && make RGB_LIB_DISTRIBUTION=$HOME/rpi-rgb-led-matrix
