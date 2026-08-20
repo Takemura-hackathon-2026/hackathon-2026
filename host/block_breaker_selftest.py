@@ -57,6 +57,17 @@ def main() -> int:
     playing = game.render("READY")
     if int(playing[12, 164]) != FC6_WHITE:
         errors.append("プレイ中に残機の白丸を表示しない")
+    game._lose_ball(.3)
+    after_loss = game.render("READY")
+    if int(after_loss[12, 164]) != FC6_WHITE or int(after_loss[12, 189]) != FC6_WHITE:
+        errors.append("ミス後に残機と減った位置の点滅輪郭を表示しない")
+    for step in range(40):
+        game.step(.04, GameInput(), .4 + step * .04)
+    if not game.life_loss_feedback_active:
+        errors.append("JUMP前に残機減少の点滅を終了する")
+    game.step(0, GameInput(launch=True), 2.1)
+    if game.life_loss_feedback_active:
+        errors.append("JUMP後も残機減少の点滅を表示する")
     game.boss_defeated = True
     cleared = game.render("READY")
     if int(cleared[12, 164]) == FC6_WHITE:
@@ -107,6 +118,22 @@ def main() -> int:
         game.step(.04, GameInput(), .5 + step * .04)
     if not game.boss_move_active or game.boss_x == x_before_move:
         errors.append("3回点滅後にボスが左右移動を開始しない")
+
+    game.reset(full=True)
+    game.boss_hp = game.boss_damage
+    point = game.boss_edge_points[np.argmax(game.boss_edge_points[:, 0])]
+    game.serving = False
+    game.boss_collision_armed = True
+    game.ball.x = game.boss_x + float(point[1])
+    game.ball.y = game.boss_y + float(point[0]) + game.ball_radius - .25
+    game.ball.vx, game.ball.vy = 0, -220
+    game._hit_boss()
+    if not game.boss_defeated or game.clear_remaining <= 0.0:
+        errors.append("クリア時の自動リセット待機に入らない")
+    for step in range(50):
+        game.step(.04, GameInput(), 1.5 + step * .04)
+    if game.boss_defeated or game.boss_hp != game.boss_max_hp or game.lives != 3 or not game.serving:
+        errors.append("クリア後に初期画面へ自動復帰しない")
 
     for step in range(120):
         frame = game.render("READY")
