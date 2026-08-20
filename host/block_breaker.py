@@ -342,8 +342,12 @@ class BlockBreaker:
         self.paddle_x = 0.0
         self.ball = Ball(0.0, 0.0)
         self.serving = True
+        self.game_started = False
         self.boss_collision_armed = False
         self.damage_effect_remaining = 0.0
+        self.life_loss_feedback_active = False
+        self.life_loss_blink_elapsed = 0.0
+        self.life_loss_slot = -1
         self.boss_transition_remaining = 0.0
         self.boss_move_active = False
         self.boss_move_vx = self.boss_move_speed
@@ -355,7 +359,11 @@ class BlockBreaker:
             self.lives = 3
             self.boss_hp = self.boss_max_hp
             self.boss_defeated = False
+            self.game_started = False
             self.damage_effect_remaining = 0.0
+            self.life_loss_feedback_active = False
+            self.life_loss_blink_elapsed = 0.0
+            self.life_loss_slot = -1
             self.boss_x = (CANVAS_WIDTH - self.boss_width) / 2
             self.boss_transition_remaining = 0.0
             self.boss_move_active = False
@@ -374,6 +382,10 @@ class BlockBreaker:
 
     def _launch(self) -> None:
         self.serving = False
+        self.game_started = True
+        self.life_loss_feedback_active = False
+        self.life_loss_blink_elapsed = 0.0
+        self.life_loss_slot = -1
         # ボスの口元からプレイヤー側へ飛び出す角度。
         self.ball.vx, self.ball.vy = self.initial_speed * .80, self.initial_speed * .60
 
@@ -452,6 +464,13 @@ class BlockBreaker:
         self.lives -= 1
         if self.lives <= 0:
             self.game_over_until = now + 1.8
+            self.life_loss_feedback_active = False
+            self.life_loss_blink_elapsed = 0.0
+            self.life_loss_slot = -1
+        else:
+            self.life_loss_feedback_active = True
+            self.life_loss_blink_elapsed = 0.0
+            self.life_loss_slot = self.lives
         self.serving = True
         self.boss_collision_armed = False
         self.ball.vx = self.ball.vy = 0.0
@@ -460,6 +479,8 @@ class BlockBreaker:
     def step(self, dt: float, controls: GameInput, now: float) -> None:
         dt = min(.04, max(0.0, dt))
         self.damage_effect_remaining = max(0.0, self.damage_effect_remaining - dt)
+        if self.life_loss_feedback_active:
+            self.life_loss_blink_elapsed += dt
         if self.boss_transition_remaining > 0.0:
             self.boss_transition_remaining = max(0.0, self.boss_transition_remaining - dt)
             if self.boss_transition_remaining == 0.0:
@@ -525,9 +546,14 @@ class BlockBreaker:
             hp_color = 0x16 if self.boss_hp > 50 else 0x0E if self.boss_hp > 20 else 0x05
             frame[hp_y + 2:hp_y + hp_height - 2, hp_x + 2:hp_x + 2 + fill] = hp_color
         active_play = not self.serving and not self.boss_defeated and not self.game_over_until
-        if active_play:
+        show_lives = self.game_started and not self.boss_defeated and not self.game_over_until
+        if show_lives:
             for life in range(self.lives):
                 cv2.circle(frame, (164 + life * 11, 12), 3, int(TEXT), -1, lineType=cv2.LINE_8)
+            if self.life_loss_feedback_active and 0 <= self.life_loss_slot < 3:
+                phase = int(self.life_loss_blink_elapsed / .12)
+                if phase % 2 == 0:
+                    cv2.circle(frame, (164 + self.life_loss_slot * 11, 12), 3, int(TEXT), 1, lineType=cv2.LINE_8)
         frame[22:24, :] = DIM
 
         boss_x, boss_y = int(self.boss_x), int(self.boss_y)

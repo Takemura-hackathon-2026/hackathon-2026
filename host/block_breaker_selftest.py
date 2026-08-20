@@ -53,6 +53,17 @@ def main() -> int:
     playing = game.render("READY")
     if int(playing[12, 164]) != FC6_WHITE:
         errors.append("プレイ中に残機の白丸を表示しない")
+    game._lose_ball(.3)
+    after_loss = game.render("READY")
+    if int(after_loss[12, 164]) != FC6_WHITE or int(after_loss[12, 189]) != FC6_WHITE:
+        errors.append("ミス後に残機と減った位置の点滅輪郭を表示しない")
+    for step in range(40):
+        game.step(.04, GameInput(), .4 + step * .04)
+    if not game.life_loss_feedback_active:
+        errors.append("JUMP前に残機減少の点滅を終了する")
+    game.step(0, GameInput(launch=True), 2.1)
+    if game.life_loss_feedback_active:
+        errors.append("JUMP後も残機減少の点滅を表示する")
     game.boss_defeated = True
     cleared = game.render("READY")
     if int(cleared[12, 164]) == FC6_WHITE:
