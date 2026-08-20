@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import ctypes.util
 import math
 import signal
 import sys
@@ -31,13 +33,31 @@ from test_mode import CANVAS_HEIGHT, CANVAS_WIDTH, PI_COUNT, UdpFrameSender, par
 # 正本 host/palettes.py 内のFC6インデックスだけを使う。
 SKY, SKY_DOT, PADDLE, PADDLE_EDGE, BALL = 0x1C, 0x20, 0x1E, 0x22, FC6_WHITE
 TEXT, DIM = FC6_WHITE, 0x31
-BLOCK_COLORS = (0x00, 0x05, 0x0A, 0x0E, 0x12, 0x16, 0x1E, 0x22, 0x29, 0x2D)
 
 # cv2.waitKeyEx() の値はOS/バックエンドで異なる。ASCIIに加え、Linux/X11・
 # macOS/Cocoa・Windowsで使われる代表値を受け入れる。
 LEFT_KEYS = frozenset((81, 2424832, 65361, 63234))
 RIGHT_KEYS = frozenset((83, 2555904, 65363, 63235))
 UP_KEYS = frozenset((82, 2490368, 65362, 63232))
+# OpenCVのwaitKeyExにはキー解放イベントがないため、キーリピート間を埋める最小限の保持時間を持たせる。
+# これを長くすると、キーを離した後も慣性のように動いて見える。
+# X11のキー状態取得が使えない環境でのフォールバック用。
+KEYBOARD_EVENT_HOLD_SECONDS = 0.08
+BOSS_IMAGE = HOST / "assets" / "takemuraface_fc6.png"
+
+
+def load_boss_sprite(path: Path = BOSS_IMAGE) -> tuple[np.ndarray, np.ndarray]:
+    """透過PNGをFC6インデックス画像と不透明マスクへ変換する。"""
+    source = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if source is None:
+        raise RuntimeError(f"ボス画像を読み込めない: {path}")
+    if source.ndim != 3 or source.shape[2] != 4:
+        raise RuntimeError(f"ボス画像はRGBA PNGでなければならない: {path}")
+    rgb = source[:, :, :3][:, :, ::-1].astype(np.int32)
+    palette = np.asarray([color[:3] for color in FC6], dtype=np.int32)
+    distance = np.sum((rgb[:, :, None, :] - palette[None, None, :, :]) ** 2, axis=3)
+    indexed = np.argmin(distance, axis=2).astype(np.uint8)
+    return indexed, source[:, :, 3] > 0
 
 
 @dataclass(frozen=True)
@@ -209,15 +229,6 @@ class CameraController:
 
 
 @dataclass
-class Block:
-    x: float
-    y: float
-    width: float
-    height: float
-    color: int
-
-
-@dataclass
 class Ball:
     x: float
     y: float
@@ -247,53 +258,194 @@ def keyboard_action(key: int) -> str | None:
     return None
 
 
+class X11KeyboardState:
+    """X11のキー状態を毎フレーム読む。キーリピート待ちと解放遅延をなくす。"""
+
+    def __init__(self) -> None:
+        self._lib = None
+        self._display = None
+        self._left_codes: set[int] = set()
+        self._right_codes: set[int] = set()
+        library = ctypes.util.find_library("X11")
+        if not library:
+            return
+        try:
+            lib = ctypes.CDLL(library)
+            lib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+            lib.XOpenDisplay.restype = ctypes.c_void_p
+            lib.XCloseDisplay.argtypes = [ctypes.c_void_p]
+            lib.XQueryKeymap.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            lib.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+            lib.XKeysymToKeycode.restype = ctypes.c_ubyte
+            display = lib.XOpenDisplay(None)
+            if not display:
+                return
+            self._lib, self._display = lib, display
+            self._left_codes = self._keycodes(0xFF51, ord("a"), ord("A"), ord("h"), ord("H"))
+            self._right_codes = self._keycodes(0xFF53, ord("d"), ord("D"), ord("l"), ord("L"))
+        except (AttributeError, OSError):
+            self.close()
+
+    @property
+    def available(self) -> bool:
+        return self._lib is not None and self._display is not None
+
+    def _keycodes(self, *keysyms: int) -> set[int]:
+        assert self._lib is not None and self._display is not None
+        return {
+            int(code)
+            for code in (self._lib.XKeysymToKeycode(self._display, ctypes.c_ulong(keysym)) for keysym in keysyms)
+            if code
+        }
+
+    def lateral(self) -> int:
+        if not self.available:
+            return 0
+        keymap = (ctypes.c_ubyte * 32)()
+        self._lib.XQueryKeymap(self._display, ctypes.cast(keymap, ctypes.c_void_p))
+
+        def pressed(codes: set[int]) -> bool:
+            return any(bool(keymap[code // 8] & (1 << (code % 8))) for code in codes)
+
+        left, right = pressed(self._left_codes), pressed(self._right_codes)
+        return -1 if left and not right else 1 if right and not left else 0
+
+    def close(self) -> None:
+        if self._lib is not None and self._display is not None:
+            self._lib.XCloseDisplay(self._display)
+        self._lib = self._display = None
+
+
 class BlockBreaker:
     paddle_width, paddle_height, paddle_y = 42.0, 6.0, 350.0
     ball_radius, paddle_speed, initial_speed = 3.0, 175.0, 175.0
+    boss_scale = 1.20
+    boss_y = 34.0  # 上端のプレイ領域(y=26)との間に8pxを残す。
+    boss_max_hp, boss_damage = 100, 10
+    damage_effect_duration = .24
+    boss_transition_duration = .48  # 3回の点滅（点灯・消灯を3周期）
+    boss_move_speed = 52.0
 
     def __init__(self) -> None:
-        self.level = 1
-        self.score = 0
+        sprite, mask = load_boss_sprite()
+        size = (round(sprite.shape[1] * self.boss_scale), round(sprite.shape[0] * self.boss_scale))
+        self.boss_sprite = cv2.resize(sprite, size, interpolation=cv2.INTER_NEAREST)
+        self.boss_mask = cv2.resize(mask.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST) > 0
+        self.boss_height, self.boss_width = self.boss_sprite.shape
+        self.boss_x = (CANVAS_WIDTH - self.boss_width) / 2
+        eroded = cv2.erode(self.boss_mask.astype(np.uint8), np.ones((3, 3), np.uint8))
+        self.boss_edge = self.boss_mask & (eroded == 0)
+        self.boss_edge_points = np.argwhere(self.boss_edge)
         self.lives = 3
+        self.boss_hp = self.boss_max_hp
+        self.boss_defeated = False
         self.paddle_x = 0.0
         self.ball = Ball(0.0, 0.0)
-        self.blocks: list[Block] = []
         self.serving = True
+        self.boss_collision_armed = False
+        self.damage_effect_remaining = 0.0
+        self.boss_transition_remaining = 0.0
+        self.boss_move_active = False
+        self.boss_move_vx = self.boss_move_speed
         self.game_over_until = 0.0
         self.reset(full=True)
 
     def reset(self, full: bool = False) -> None:
         if full:
-            self.level, self.score, self.lives = 1, 0, 3
+            self.lives = 3
+            self.boss_hp = self.boss_max_hp
+            self.boss_defeated = False
+            self.damage_effect_remaining = 0.0
+            self.boss_x = (CANVAS_WIDTH - self.boss_width) / 2
+            self.boss_transition_remaining = 0.0
+            self.boss_move_active = False
+            self.boss_move_vx = self.boss_move_speed
+            self.game_over_until = 0.0
         self.paddle_x = (CANVAS_WIDTH - self.paddle_width) / 2
         self.serving = True
-        self.ball = Ball(self.paddle_x + self.paddle_width / 2, self.paddle_y - self.ball_radius - 1)
-        self.blocks = self._make_blocks()
+        self.boss_collision_armed = False
+        self._place_ball_at_mouth()
 
-    def _make_blocks(self) -> list[Block]:
-        columns, rows, margin, gap = 8, min(10, 5 + self.level), 8, 2
-        width = (CANVAS_WIDTH - margin * 2 - gap * (columns - 1)) / columns
-        return [
-            Block(margin + col * (width + gap), 48 + row * 14, width, 12, BLOCK_COLORS[(row + col + self.level - 1) % len(BLOCK_COLORS)])
-            for row in range(rows) for col in range(columns)
-        ]
+    def _place_ball_at_mouth(self) -> None:
+        self.ball = Ball(
+            self.boss_x + self.boss_width * .53,
+            self.boss_y + self.boss_height * .70,
+        )
 
     def _launch(self) -> None:
-        speed = self.initial_speed + (self.level - 1) * 13
         self.serving = False
-        self.ball.vx, self.ball.vy = speed * .52, -speed * .86
+        # ボスの口元からプレイヤー側へ飛び出す角度。
+        self.ball.vx, self.ball.vy = self.initial_speed * .80, self.initial_speed * .60
 
-    def _hit_block(self, block: Block) -> bool:
-        ball = self.ball
-        near_x = min(max(ball.x, block.x), block.x + block.width)
-        near_y = min(max(ball.y, block.y), block.y + block.height)
-        dx, dy = ball.x - near_x, ball.y - near_y
-        if dx * dx + dy * dy > self.ball_radius ** 2:
+    def _ball_overlaps_boss(self) -> bool:
+        left = max(0, int(math.floor(self.ball.x - self.ball_radius - self.boss_x)))
+        right = min(self.boss_width, int(math.ceil(self.ball.x + self.ball_radius - self.boss_x + 1)))
+        top = max(0, int(math.floor(self.ball.y - self.ball_radius - self.boss_y)))
+        bottom = min(self.boss_height, int(math.ceil(self.ball.y + self.ball_radius - self.boss_y + 1)))
+        if left >= right or top >= bottom:
             return False
-        if abs(dx) > abs(dy):
-            ball.vx = -ball.vx
+        yy, xx = np.ogrid[top:bottom, left:right]
+        circle = (
+            (xx + self.boss_x - self.ball.x) ** 2
+            + (yy + self.boss_y - self.ball.y) ** 2
+            <= self.ball_radius ** 2
+        )
+        return bool(np.any(self.boss_mask[top:bottom, left:right] & circle))
+
+    def _boss_contact_normal(self) -> tuple[float, float, float, float]:
+        """ボール中心に最も近い不透明輪郭点と、そこから外向きの法線を返す。"""
+        if len(self.boss_edge_points) == 0:
+            return 0.0, -1.0, self.ball.x, self.ball.y
+        edge_y = self.boss_edge_points[:, 0].astype(np.float64) + self.boss_y
+        edge_x = self.boss_edge_points[:, 1].astype(np.float64) + self.boss_x
+        distance = (edge_x - self.ball.x) ** 2 + (edge_y - self.ball.y) ** 2
+        nearest = int(np.argmin(distance))
+        contact_x, contact_y = float(edge_x[nearest]), float(edge_y[nearest])
+        local_x = int(round(self.ball.x - self.boss_x))
+        local_y = int(round(self.ball.y - self.boss_y))
+        center_inside = (
+            0 <= local_x < self.boss_width
+            and 0 <= local_y < self.boss_height
+            and bool(self.boss_mask[local_y, local_x])
+        )
+        if center_inside:
+            nx, ny = contact_x - self.ball.x, contact_y - self.ball.y
         else:
-            ball.vy = -ball.vy
+            nx, ny = self.ball.x - contact_x, self.ball.y - contact_y
+        length = math.hypot(nx, ny)
+        if length < 1e-6:
+            speed = math.hypot(self.ball.vx, self.ball.vy)
+            if speed < 1e-6:
+                return 0.0, -1.0, contact_x, contact_y
+            nx, ny, length = -self.ball.vx, -self.ball.vy, speed
+        return nx / length, ny / length, contact_x, contact_y
+
+    def _hit_boss(self) -> bool:
+        overlaps = self._ball_overlaps_boss()
+        if not self.boss_collision_armed:
+            if not overlaps:
+                self.boss_collision_armed = True
+            return False
+        if not overlaps or self.boss_defeated:
+            return False
+        nx, ny, contact_x, contact_y = self._boss_contact_normal()
+        incoming = self.ball.vx * nx + self.ball.vy * ny
+        # 法線方向へ離れている接触は、前フレームの押し出しが残っただけなので無視する。
+        if incoming >= 0.0:
+            return False
+        self.ball.vx -= 2.0 * incoming * nx
+        self.ball.vy -= 2.0 * incoming * ny
+        # 輪郭からボール半径+1pxだけ外へ押し出し、同じ衝突を連続計上しない。
+        self.ball.x = contact_x + nx * (self.ball_radius + 1.0)
+        self.ball.y = contact_y + ny * (self.ball_radius + 1.0)
+        self.boss_hp = max(0, self.boss_hp - self.boss_damage)
+        self.damage_effect_remaining = self.damage_effect_duration
+        if self.boss_hp <= self.boss_max_hp // 2 and not self.boss_move_active and self.boss_transition_remaining <= 0.0:
+            self.boss_transition_remaining = self.boss_transition_duration
+        if self.boss_hp == 0:
+            self.boss_defeated = True
+            self.serving = True
+            self.ball.vx = self.ball.vy = 0.0
         return True
 
     def _lose_ball(self, now: float) -> None:
@@ -301,19 +453,34 @@ class BlockBreaker:
         if self.lives <= 0:
             self.game_over_until = now + 1.8
         self.serving = True
+        self.boss_collision_armed = False
         self.ball.vx = self.ball.vy = 0.0
-        self.ball.x, self.ball.y = self.paddle_x + self.paddle_width / 2, self.paddle_y - self.ball_radius - 1
+        self._place_ball_at_mouth()
 
     def step(self, dt: float, controls: GameInput, now: float) -> None:
         dt = min(.04, max(0.0, dt))
+        self.damage_effect_remaining = max(0.0, self.damage_effect_remaining - dt)
+        if self.boss_transition_remaining > 0.0:
+            self.boss_transition_remaining = max(0.0, self.boss_transition_remaining - dt)
+            if self.boss_transition_remaining == 0.0:
+                self.boss_move_active = True
+        if self.boss_move_active and not self.boss_defeated:
+            self.boss_x += self.boss_move_vx * dt
+            if self.boss_x <= 0.0:
+                self.boss_x, self.boss_move_vx = 0.0, abs(self.boss_move_vx)
+            elif self.boss_x + self.boss_width >= CANVAS_WIDTH:
+                self.boss_x = CANVAS_WIDTH - self.boss_width
+                self.boss_move_vx = -abs(self.boss_move_vx)
         if self.game_over_until:
             if now >= self.game_over_until:
                 self.game_over_until = 0.0
                 self.reset(full=True)
             return
+        if self.boss_defeated:
+            return
         self.paddle_x = min(max(0.0, self.paddle_x + max(-1, min(1, controls.lateral)) * self.paddle_speed * dt), CANVAS_WIDTH - self.paddle_width)
         if self.serving:
-            self.ball.x, self.ball.y = self.paddle_x + self.paddle_width / 2, self.paddle_y - self.ball_radius - 1
+            self._place_ball_at_mouth()
             if controls.launch:
                 self._launch()
             return
@@ -333,16 +500,7 @@ class BlockBreaker:
                 speed = min(300, math.hypot(ball.vx, ball.vy) * 1.015)
                 ball.vx = speed * hit * .92
                 ball.vy = -max(80, math.sqrt(max(1, speed * speed - ball.vx * ball.vx)))
-            for index, block in enumerate(self.blocks):
-                if self._hit_block(block):
-                    del self.blocks[index]
-                    self.score += 10 * self.level
-                    break
-            if not self.blocks:
-                self.level += 1
-                self.blocks = self._make_blocks()
-                self.serving = True
-                self.ball.vx = self.ball.vy = 0.0
+            if self._hit_boss():
                 return
             if ball.y - self.ball_radius > CANVAS_HEIGHT:
                 self._lose_ball(now)
@@ -358,19 +516,42 @@ class BlockBreaker:
         frame = np.full((CANVAS_HEIGHT, CANVAS_WIDTH), SKY, np.uint8)
         for index in range(30):
             frame[30 + (index * 71 + 13) % 300, (index * 47 + 19) % CANVAS_WIDTH] = SKY_DOT
+        # 左上はボスHP、右上は残機。HPは現在値に応じて動的に縮む。
+        hp_x, hp_y, hp_width, hp_height = 7, 7, 143, 10
+        frame[hp_y:hp_y + hp_height, hp_x:hp_x + hp_width] = TEXT
+        frame[hp_y + 2:hp_y + hp_height - 2, hp_x + 2:hp_x + hp_width - 2] = FC6_BLACK
+        fill = round((hp_width - 4) * self.boss_hp / self.boss_max_hp)
+        if fill:
+            hp_color = 0x16 if self.boss_hp > 50 else 0x0E if self.boss_hp > 20 else 0x05
+            frame[hp_y + 2:hp_y + hp_height - 2, hp_x + 2:hp_x + 2 + fill] = hp_color
+        active_play = not self.serving and not self.boss_defeated and not self.game_over_until
+        if active_play:
+            for life in range(self.lives):
+                cv2.circle(frame, (164 + life * 11, 12), 3, int(TEXT), -1, lineType=cv2.LINE_8)
         frame[22:24, :] = DIM
-        self._text(frame, f"SCORE {self.score:05d}", (6, 17), TEXT, .38)
-        self._text(frame, f"L{self.level} {self.lives}UP", (130, 17), TEXT, .34)
-        for block in self.blocks:
-            x0, y0 = int(round(block.x)), int(round(block.y))
-            x1, y1 = int(round(block.x + block.width)), int(round(block.y + block.height))
-            frame[y0:y1, x0:x1] = block.color
-            frame[y0:y0 + 2, x0:x1] = TEXT
+
+        boss_x, boss_y = int(self.boss_x), int(self.boss_y)
+        boss_region = frame[boss_y:boss_y + self.boss_height, boss_x:boss_x + self.boss_width]
+        boss_region[self.boss_mask] = self.boss_sprite[self.boss_mask]
+        if self.boss_transition_remaining > 0.0:
+            # 点灯→消灯を3周期。点滅中はボスの位置を固定する。
+            phase = int((self.boss_transition_duration - self.boss_transition_remaining) / (self.boss_transition_duration / 6))
+            if phase in (0, 2, 4):
+                boss_region[self.boss_mask] = FC6_WHITE
+        elif self.damage_effect_remaining > 0.0:
+            # 点灯→消灯→点灯→消灯の4区間で、ボスを2回だけ点滅させる。
+            phase = int((self.damage_effect_duration - self.damage_effect_remaining) / (self.damage_effect_duration / 4))
+            if phase in (0, 2):
+                boss_region[self.boss_mask] = FC6_WHITE
         x = int(round(self.paddle_x))
         frame[int(self.paddle_y):int(self.paddle_y + self.paddle_height), x:x + int(self.paddle_width)] = PADDLE
         frame[int(self.paddle_y):int(self.paddle_y + 2), x:x + int(self.paddle_width)] = PADDLE_EDGE
-        cv2.circle(frame, (int(round(self.ball.x)), int(round(self.ball.y))), int(self.ball_radius), int(BALL), -1, lineType=cv2.LINE_8)
-        if self.game_over_until:
+        if active_play:
+            cv2.circle(frame, (int(round(self.ball.x)), int(round(self.ball.y))), int(self.ball_radius), int(BALL), -1, lineType=cv2.LINE_8)
+        if self.boss_defeated:
+            self._text(frame, "BOSS DOWN", (39, 228), 0x12, .68)
+            self._text(frame, "R TO RETRY", (47, 249), TEXT, .40)
+        elif self.game_over_until:
             self._text(frame, "GAME OVER", (43, 228), 0x06, .72)
         elif self.serving:
             self._text(frame, "JUMP TO LAUNCH" if camera_stage == "READY" else "CAMERA CAL", (25, 232), 0x0E, .48)
@@ -442,6 +623,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     except (RuntimeError, ValueError) as exc:
         print(f"error: {exc}（開発用には --keyboard）", file=sys.stderr)
         return 2
+    keyboard_state = X11KeyboardState() if not args.no_preview else None
     game, running, frame_id = BlockBreaker(), True, 0
     manual_lateral, manual_until, manual_jump = 0, 0.0, False
     def stop(_signum: int, _frame: object) -> None:
@@ -461,9 +643,10 @@ def main(argv: Iterable[str] | None = None) -> int:
             if args.seconds and now - started >= args.seconds:
                 break
             body = camera.read(now) if camera else InputState(calibrated=True)
+            x11_lateral = keyboard_state.lateral() if keyboard_state is not None else 0
             if manual_lateral and now >= manual_until:
                 manual_lateral = 0
-            lateral = manual_lateral if manual_lateral else (body.lateral if body.calibrated else 0)
+            lateral = x11_lateral or manual_lateral or (body.lateral if body.calibrated else 0)
             game.step(min(.05, now - last), GameInput(lateral, body.jump or manual_jump), now)
             manual_jump, last = False, now
             indexed = game.render(camera.stage if camera else "READY", args.boundaries)
@@ -482,9 +665,11 @@ def main(argv: Iterable[str] | None = None) -> int:
                 if action == "quit":
                     running = False
                 elif action == "left":
-                    manual_lateral, manual_until = -1, now + .16
+                    if keyboard_state is None or not keyboard_state.available:
+                        manual_lateral, manual_until = -1, now + KEYBOARD_EVENT_HOLD_SECONDS
                 elif action == "right":
-                    manual_lateral, manual_until = 1, now + .16
+                    if keyboard_state is None or not keyboard_state.available:
+                        manual_lateral, manual_until = 1, now + KEYBOARD_EVENT_HOLD_SECONDS
                 elif action == "launch":
                     manual_jump = True
                 elif action == "reset":
@@ -501,6 +686,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             sender.close()
         if camera:
             camera.close()
+        if keyboard_state is not None:
+            keyboard_state.close()
         if not args.no_preview:
             cv2.destroyAllWindows()
     return 0
