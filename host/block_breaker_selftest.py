@@ -27,9 +27,13 @@ def main() -> int:
     left = classifier.update(BodyMeasurement(.20, .5, .9, .2), .35)
     if left.lateral != -1:
         errors.append("LEFTを確定しない")
-    jump = classifier.update(BodyMeasurement(.5, .35, .77, .2), 1.2)
+    # 小さめのジャンプ（上昇0.06、下端上昇0.05）も確定できること。
+    jump = classifier.update(BodyMeasurement(.5, .44, .85, .2), 1.2)
     if not jump.jump:
         errors.append("JUMPを確定しない")
+    classifier.reset()
+    if classifier.jump_rise_y_min != .05 or classifier.jump_rise_bottom_min != .04:
+        errors.append("JUMP閾値をreset後も維持しない")
     for key, expected in ((ord("a"), "left"), (83, "right"), (ord(" "), "launch"), (ord("r"), "reset")):
         if keyboard_action(key) != expected:
             errors.append(f"キーボード操作の変換が不正: {key} -> {keyboard_action(key)}")

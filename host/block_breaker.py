@@ -61,8 +61,22 @@ class InputState:
 class InputClassifier:
     """校正済み重心の時系列をLEFT/RIGHT/JUMPへ変換する。"""
 
-    def __init__(self, samples: int = 30) -> None:
+    def __init__(
+        self,
+        samples: int = 30,
+        jump_rise_y_min: float = 0.05,
+        jump_rise_bottom_min: float = 0.04,
+    ) -> None:
         self.required_samples = max(3, samples)
+        if (
+            not math.isfinite(jump_rise_y_min)
+            or not math.isfinite(jump_rise_bottom_min)
+            or jump_rise_y_min <= 0
+            or jump_rise_bottom_min <= 0
+        ):
+            raise ValueError("ジャンプ閾値は正の値")
+        self.jump_rise_y_min = float(jump_rise_y_min)
+        self.jump_rise_bottom_min = float(jump_rise_bottom_min)
         self.samples: list[BodyMeasurement] = []
         self.baseline: BodyMeasurement | None = None
         self.last: BodyMeasurement | None = None
@@ -78,7 +92,7 @@ class InputClassifier:
         return self.baseline is not None
 
     def reset(self) -> None:
-        self.__init__(self.required_samples)
+        self.__init__(self.required_samples, self.jump_rise_y_min, self.jump_rise_bottom_min)
 
     def update(self, body: BodyMeasurement | None, now: float) -> InputState:
         if body is None:
@@ -109,11 +123,11 @@ class InputClassifier:
             self.candidate = target
 
         rise_y, rise_bottom = base.y - body.y, base.bottom - body.bottom
-        pose = rise_y >= .075 and rise_bottom >= .06
+        pose = rise_y >= self.jump_rise_y_min and rise_bottom >= self.jump_rise_bottom_min
         jump = pose and not self.jump_latched and now - self.last_jump >= .65
         if jump:
             self.jump_latched, self.last_jump = True, now
-        elif rise_y < .034 and rise_bottom < .027:
+        elif rise_y < self.jump_rise_y_min * .45 and rise_bottom < self.jump_rise_bottom_min * .45:
             self.jump_latched = False
         self.last, self.last_time = body, now
         return InputState(self.lateral, jump, True, True)
@@ -130,6 +144,8 @@ class CameraController:
         background_seconds: float,
         min_area: int,
         roi: tuple[int, int, int, int] | None,
+        jump_rise_y_min: float,
+        jump_rise_bottom_min: float,
     ) -> None:
         self.capture = cv2.VideoCapture(device)
         if not self.capture.isOpened():
@@ -142,7 +158,10 @@ class CameraController:
         self.roi = roi
         self.started: float | None = None
         self.subtractor = cv2.createBackgroundSubtractorMOG2(history=240, varThreshold=20, detectShadows=False)
-        self.classifier = InputClassifier()
+        self.classifier = InputClassifier(
+            jump_rise_y_min=jump_rise_y_min,
+            jump_rise_bottom_min=jump_rise_bottom_min,
+        )
         self.debug: np.ndarray | None = None
         self.mask: np.ndarray | None = None
 
@@ -404,6 +423,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--camera-background-seconds", type=float, default=2.0)
     result.add_argument("--min-foreground-area", type=int, default=420)
     result.add_argument("--roi", type=parse_roi, default=None, help="検出ROI x,y,width,height")
+    result.add_argument("--jump-rise-y-min", type=float, default=0.05, help="ジャンプ判定の重心上昇量（既定0.05）")
+    result.add_argument("--jump-rise-bottom-min", type=float, default=0.04, help="ジャンプ判定の下端上昇量（既定0.04）")
     result.add_argument("--fps", type=float, default=60.0)
     result.add_argument("--frames", type=int, default=0)
     result.add_argument("--seconds", type=float, default=0.0)
@@ -423,8 +444,14 @@ def preview(indexed: np.ndarray) -> np.ndarray:
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = parser().parse_args(argv)
-    if args.fps <= 0 or args.preview_scale <= 0 or (args.send and len(args.pi) != PI_COUNT):
-        print("error: --fps/--preview-scale または --pi の指定が不正", file=sys.stderr)
+    if (
+        args.fps <= 0
+        or args.preview_scale <= 0
+        or args.jump_rise_y_min <= 0
+        or args.jump_rise_bottom_min <= 0
+        or (args.send and len(args.pi) != PI_COUNT)
+    ):
+        print("error: --fps/--preview-scale/--jump-rise-* または --pi の指定が不正", file=sys.stderr)
         return 2
     camera: CameraController | None = None
     try:
@@ -437,6 +464,8 @@ def main(argv: Iterable[str] | None = None) -> int:
                 args.camera_background_seconds,
                 args.min_foreground_area,
                 args.roi,
+                args.jump_rise_y_min,
+                args.jump_rise_bottom_min,
             )
         sender = UdpFrameSender([parse_pi(value) for value in args.pi], args.chunk_size) if args.send else None
     except (RuntimeError, ValueError) as exc:

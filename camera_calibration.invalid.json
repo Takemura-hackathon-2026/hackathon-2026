@@ -1,0 +1,268 @@
+{
+  "ROI": {
+    "after_rotation": null,
+    "processed_size": [
+      240,
+      320
+    ]
+  },
+  "background": {
+    "fixed_mask_fraction": 0.1109375,
+    "frames": 15,
+    "median_luma": 104.0,
+    "noise_p95": 2.0,
+    "ready": true,
+    "stable_bright_mask_fraction": 0.009856770833333334,
+    "std_luma": 0.8055363893508911
+  },
+  "baseline": {
+    "area": 0.052978515625,
+    "bottom": 0.696875,
+    "mad": {
+      "area": 0.013160807291666667,
+      "bottom": 0.0703125,
+      "x": 0.06872506786329596,
+      "y": 0.021170648018505656
+    },
+    "x": 0.46699930644095566,
+    "y": 0.44255432644628057
+  },
+  "camera": {
+    "device": 0,
+    "exposure": {
+      "auto_readback": 1.0,
+      "gain_readback": 2.0,
+      "requested": {
+        "auto": 1.0,
+        "gain": 2.0,
+        "shutter": 312.0
+      },
+      "shutter_readback": 312.0
+    },
+    "fps": 30.0,
+    "height": 480,
+    "requested_height": 240,
+    "requested_width": 320,
+    "rotation": "ccw",
+    "width": 640
+  },
+  "date": "2026-08-19T04:39:19.997961+00:00",
+  "fixed_light": {
+    "coordinate_space": "processed_240x320_after_rotation_and_roi",
+    "regions": [
+      [
+        52,
+        32,
+        142,
+        60
+      ]
+    ],
+    "stable_background_mask": "stable_high_luminance_low_variance_only"
+  },
+  "motion_stats": {
+    "CENTER/STANCE": {
+      "area": {
+        "count": 220,
+        "mad": 0.013160807291666667,
+        "max": 0.11921223958333334,
+        "median": 0.052978515625,
+        "min": 0.0092578125,
+        "p10": 0.030821614583333334,
+        "p25": 0.0426904296875,
+        "p75": 0.06760579427083332,
+        "p90": 0.07768489583333334
+      },
+      "background_score": {
+        "count": 220,
+        "mad": 0.2403009414672851,
+        "max": 3.337187576293945,
+        "median": 1.9610684394836424,
+        "min": 1.1237218856811524,
+        "p10": 1.4595275020599365,
+        "p25": 1.6443378925323486,
+        "p75": 2.131083297729492,
+        "p90": 2.32930154800415
+      },
+      "bottom": {
+        "count": 220,
+        "mad": 0.0703125,
+        "max": 0.853125,
+        "median": 0.696875,
+        "min": 0.375,
+        "p10": 0.58125,
+        "p25": 0.63125,
+        "p75": 0.80625,
+        "p90": 0.834375
+      },
+      "persistence": {
+        "count": 220,
+        "mad": 28.5,
+        "max": 141.0,
+        "median": 56.0,
+        "min": 2.0,
+        "p10": 12.0,
+        "p25": 28.75,
+        "p75": 86.25,
+        "p90": 119.1
+      },
+      "x": {
+        "count": 220,
+        "mad": 0.06872506786329596,
+        "max": 0.9660962650414127,
+        "median": 0.46699930644095566,
+        "min": 0.04963004298941799,
+        "p10": 0.26956198786525826,
+        "p25": 0.42556380201893473,
+        "p75": 0.6849595767525913,
+        "p90": 0.8954808234958593
+      },
+      "y": {
+        "count": 220,
+        "mad": 0.021170648018505656,
+        "max": 0.5227573046618516,
+        "median": 0.44255432644628057,
+        "min": 0.27023265353961556,
+        "p10": 0.37822286733439053,
+        "p25": 0.40939053365176736,
+        "p75": 0.4576568177488746,
+        "p90": 0.4765005371360647
+      }
+    },
+    "JUMP": {
+      "area": {
+        "count": 0
+      },
+      "background_score": {
+        "count": 0
+      },
+      "bottom": {
+        "count": 0
+      },
+      "persistence": {
+        "count": 0
+      },
+      "rise_bottom": {
+        "count": 0
+      },
+      "rise_y": {
+        "count": 0
+      },
+      "x": {
+        "count": 0
+      },
+      "y": {
+        "count": 0
+      }
+    },
+    "LEFT": {
+      "area": {
+        "count": 0
+      },
+      "background_score": {
+        "count": 0
+      },
+      "bottom": {
+        "count": 0
+      },
+      "offset_x": {
+        "count": 0
+      },
+      "persistence": {
+        "count": 0
+      },
+      "x": {
+        "count": 0
+      },
+      "y": {
+        "count": 0
+      }
+    },
+    "RIGHT": {
+      "area": {
+        "count": 0
+      },
+      "background_score": {
+        "count": 0
+      },
+      "bottom": {
+        "count": 0
+      },
+      "offset_x": {
+        "count": 0
+      },
+      "persistence": {
+        "count": 0
+      },
+      "x": {
+        "count": 0
+      },
+      "y": {
+        "count": 0
+      }
+    },
+    "VALIDATE": {
+      "area": {
+        "count": 0
+      },
+      "background_score": {
+        "count": 0
+      },
+      "bottom": {
+        "count": 0
+      },
+      "persistence": {
+        "count": 0
+      },
+      "x": {
+        "count": 0
+      },
+      "y": {
+        "count": 0
+      }
+    }
+  },
+  "quality": {
+    "background_frames": 15,
+    "minimum_samples_per_stage": 8,
+    "reasons": [
+      "left_samples_insufficient",
+      "right_samples_insufficient",
+      "jump_samples_insufficient",
+      "validate_samples_insufficient",
+      "signal_abort"
+    ],
+    "valid": false
+  },
+  "sample_counts": {
+    "CENTER/STANCE": 220,
+    "JUMP": 0,
+    "LEFT": 0,
+    "RIGHT": 0,
+    "VALIDATE": 0
+  },
+  "status": "FAIL",
+  "thresholds": {
+    "center_tolerance": {
+      "bottom": 0.2109375,
+      "x": 0.2061752035898879,
+      "y": 0.06351194405551697
+    },
+    "jump": {
+      "rise_bottom_min": null,
+      "rise_y_min": null,
+      "source": "JUMP measured p25 rise"
+    },
+    "left": {
+      "delta_min": null,
+      "source": "LEFT measured p25 offset",
+      "x_max": null
+    },
+    "right": {
+      "delta_min": null,
+      "source": "RIGHT measured p25 offset",
+      "x_min": null
+    }
+  },
+  "valid": false,
+  "version": "1.0"
+}
