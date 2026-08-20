@@ -115,6 +115,22 @@ def main() -> int:
     if not game.boss_move_active or game.boss_x == x_before_move:
         errors.append("3回点滅後にボスが左右移動を開始しない")
 
+    game.reset(full=True)
+    game.boss_hp = game.boss_damage
+    point = game.boss_edge_points[np.argmax(game.boss_edge_points[:, 0])]
+    game.serving = False
+    game.boss_collision_armed = True
+    game.ball.x = game.boss_x + float(point[1])
+    game.ball.y = game.boss_y + float(point[0]) + game.ball_radius - .25
+    game.ball.vx, game.ball.vy = 0, -220
+    game._hit_boss()
+    if not game.boss_defeated or game.clear_remaining <= 0.0:
+        errors.append("クリア時の自動リセット待機に入らない")
+    for step in range(50):
+        game.step(.04, GameInput(), 1.5 + step * .04)
+    if game.boss_defeated or game.boss_hp != game.boss_max_hp or game.lives != 3 or not game.serving:
+        errors.append("クリア後に初期画面へ自動復帰しない")
+
     for step in range(120):
         frame = game.render("READY")
         if frame.shape != (384, 192) or int(frame.max()) >= FC6_LIMIT:

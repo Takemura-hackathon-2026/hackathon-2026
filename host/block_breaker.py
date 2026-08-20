@@ -325,6 +325,7 @@ class BlockBreaker:
     damage_effect_duration = .24
     boss_transition_duration = .48  # 3回の点滅（点灯・消灯を3周期）
     boss_move_speed = 52.0
+    clear_delay = 1.8
 
     def __init__(self) -> None:
         sprite, mask = load_boss_sprite()
@@ -351,6 +352,7 @@ class BlockBreaker:
         self.boss_transition_remaining = 0.0
         self.boss_move_active = False
         self.boss_move_vx = self.boss_move_speed
+        self.clear_remaining = 0.0
         self.game_over_until = 0.0
         self.reset(full=True)
 
@@ -368,6 +370,7 @@ class BlockBreaker:
             self.boss_transition_remaining = 0.0
             self.boss_move_active = False
             self.boss_move_vx = self.boss_move_speed
+            self.clear_remaining = 0.0
             self.game_over_until = 0.0
         self.paddle_x = (CANVAS_WIDTH - self.paddle_width) / 2
         self.serving = True
@@ -458,6 +461,7 @@ class BlockBreaker:
             self.boss_defeated = True
             self.serving = True
             self.ball.vx = self.ball.vy = 0.0
+            self.clear_remaining = self.clear_delay
         return True
 
     def _lose_ball(self, now: float) -> None:
@@ -492,6 +496,11 @@ class BlockBreaker:
             elif self.boss_x + self.boss_width >= CANVAS_WIDTH:
                 self.boss_x = CANVAS_WIDTH - self.boss_width
                 self.boss_move_vx = -abs(self.boss_move_vx)
+        if self.boss_defeated:
+            self.clear_remaining = max(0.0, self.clear_remaining - dt)
+            if self.clear_remaining == 0.0:
+                self.reset(full=True)
+            return
         if self.game_over_until:
             if now >= self.game_over_until:
                 self.game_over_until = 0.0
@@ -576,7 +585,6 @@ class BlockBreaker:
             cv2.circle(frame, (int(round(self.ball.x)), int(round(self.ball.y))), int(self.ball_radius), int(BALL), -1, lineType=cv2.LINE_8)
         if self.boss_defeated:
             self._text(frame, "BOSS DOWN", (39, 228), 0x12, .68)
-            self._text(frame, "R TO RETRY", (47, 249), TEXT, .40)
         elif self.game_over_until:
             self._text(frame, "GAME OVER", (43, 228), 0x06, .72)
         elif self.serving:
