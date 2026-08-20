@@ -36,11 +36,24 @@ constexpr int kMaxPacket = 2048;
 // 死活報告の送信先ポートと送信間隔。主機の診断表示（TEST2）が受ける。
 constexpr int kHealthPort = 5101;
 constexpr double kHealthIntervalSec = 1.0;
+// パネル全体の既定輝度。個別の --led-brightness 指定があればそちらを優先する。
+constexpr int kDefaultBrightnessPercent = 40;
 
 double MonotonicSeconds() {
   timespec ts{};
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return static_cast<double>(ts.tv_sec) + ts.tv_nsec * 1e-9;
+}
+
+bool ReadCpuTemperature(double *temperature_c) {
+  FILE *file = fopen("/sys/class/thermal/thermal_zone0/temp", "r");
+  if (file == nullptr) return false;
+  long millidegrees = 0;
+  const bool ok = fscanf(file, "%ld", &millidegrees) == 1;
+  fclose(file);
+  if (!ok || millidegrees < -50000 || millidegrees > 200000) return false;
+  *temperature_c = static_cast<double>(millidegrees) / 1000.0;
+  return true;
 }
 
 // palettes.py と同一。FC6 は 2026-08-06 指定の 52 色。
@@ -126,6 +139,7 @@ int main(int argc, char *argv[]) {
   matrix_options.chain_length = 6;
   matrix_options.parallel = 3;
   matrix_options.hardware_mapping = "regular";
+  matrix_options.brightness = kDefaultBrightnessPercent;
 
   if (!rgb_matrix::ParseOptionsFromFlags(&argc, &argv, &matrix_options,
                                          &runtime_options)) {
@@ -223,10 +237,16 @@ int main(int argc, char *argv[]) {
       const double span = now - last_health;
       const double fps = span > 0 ? (frames - frames_at_last_health) / span : 0.0;
       char line[256];
-      const int len = snprintf(
-          line, sizeof(line),
-          "PIHEALTH target=%d displayed=%ld dropped=%ld fps=%.1f up=%.0f rot=%d",
-          target_id, frames, dropped, fps, now - start_time, rotate180 ? 1 : 0);
+      double temperature_c = 0.0;
+      const int len = ReadCpuTemperature(&temperature_c)
+                          ? snprintf(line, sizeof(line),
+                                     "PIHEALTH target=%d displayed=%ld dropped=%ld fps=%.1f up=%.0f rot=%d temp_c=%.1f",
+                                     target_id, frames, dropped, fps, now - start_time,
+                                     rotate180 ? 1 : 0, temperature_c)
+                          : snprintf(line, sizeof(line),
+                                     "PIHEALTH target=%d displayed=%ld dropped=%ld fps=%.1f up=%.0f rot=%d temp_c=NA",
+                                     target_id, frames, dropped, fps, now - start_time,
+                                     rotate180 ? 1 : 0);
       if (len > 0) {
         sockaddr_in dest = host_addr;
         dest.sin_port = htons(health_port);

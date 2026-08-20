@@ -1,0 +1,17 @@
+[Unit]
+Description=RGB LED matrix client for target %i
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/hackathon-2026/pi-client
+ExecStart=/opt/hackathon-2026/pi-client/pi_client --target-id %i --port 5000 --health-port 5101
+Restart=always
+RestartSec=2
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

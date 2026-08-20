@@ -57,7 +57,7 @@ UDPペイロードは1200バイト固定（`--chunk-size`）。MTU 1500のまま
 報告は1行のASCIIテキストで、内容は次のとおり。
 
 ```text
-PIHEALTH target=0 displayed=1234 dropped=2 fps=59.8 up=41 rot=0
+PIHEALTH target=0 displayed=1234 dropped=2 fps=59.8 up=41 rot=0 temp_c=42.1
 ```
 
 ## 設定コマンド
@@ -142,10 +142,24 @@ ping -c 3 192.168.10.101
 ssh oyaki "for i in 1 2 3 4; do ping -c1 -W1 192.168.10.10\$i >/dev/null && echo pi\$i OK || echo pi\$i NG; done"
 ```
 
-各Pi側で表示クライアントを起動する（`target_id` は自機のIP末尾 − 101）:
+各Pi側で表示クライアントを手動インストールする場合（`target_id` は自機のIP末尾 − 101）:
 
 ```bash
-sudo ./pi_client --target-id 0 --port 5000
+./install.sh 0
+```
+
+通常は主機から4台へ転送・Pi上ビルド・systemd自動起動を一括で設定する。`PI_SSH_USER`はPi側の
+実ユーザー名に置き換える。Pi側でパスワードなしsudoと、`$HOME/rpi-rgb-led-matrix`の配置が必要。
+
+```bash
+PI_SSH_USER=pi host/oyaki_camera_calibrate.sh pi-deploy
+PI_SSH_USER=pi host/oyaki_camera_calibrate.sh pi-status
+```
+
+個別に再起動する場合:
+
+```bash
+PI_SSH_USER=pi host/oyaki_camera_calibrate.sh pi-start
 ```
 
 4台へ実際にフレームを送る:

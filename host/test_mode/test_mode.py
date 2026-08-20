@@ -57,6 +57,7 @@ HEADER = struct.Struct("!IIBBHHHI")
 # 既定の開始番号。MSX16 の 0 は透明であり送出しないため 1 から始める。
 FC6_COLOR_START = 0x00
 MSX16_COLOR_START = MSX16_TRANSPARENT + 1
+DEFAULT_IMAGE = Path(__file__).resolve().with_name("single-eye-catch_2800x1040.png")
 
 
 def color_sequence(mode: PaletteMode, start: int | None = None) -> tuple[int, ...]:
@@ -82,15 +83,16 @@ def color_sequence(mode: PaletteMode, start: int | None = None) -> tuple[int, ..
 # 素材読込み
 # ---------------------------------------------------------------------------
 def load_webp(path: Path) -> tuple[np.ndarray, np.ndarray]:
-    """WebP を (RGB配列, 不透明マスク) として読み込む。
+    """画像を (RGB配列, 不透明マスク) として読み込む。
 
-    アルファ付き WebP はアルファ 128 以上を前景として扱う。
+    既存名との互換性を保つため関数名は ``load_webp`` のままだが、PNGも扱う。
+    アルファ付き画像はアルファ 128 以上を前景として扱う。
     """
     if not path.exists():
         raise RuntimeError(f"画像が見つからない: {path}")
     image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
     if image is None:
-        raise RuntimeError(f"WebP の読込みに失敗した: {path}")
+        raise RuntimeError(f"画像の読込みに失敗した: {path}")
 
     if image.ndim == 2:
         rgb = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
@@ -121,6 +123,37 @@ def fit_image(
         opaque.astype(np.uint8), new_size, interpolation=cv2.INTER_NEAREST
     ).astype(bool)
     return rgb, opaque
+
+
+def crop_logo(
+    rgb: np.ndarray,
+    opaque: np.ndarray,
+    threshold: int = 245,
+    margin: int = 8,
+) -> tuple[np.ndarray, np.ndarray]:
+    """白い余白を除き、画像内のロゴ領域だけを切り抜く。
+
+    ロゴ画像の白背景と青いマークを前提にするが、アルファ値だけには依存しない。
+    そのため、元PNGをRGB LED用の背景色へ合成する場合でも切り抜き範囲が安定する。
+    """
+    image = np.asarray(rgb)
+    mask = np.asarray(opaque, dtype=bool)
+    if image.ndim != 3 or image.shape[2] != 3 or mask.shape != image.shape[:2]:
+        raise ValueError("ロゴ画像とマスクの形状が不正")
+    if not 0 <= threshold <= 255 or margin < 0:
+        raise ValueError("ロゴ切り抜きのthreshold/marginが不正")
+
+    content = mask & np.any(image < threshold, axis=2)
+    coordinates = np.argwhere(content)
+    if coordinates.size == 0:
+        raise ValueError("ロゴ領域を検出できない")
+    y0, x0 = coordinates.min(axis=0)
+    y1, x1 = coordinates.max(axis=0) + 1
+    y0 = max(0, int(y0) - margin)
+    x0 = max(0, int(x0) - margin)
+    y1 = min(image.shape[0], int(y1) + margin)
+    x1 = min(image.shape[1], int(x1) + margin)
+    return image[y0:y1, x0:x1], mask[y0:y1, x0:x1]
 
 
 # ---------------------------------------------------------------------------
@@ -494,7 +527,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="test.webp を FC6/MSX16 パレットで DVD ロゴ風に反射移動させる。"
     )
-    parser.add_argument("--image", type=Path, default=Path("test.webp"), help="WebP ファイル")
+    parser.add_argument(
+        "--image",
+        type=Path,
+        default=Path("test.webp"),
+        help="WebP ファイル",
+    )
     parser.add_argument("--palette", choices=("fc6", "msx16"), default="fc6")
     parser.add_argument(
         "--render-mode",
@@ -554,6 +592,8 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     try:
         rgb, opaque = load_webp(args.image)
+        if args.image.resolve() == DEFAULT_IMAGE.resolve():
+            rgb, opaque = crop_logo(rgb, opaque)
         if args.no_fit and (
             opaque.shape[1] > CANVAS_WIDTH or opaque.shape[0] > CANVAS_HEIGHT
         ):
