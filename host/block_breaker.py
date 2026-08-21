@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import signal
 import sys
@@ -26,6 +27,18 @@ for directory in (HOST, HOST / "test_mode"):
 
 from palettes import FC6, FC6_BLACK, FC6_LIMIT, FC6_WHITE, PaletteMode  # noqa: E402
 from test_mode import CANVAS_HEIGHT, CANVAS_WIDTH, PI_COUNT, UdpFrameSender, parse_pi  # noqa: E402
+
+# 校正値をそのまま使うには、測定系が camera_calibrate.py と一致していなければならない。
+# 閾値は CandidateDetector が 240x320 の処理画像で出した正規化値なので、検出・前処理を
+# 自前で書き直さず、校正側の実装をそのまま読み込んで共有する。_process_frame は非公開だが、
+# 回転→ROI→240x320リサイズの順序が1箇所でも違うと閾値の意味が変わるため、あえて再実装しない。
+from camera_calibrate import (  # noqa: E402
+    PROCESS_HEIGHT,
+    PROCESS_WIDTH,
+    CandidateDetector,
+    build_background_model,
+    _process_frame as process_frame,
+)
 
 
 # 正本 host/palettes.py 内のFC6インデックスだけを使う。
@@ -58,6 +71,113 @@ class InputState:
     calibrated: bool = False
 
 
+COORDINATE_SPACE = "processed_240x320_after_rotation_and_roi"
+
+
+@dataclass(frozen=True)
+class Calibration:
+    """camera_calibrate.py が書いた校正結果のうち、判定に必要な部分だけ。"""
+
+    baseline: BodyMeasurement
+    center_tolerance_x: float
+    center_tolerance_y: float
+    center_tolerance_bottom: float
+    left_delta_min: float
+    right_delta_min: float
+    jump_rise_y_min: float
+    jump_rise_bottom_min: float
+    rotation: str
+    roi: tuple[int, int, int, int] | None
+    device: int | str
+    width: int
+    height: int
+    fps: float
+    date: str
+    background_median_luma: float | None
+    source: Path
+
+
+def _require(mapping: dict, key: str, where: str) -> object:
+    if key not in mapping or mapping[key] is None:
+        raise ValueError(f"校正ファイルの {where}.{key} が欠けている（校正をやり直す）")
+    return mapping[key]
+
+
+def _positive(value: object, where: str) -> float:
+    number = float(value)  # type: ignore[arg-type]
+    if not math.isfinite(number) or number <= 0:
+        raise ValueError(f"校正ファイルの {where} が正の有限値でない: {value!r}")
+    return number
+
+
+def load_calibration(path: Path) -> Calibration:
+    """校正JSONを読み、判定に使える形へ変換する。
+
+    欠測や座標系の不一致は、その場で例外にする。校正値が一部でも欠けたまま
+    既定値で補うと「測ったつもりの推測値」で動いてしまうため、補完はしない。
+    """
+    if not path.exists():
+        raise ValueError(f"校正ファイルがない: {path}（先に camera_calibrate.py を実行する）")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"校正ファイルを読めない: {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"校正ファイルの形式が不正: {path}")
+
+    status = payload.get("status")
+    if not payload.get("valid") or status != "PASS":
+        reasons = payload.get("quality", {}).get("reasons", [])
+        raise ValueError(f"校正ファイルが未完了（status={status} reasons={reasons}）: {path}")
+
+    space = payload.get("fixed_light", {}).get("coordinate_space")
+    if space != COORDINATE_SPACE:
+        raise ValueError(f"校正の座標系が想定と違う: {space!r} != {COORDINATE_SPACE!r}")
+    processed = payload.get("ROI", {}).get("processed_size")
+    if list(processed or ()) != [PROCESS_WIDTH, PROCESS_HEIGHT]:
+        raise ValueError(f"校正の処理解像度が {PROCESS_WIDTH}x{PROCESS_HEIGHT} でない: {processed!r}")
+
+    base = payload.get("baseline") or {}
+    baseline = BodyMeasurement(
+        float(_require(base, "x", "baseline")),
+        float(_require(base, "y", "baseline")),
+        float(_require(base, "bottom", "baseline")),
+        float(_require(base, "area", "baseline")),
+    )
+    thresholds = payload.get("thresholds") or {}
+    tolerance = thresholds.get("center_tolerance") or {}
+    left = thresholds.get("left") or {}
+    right = thresholds.get("right") or {}
+    jump = thresholds.get("jump") or {}
+    camera = payload.get("camera") or {}
+    roi_value = (payload.get("ROI") or {}).get("after_rotation")
+    roi = None if roi_value is None else tuple(int(v) for v in roi_value)
+    if roi is not None and len(roi) != 4:
+        raise ValueError(f"校正のROIが4値でない: {roi_value!r}")
+
+    return Calibration(
+        baseline=baseline,
+        center_tolerance_x=_positive(_require(tolerance, "x", "thresholds.center_tolerance"), "center_tolerance.x"),
+        center_tolerance_y=_positive(_require(tolerance, "y", "thresholds.center_tolerance"), "center_tolerance.y"),
+        center_tolerance_bottom=_positive(
+            _require(tolerance, "bottom", "thresholds.center_tolerance"), "center_tolerance.bottom"
+        ),
+        left_delta_min=_positive(_require(left, "delta_min", "thresholds.left"), "left.delta_min"),
+        right_delta_min=_positive(_require(right, "delta_min", "thresholds.right"), "right.delta_min"),
+        jump_rise_y_min=_positive(_require(jump, "rise_y_min", "thresholds.jump"), "jump.rise_y_min"),
+        jump_rise_bottom_min=_positive(_require(jump, "rise_bottom_min", "thresholds.jump"), "jump.rise_bottom_min"),
+        rotation=str(camera.get("rotation") or "none"),
+        roi=roi,  # type: ignore[arg-type]
+        device=camera.get("device", 0),
+        width=int(camera.get("width") or camera.get("requested_width") or 640),
+        height=int(camera.get("height") or camera.get("requested_height") or 480),
+        fps=float(camera.get("fps") or 30.0),
+        date=str(payload.get("date") or "unknown"),
+        background_median_luma=(payload.get("background") or {}).get("median_luma"),
+        source=path,
+    )
+
+
 class InputClassifier:
     """校正済み重心の時系列をLEFT/RIGHT/JUMPへ変換する。"""
 
@@ -66,6 +186,7 @@ class InputClassifier:
         samples: int = 30,
         jump_rise_y_min: float = 0.05,
         jump_rise_bottom_min: float = 0.04,
+        calibration: Calibration | None = None,
     ) -> None:
         self.required_samples = max(3, samples)
         if (
@@ -75,10 +196,35 @@ class InputClassifier:
             or jump_rise_bottom_min <= 0
         ):
             raise ValueError("ジャンプ閾値は正の値")
-        self.jump_rise_y_min = float(jump_rise_y_min)
-        self.jump_rise_bottom_min = float(jump_rise_bottom_min)
+        self.calibration = calibration
+        if calibration is None:
+            # 校正なしの従来動作。閾値は実測ではなく固定値であることに注意。
+            self.jump_rise_y_min = float(jump_rise_y_min)
+            self.jump_rise_bottom_min = float(jump_rise_bottom_min)
+            self.enter_left = self.enter_right = .10
+            self.strong_left = self.strong_right = .17
+            self.idle_tolerance = .045
+            self.release_y = self.jump_rise_y_min * .45
+            self.release_bottom = self.jump_rise_bottom_min * .45
+        else:
+            self.jump_rise_y_min = calibration.jump_rise_y_min
+            self.jump_rise_bottom_min = calibration.jump_rise_bottom_min
+            self.enter_left = calibration.left_delta_min
+            self.enter_right = calibration.right_delta_min
+            # 実測p25を超えた時点で「確かに動いた」と見なせるため、速度ゲートは課さず
+            # デバウンス時間だけで確定させる。単発の外れ値は CandidateDetector の
+            # persistence>=2 が先に落としている。
+            self.strong_left = calibration.left_delta_min
+            self.strong_right = calibration.right_delta_min
+            self.idle_tolerance = calibration.center_tolerance_x
+            # ラッチ解除は既存実装の 0.45 倍を踏襲しつつ、静止時に実測した許容幅より
+            # 狭くはしない。狭すぎると着地後も解除されず次のジャンプが出なくなる。
+            self.release_y = max(calibration.center_tolerance_y, calibration.jump_rise_y_min * .45)
+            self.release_bottom = max(
+                calibration.center_tolerance_bottom, calibration.jump_rise_bottom_min * .45
+            )
         self.samples: list[BodyMeasurement] = []
-        self.baseline: BodyMeasurement | None = None
+        self.baseline: BodyMeasurement | None = None if calibration is None else calibration.baseline
         self.last: BodyMeasurement | None = None
         self.last_time = 0.0
         self.lateral = 0
@@ -92,7 +238,12 @@ class InputClassifier:
         return self.baseline is not None
 
     def reset(self) -> None:
-        self.__init__(self.required_samples, self.jump_rise_y_min, self.jump_rise_bottom_min)
+        self.__init__(
+            self.required_samples,
+            self.jump_rise_y_min,
+            self.jump_rise_bottom_min,
+            self.calibration,
+        )
 
     def update(self, body: BodyMeasurement | None, now: float) -> InputState:
         if body is None:
@@ -113,11 +264,19 @@ class InputClassifier:
         base = self.baseline
         velocity_x = 0.0 if self.last is None else (body.x - self.last.x) / max(.001, now - self.last_time)
         offset = body.x - base.x
-        target = -1 if offset <= -.10 else 1 if offset >= .10 else 0 if abs(offset) <= .045 else self.lateral
+        strong = self.strong_left if offset < 0 else self.strong_right
+        target = (
+            -1 if offset <= -self.enter_left
+            else 1 if offset >= self.enter_right
+            else 0 if abs(offset) <= self.idle_tolerance
+            else self.lateral
+        )
         if target != self.lateral:
             if target != self.candidate:
                 self.candidate, self.candidate_since = target, now
-            elif target == 0 or ((velocity_x * target >= .03 or abs(offset) >= .17) and now - self.candidate_since >= .12):
+            elif target == 0 or (
+                (velocity_x * target >= .03 or abs(offset) >= strong) and now - self.candidate_since >= .12
+            ):
                 self.lateral, self.candidate = target, target
         else:
             self.candidate = target
@@ -127,7 +286,7 @@ class InputClassifier:
         jump = pose and not self.jump_latched and now - self.last_jump >= .65
         if jump:
             self.jump_latched, self.last_jump = True, now
-        elif rise_y < self.jump_rise_y_min * .45 and rise_bottom < self.jump_rise_bottom_min * .45:
+        elif rise_y < self.release_y and rise_bottom < self.release_bottom:
             self.jump_latched = False
         self.last, self.last_time = body, now
         return InputState(self.lateral, jump, True, True)
@@ -138,7 +297,7 @@ class CameraController:
 
     def __init__(
         self,
-        device: int,
+        device: int | str,
         width: int,
         height: int,
         background_seconds: float,
@@ -146,6 +305,7 @@ class CameraController:
         roi: tuple[int, int, int, int] | None,
         jump_rise_y_min: float,
         jump_rise_bottom_min: float,
+        calibration: Calibration | None = None,
     ) -> None:
         self.capture = cv2.VideoCapture(device)
         if not self.capture.isOpened():
@@ -155,12 +315,23 @@ class CameraController:
         self.capture.set(cv2.CAP_PROP_FPS, 60)
         self.background_seconds = max(.2, background_seconds)
         self.min_area = max(1, min_area)
-        self.roi = roi
+        self.calibration = calibration
+        # 校正ありの時は、ROIも回転も校正時と同じものを使う。ここがずれると
+        # 正規化座標の意味が変わり、閾値がそのまま無効になる。
+        self.roi = calibration.roi if calibration is not None else roi
+        self.rotation = calibration.rotation if calibration is not None else "none"
         self.started: float | None = None
-        self.subtractor = cv2.createBackgroundSubtractorMOG2(history=240, varThreshold=20, detectShadows=False)
+        self.subtractor = (
+            None
+            if calibration is not None
+            else cv2.createBackgroundSubtractorMOG2(history=240, varThreshold=20, detectShadows=False)
+        )
+        self.background_frames: list[np.ndarray] = []
+        self.detector: CandidateDetector | None = None
         self.classifier = InputClassifier(
             jump_rise_y_min=jump_rise_y_min,
             jump_rise_bottom_min=jump_rise_bottom_min,
+            calibration=calibration,
         )
         self.debug: np.ndarray | None = None
         self.mask: np.ndarray | None = None
@@ -169,7 +340,39 @@ class CameraController:
     def stage(self) -> str:
         if self.started is None or time.monotonic() - self.started < self.background_seconds:
             return "BACKGROUND"
+        if self.calibration is not None:
+            # 基準姿勢は校正済みなので STANCE を待たせない。
+            return "READY" if self.detector is not None else "BACKGROUND"
         return "READY" if self.classifier.calibrated else "STANCE"
+
+    def _read_calibrated(self, source: np.ndarray, now: float) -> InputState:
+        """校正時と同一の前処理・検出器で1フレーム分を判定する。"""
+        processed, gray = process_frame(source, self.rotation, self.roi)
+        background_phase = now - (self.started or now) < self.background_seconds
+        if background_phase:
+            self.background_frames.append(gray)
+            self.debug, self.mask = processed, None
+            return InputState(calibrated=True)
+        if self.detector is None:
+            if len(self.background_frames) < 2:
+                raise RuntimeError("背景フレームが2枚に満たない（--camera-background-seconds を伸ばす）")
+            model = build_background_model(self.background_frames)
+            self.detector = CandidateDetector(model)
+            self.background_frames.clear()
+        detection = self.detector.detect(gray)
+        measurement = detection.measurement
+        body = (
+            None
+            if measurement is None
+            else BodyMeasurement(measurement.x, measurement.y, measurement.bottom, measurement.area)
+        )
+        debug = processed.copy()
+        if measurement is not None:
+            x, y, width, height = measurement.bbox
+            cv2.rectangle(debug, (x, y), (x + width, y + height), (0, 255, 0), 1)
+        cv2.putText(debug, self.stage, (6, 18), cv2.FONT_HERSHEY_SIMPLEX, .55, (0, 230, 230), 1, cv2.LINE_AA)
+        self.debug, self.mask = debug, detection.mask
+        return self.classifier.update(body, now)
 
     def close(self) -> None:
         self.capture.release()
@@ -180,6 +383,8 @@ class CameraController:
             return InputState(calibrated=self.classifier.calibrated)
         if self.started is None:
             self.started = now
+        if self.calibration is not None:
+            return self._read_calibrated(source, now)
         if self.roi is not None:
             x, y, width, height = self.roi
             source_height, source_width = source.shape[:2]
@@ -413,9 +618,38 @@ def parse_roi(value: str) -> tuple[int, int, int, int]:
     return parts  # type: ignore[return-value]
 
 
+def parse_camera(value: str) -> int | str:
+    """カメラ指定をインデックスまたはデバイスパスとして解釈する。
+
+    カメラが増減すると /dev/videoN の採番は入れ替わるため、固定したい場合は
+    /dev/v4l/by-id/... のシンボリックリンクを渡す。
+    """
+    try:
+        return int(value)
+    except ValueError:
+        path = Path(value)
+        if not path.exists():
+            raise argparse.ArgumentTypeError(f"カメラデバイスがない: {value}") from None
+        return str(path)
+
+
+DEFAULT_CALIBRATION = HOST.parent / "camera_calibration.json"
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="USBカメラまたはキーボードで操作する192x384 LEDブロック崩し")
-    result.add_argument("--camera", type=int, default=0)
+    result.add_argument("--camera", type=parse_camera, default=0, help="カメラ番号、または /dev/v4l/by-id/... のパス")
+    result.add_argument(
+        "--calibration",
+        type=Path,
+        default=DEFAULT_CALIBRATION,
+        help=f"camera_calibrate.py が書いた校正JSON（既定 {DEFAULT_CALIBRATION.name}）",
+    )
+    result.add_argument(
+        "--no-calibration",
+        action="store_true",
+        help="校正JSONを使わず、固定値の従来判定で動かす",
+    )
     result.add_argument("--keyboard", action="store_true", help="カメラを使わず、プレビューをキーボードで操作")
     result.add_argument("--no-camera", action="store_true", help="--keyboard の後方互換エイリアス")
     result.add_argument("--camera-width", type=int, default=640)
@@ -454,18 +688,24 @@ def main(argv: Iterable[str] | None = None) -> int:
         print("error: --fps/--preview-scale/--jump-rise-* または --pi の指定が不正", file=sys.stderr)
         return 2
     camera: CameraController | None = None
+    calibration: Calibration | None = None
     try:
         keyboard_mode = args.keyboard or args.no_camera
         if not keyboard_mode:
+            if not args.no_calibration:
+                calibration = load_calibration(args.calibration)
+            # デバイス指定は常に引数を優先する。校正JSONのdeviceは記録用であり、
+            # カメラの増減で /dev/videoN の採番が変わるため復元には使えない。
             camera = CameraController(
                 args.camera,
-                args.camera_width,
-                args.camera_height,
+                calibration.width if calibration is not None else args.camera_width,
+                calibration.height if calibration is not None else args.camera_height,
                 args.camera_background_seconds,
                 args.min_foreground_area,
                 args.roi,
                 args.jump_rise_y_min,
                 args.jump_rise_bottom_min,
+                calibration,
             )
         sender = UdpFrameSender([parse_pi(value) for value in args.pi], args.chunk_size) if args.send else None
     except (RuntimeError, ValueError) as exc:
@@ -482,6 +722,21 @@ def main(argv: Iterable[str] | None = None) -> int:
     period = 1 / args.fps
     input_label = "keyboard" if keyboard_mode else f"camera={args.camera}"
     print(f"block breaker: canvas={CANVAS_WIDTH}x{CANVAS_HEIGHT} palette=FC6 input={input_label} send={'yes' if sender else 'no'}")
+    if calibration is not None:
+        # 校正がいつ・どの構成で取られたかを必ず出す。カメラを動かした後の
+        # 古い校正で走っていることに気づけるようにするため。
+        print(
+            f"calibration: {calibration.source.name} date={calibration.date} "
+            f"rotation={calibration.rotation} roi={calibration.roi} "
+            f"device_at_calibration={calibration.device}"
+        )
+        print(
+            f"  thresholds: left>={calibration.left_delta_min:.4f} right>={calibration.right_delta_min:.4f} "
+            f"idle<={calibration.center_tolerance_x:.4f} "
+            f"jump rise_y>={calibration.jump_rise_y_min:.4f} rise_bottom>={calibration.jump_rise_bottom_min:.4f}"
+        )
+    elif not keyboard_mode:
+        print("calibration: 未使用（--no-calibration）。閾値は実測ではなく固定値", file=sys.stderr)
     if not args.no_preview:
         print("keys: A/D or LEFT/RIGHT = paddle, SPACE/W/UP = launch, R = reset, Q/ESC = quit")
     try:
