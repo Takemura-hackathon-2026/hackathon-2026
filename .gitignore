@@ -3,5 +3,4 @@ __pycache__/
 *.pyc
 .DS_Store
 
-# 姿勢推定モデル（host/fetch_models.sh で取得する。約17MB）
-host/models/*.onnx
+# 姿勢推定モデルも実機再現用にGit管理する（約17MB）

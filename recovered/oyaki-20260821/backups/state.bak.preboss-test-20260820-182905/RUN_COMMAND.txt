@@ -1,0 +1,1 @@
+.venv/bin/python host/block_breaker.py --calibration /home/th1/hackathon-2026/camera_calibration_multi.json --calibration-zone MID --mirror --jump-debug --no-preview --send --pi 192.168.10.101:5000 --pi 192.168.10.102:5000 --pi 192.168.10.103:5000 --pi 192.168.10.104:5000 

@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""ホスト常時起動用の待機表示。
+
+既定ではFC6全52色を8x8タイルへ並べた市松状グラデーションを表示する。
+``--mode logo`` を指定した場合は、既定のPNGから白い余白を除いたロゴ領域を
+192x384の中央へ配置する。ゲームや校正の処理はここでは起動しない。
+"""
+from __future__ import annotations
+
+import argparse
+import signal
+import sys
+import time
+from pathlib import Path
+from typing import Iterable
+
+import cv2
+import numpy as np
+
+HOST_ROOT = Path(__file__).resolve().parent
+TEST_MODE_ROOT = HOST_ROOT / "test_mode"
+if str(TEST_MODE_ROOT) not in sys.path:
+    sys.path.insert(0, str(TEST_MODE_ROOT))
+if str(HOST_ROOT) not in sys.path:
+    sys.path.insert(0, str(HOST_ROOT))
+
+from palettes import FC6, FC6_BLACK, FC6_LIMIT, PaletteMode  # noqa: E402
+from test_mode import (  # noqa: E402
+    CANVAS_HEIGHT,
+    CANVAS_WIDTH,
+    DEFAULT_IMAGE,
+    PI_COUNT,
+    UdpFrameSender,
+    crop_logo,
+    fit_image,
+    load_webp,
+    parse_int,
+    parse_pi,
+    quantize_to_palette,
+)
+
+MAX_LOGO_WIDTH = 160
+MAX_LOGO_HEIGHT = 320
+GRID_COLUMNS = 8
+GRID_ROWS = 8
+GRID_CELL_WIDTH = CANVAS_WIDTH // GRID_COLUMNS
+GRID_CELL_HEIGHT = CANVAS_HEIGHT // GRID_ROWS
+
+
+def build_palette_checkerboard_frame(background: int = FC6_BLACK) -> np.ndarray:
+    """FC6全色を左上から8x8の市松状タイルへ行優先で配置する。"""
+    if not 0 <= background < FC6_LIMIT:
+        raise ValueError(f"背景インデックス {background:#x} はFC6範囲外")
+
+    # FC6の52色を一度ずつ使い、64マスに足りない12マスは背景で埋める。
+    indices = list(range(FC6_LIMIT))
+    indices.extend([background] * (GRID_COLUMNS * GRID_ROWS - len(indices)))
+    frame = np.full((CANVAS_HEIGHT, CANVAS_WIDTH), background, dtype=np.uint8)
+    for position, index in enumerate(indices):
+        row, column = divmod(position, GRID_COLUMNS)
+        y0 = row * GRID_CELL_HEIGHT
+        x0 = column * GRID_CELL_WIDTH
+        y1 = y0 + GRID_CELL_HEIGHT
+        x1 = x0 + GRID_CELL_WIDTH
+        # 奇数タイルだけ1px内側へ入れ、隣接タイルとの境界を市松状に見せる。
+        inset = 1 if (row + column) % 2 else 0
+        frame[y0 + inset:y1 - inset, x0 + inset:x1 - inset] = index
+    return frame
+
+
+def build_logo_frame(image_path: Path, background: int | None = None) -> tuple[np.ndarray, tuple[int, int]]:
+    """ロゴ素材を中央配置したFC6インデックスフレームを返す。"""
+    rgb, opaque = load_webp(image_path)
+    if image_path.resolve() == DEFAULT_IMAGE.resolve():
+        rgb, opaque = crop_logo(rgb, opaque)
+    rgb, opaque = fit_image(rgb, opaque, MAX_LOGO_WIDTH, MAX_LOGO_HEIGHT)
+
+    background_index = FC6_BLACK if background is None else int(background)
+    if not 0 <= background_index < FC6_LIMIT:
+        raise ValueError(f"背景インデックス {background_index:#x} はFC6範囲外")
+
+    indexed = np.full((CANVAS_HEIGHT, CANVAS_WIDTH), background_index, dtype=np.uint8)
+    quantized = quantize_to_palette(rgb, PaletteMode.FC6)
+    height, width = opaque.shape
+    x0 = (CANVAS_WIDTH - width) // 2
+    y0 = (CANVAS_HEIGHT - height) // 2
+    indexed[y0:y0 + height, x0:x0 + width][opaque] = quantized[opaque]
+    return indexed, (width, height)
+
+
+def build_waiting_frame(
+    mode: str,
+    image_path: Path,
+    background: int | None = None,
+) -> tuple[np.ndarray, str]:
+    """待機モードに応じたFC6フレームと表示名を返す。"""
+    background_index = FC6_BLACK if background is None else int(background)
+    if mode == "palette":
+        return build_palette_checkerboard_frame(background_index), "palette-8x8"
+    frame, size = build_logo_frame(image_path, background_index)
+    return frame, f"logo-{size[0]}x{size[1]}"
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="ホスト常時起動用のFC6待機表示")
+    parser.add_argument(
+        "--mode",
+        choices=("palette", "logo"),
+        default="palette",
+        help="palette=全52色の8x8市松状グラデーション, logo=ロゴ表示",
+    )
+    parser.add_argument("--image", type=Path, default=DEFAULT_IMAGE, help="ロゴ素材（PNG/WebP）")
+    parser.add_argument("--background", type=parse_int, default=None, help="FC6背景インデックス（例: 0x30）")
+    parser.add_argument("--fps", type=float, default=30.0)
+    parser.add_argument("--frames", type=int, default=0, help="指定フレーム数で終了。0は無制限")
+    parser.add_argument("--seconds", type=float, default=0.0, help="指定秒数で終了。0は無制限")
+    parser.add_argument("--send", action="store_true", help="4台のPiへUDP送信する")
+    parser.add_argument("--pi", action="append", default=[], metavar="HOST[:PORT]")
+    parser.add_argument("--chunk-size", type=int, default=1200)
+    parser.add_argument("--preview", action="store_true", help="OpenCVプレビューを表示する")
+    parser.add_argument("--preview-scale", type=int, default=2)
+    return parser
+
+
+def main(argv: Iterable[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if (
+        args.fps <= 0
+        or args.preview_scale <= 0
+        or args.frames < 0
+        or args.seconds < 0
+        or (args.send and len(args.pi) != PI_COUNT)
+    ):
+        print("error: fps/preview-scale/frames/seconds または --pi の指定が不正", file=sys.stderr)
+        return 2
+
+    try:
+        indexed, screen_name = build_waiting_frame(args.mode, args.image, args.background)
+        sender = (
+            UdpFrameSender([parse_pi(value) for value in args.pi], args.chunk_size)
+            if args.send
+            else None
+        )
+    except (RuntimeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if indexed.shape != (CANVAS_HEIGHT, CANVAS_WIDTH) or int(indexed.max()) >= FC6_LIMIT:
+        print("error: 待機フレームがFC6の192x384条件を満たさない", file=sys.stderr)
+        if sender is not None:
+            sender.close()
+        return 2
+
+    running = True
+
+    def stop_handler(_signum: int, _frame: object) -> None:
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGINT, stop_handler)
+    signal.signal(signal.SIGTERM, stop_handler)
+
+    display = np.asarray([entry[:3] for entry in FC6], dtype=np.uint8)[indexed][:, :, ::-1]
+    if args.preview_scale != 1:
+        display = cv2.resize(
+            display,
+            (CANVAS_WIDTH * args.preview_scale, CANVAS_HEIGHT * args.preview_scale),
+            interpolation=cv2.INTER_NEAREST,
+        )
+
+    print(
+        f"standby: screen={screen_name} image={args.image} "
+        f"canvas={CANVAS_WIDTH}x{CANVAS_HEIGHT} fps={args.fps:g} send={'yes' if sender else 'no'}"
+    )
+    frame_id = 0
+    started = deadline = time.monotonic()
+    period = 1.0 / args.fps
+    try:
+        while running and (args.frames <= 0 or frame_id < args.frames):
+            now = time.monotonic()
+            if args.seconds > 0 and now - started >= args.seconds:
+                break
+            if sender is not None:
+                sender.send(frame_id, PaletteMode.FC6, indexed)
+            if args.preview:
+                cv2.imshow("RGB LED standby", display)
+                if (cv2.waitKey(1) & 0xFF) in (27, ord("q")):
+                    running = False
+            frame_id += 1
+            deadline += period
+            sleep_time = deadline - time.monotonic()
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+            elif sleep_time < -period:
+                deadline = time.monotonic()
+    finally:
+        if sender is not None:
+            sender.close()
+        if args.preview:
+            cv2.destroyAllWindows()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,106 @@
+{
+  "ROI": {
+    "after_rotation": null,
+    "processed_size": [
+      240,
+      320
+    ]
+  },
+  "camera": {
+    "device": 0,
+    "exposure": {
+      "auto_readback": 1.0,
+      "gain_readback": 2.0,
+      "requested": {
+        "auto": 1.0,
+        "gain": 2.0,
+        "shutter": 312.0
+      },
+      "shutter_readback": 312.0
+    },
+    "fps": 30.0,
+    "height": 480,
+    "requested_height": 240,
+    "requested_width": 320,
+    "rotation": "ccw",
+    "width": 640
+  },
+  "date": "2026-08-20T04:49:03.059156+00:00",
+  "version": "1.0-multi",
+  "zones": {
+    "FAR": {
+      "baseline": {
+        "area": 0.11682291666666667,
+        "bottom": 0.778125,
+        "x": 0.4851760019715551,
+        "y": 0.35262819134373985
+      },
+      "sample_counts": {
+        "JUMP": 46,
+        "LEFT": 156,
+        "RIGHT": 177,
+        "STANCE": 90
+      },
+      "status": "PASS",
+      "thresholds": {
+        "center_tolerance": {
+          "source": "STANCE measured MAD x3",
+          "x": 0.007077659774462064
+        },
+        "jump": {
+          "rise_bottom_min": 0.02499999999999991,
+          "rise_y_min": 0.08251951670878686,
+          "source": "JUMP measured p25 rise"
+        },
+        "left": {
+          "delta_min": 0.06202620979872282,
+          "source": "LEFT measured p25 offset",
+          "x_max": 0.4231497921728323
+        },
+        "right": {
+          "delta_min": 0.14391915939934818,
+          "source": "RIGHT measured p25 offset",
+          "x_min": 0.6290951613709033
+        }
+      },
+      "valid": true
+    },
+    "MID": {
+      "baseline": {
+        "area": 0.2229231770833333,
+        "bottom": 0.784375,
+        "x": 0.44942313539664736,
+        "y": 0.2925355966265003
+      },
+      "sample_counts": {
+        "JUMP": 38,
+        "LEFT": 209,
+        "RIGHT": 272,
+        "STANCE": 146
+      },
+      "status": "PASS",
+      "thresholds": {
+        "center_tolerance": {
+          "source": "STANCE measured MAD x3",
+          "x": 0.008142866885519934
+        },
+        "jump": {
+          "rise_bottom_min": 0.24453125000000003,
+          "rise_y_min": 0.0553551355777426,
+          "source": "JUMP measured p25 rise"
+        },
+        "left": {
+          "delta_min": 0.08690507253425556,
+          "source": "LEFT measured p25 offset",
+          "x_max": 0.3625180628623918
+        },
+        "right": {
+          "delta_min": 0.10058228587237772,
+          "source": "RIGHT measured p25 offset",
+          "x_min": 0.5500054212690251
+        }
+      },
+      "valid": true
+    }
+  }
+}

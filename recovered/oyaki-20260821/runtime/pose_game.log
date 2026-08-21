@@ -1,0 +1,5 @@
+[ WARN:0@0.109] global net_impl_backend.cpp:345 setPreferableTarget Targets are not supported by the new graph engine for now
+[ WARN:0@0.123] global net_impl_backend.cpp:345 setPreferableTarget Targets are not supported by the new graph engine for now
+pose game: canvas=192x384 camera=/dev/v4l/by-id/usb-e-con_systems_See3CAM_130_311CC209-video-index0 calibration=pose_calibration.json rotation=none direction=player_relative send=yes
+thresholds(torso): left>=0.0535 right>=1.2422 jump rise_y>=0.3046 rise_bottom>=0.7412
+pose game: frames=8684 stage=POSE

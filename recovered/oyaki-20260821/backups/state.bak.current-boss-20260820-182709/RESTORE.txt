@@ -1,0 +1,1 @@
+Restore host/block_breaker.py and host/block_breaker_selftest.py from this backup, run selftest, then launch the command in RUN_COMMAND.txt.
