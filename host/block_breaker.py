@@ -72,6 +72,8 @@ class InputState:
 
 
 COORDINATE_SPACE = "processed_240x320_after_rotation_and_roi"
+# 背景モデルに最低限必要な枚数。camera_calibrate.py の校正時は15枚で作られている。
+BACKGROUND_MIN_FRAMES = 8
 
 
 @dataclass(frozen=True)
@@ -92,6 +94,7 @@ class Calibration:
     width: int
     height: int
     fps: float
+    exposure: tuple[float, float, float] | None
     date: str
     background_median_luma: float | None
     source: Path
@@ -108,6 +111,34 @@ def _positive(value: object, where: str) -> float:
     if not math.isfinite(number) or number <= 0:
         raise ValueError(f"校正ファイルの {where} が正の有限値でない: {value!r}")
     return number
+
+
+def _exposure_from(camera: dict) -> tuple[float, float, float] | None:
+    """校正時に要求した auto/shutter/gain を取り出す。
+
+    校正はこの露出で測っているため、本番も同じ値で走らせないと画素値の水準が
+    変わる。特にオート露出のままだと、扉の開閉や環境光の変化にAGCが追従して
+    全画素が動き、背景差分が成立しない。
+    """
+    requested = (camera.get("exposure") or {}).get("requested") or {}
+    values = (requested.get("auto"), requested.get("shutter"), requested.get("gain"))
+    if any(value is None for value in values):
+        return None
+    numbers = tuple(float(value) for value in values)  # type: ignore[arg-type]
+    if not all(math.isfinite(number) for number in numbers):
+        return None
+    return numbers  # type: ignore[return-value]
+
+
+def parse_exposure(value: str) -> tuple[float, float, float]:
+    """露出設定 auto/shutter/gain を読む。camera_calibrate.py と同じ書式。"""
+    try:
+        parts = tuple(float(part) for part in value.split("/"))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("露出は auto/shutter/gain 形式") from exc
+    if len(parts) != 3 or not all(math.isfinite(part) for part in parts):
+        raise argparse.ArgumentTypeError("露出は有限な3値 auto/shutter/gain")
+    return parts  # type: ignore[return-value]
 
 
 def load_calibration(path: Path) -> Calibration:
@@ -172,6 +203,7 @@ def load_calibration(path: Path) -> Calibration:
         width=int(camera.get("width") or camera.get("requested_width") or 640),
         height=int(camera.get("height") or camera.get("requested_height") or 480),
         fps=float(camera.get("fps") or 30.0),
+        exposure=_exposure_from(camera),
         date=str(payload.get("date") or "unknown"),
         background_median_luma=(payload.get("background") or {}).get("median_luma"),
         source=path,
@@ -306,6 +338,7 @@ class CameraController:
         jump_rise_y_min: float,
         jump_rise_bottom_min: float,
         calibration: Calibration | None = None,
+        exposure: tuple[float, float, float] | None = None,
     ) -> None:
         self.capture = cv2.VideoCapture(device)
         if not self.capture.isOpened():
@@ -313,6 +346,15 @@ class CameraController:
         self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self.capture.set(cv2.CAP_PROP_FPS, 60)
+        # 露出は校正時と同じ値に固定する。ここを既定（多くの環境でオート）のまま
+        # 走らせると、校正した画素水準と本番の画素水準が食い違う。
+        self.exposure = exposure if exposure is not None else (
+            calibration.exposure if calibration is not None else None
+        )
+        if self.exposure is not None:
+            self.capture.set(cv2.CAP_PROP_AUTO_EXPOSURE, self.exposure[0])
+            self.capture.set(cv2.CAP_PROP_EXPOSURE, self.exposure[1])
+            self.capture.set(cv2.CAP_PROP_GAIN, self.exposure[2])
         self.background_seconds = max(.2, background_seconds)
         self.min_area = max(1, min_area)
         self.calibration = calibration
@@ -348,14 +390,16 @@ class CameraController:
     def _read_calibrated(self, source: np.ndarray, now: float) -> InputState:
         """校正時と同一の前処理・検出器で1フレーム分を判定する。"""
         processed, gray = process_frame(source, self.rotation, self.roi)
-        background_phase = now - (self.started or now) < self.background_seconds
-        if background_phase:
+        elapsed = now - (self.started or now)
+        # 時間だけで打ち切ると、露出を伸ばした時など実フレームレートが落ちた場合に
+        # 枚数が足りないまま次段へ進んでしまう。時間と枚数の両方を満たすまで集める。
+        if self.detector is None and (
+            elapsed < self.background_seconds or len(self.background_frames) < BACKGROUND_MIN_FRAMES
+        ):
             self.background_frames.append(gray)
             self.debug, self.mask = processed, None
             return InputState(calibrated=True)
         if self.detector is None:
-            if len(self.background_frames) < 2:
-                raise RuntimeError("背景フレームが2枚に満たない（--camera-background-seconds を伸ばす）")
             model = build_background_model(self.background_frames)
             self.detector = CandidateDetector(model)
             self.background_frames.clear()
@@ -650,6 +694,12 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="校正JSONを使わず、固定値の従来判定で動かす",
     )
+    result.add_argument(
+        "--exposure",
+        type=parse_exposure,
+        default=None,
+        help="auto/shutter/gain。既定は校正JSONに記録された値を使う",
+    )
     result.add_argument("--keyboard", action="store_true", help="カメラを使わず、プレビューをキーボードで操作")
     result.add_argument("--no-camera", action="store_true", help="--keyboard の後方互換エイリアス")
     result.add_argument("--camera-width", type=int, default=640)
@@ -706,6 +756,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 args.jump_rise_y_min,
                 args.jump_rise_bottom_min,
                 calibration,
+                args.exposure,
             )
         sender = UdpFrameSender([parse_pi(value) for value in args.pi], args.chunk_size) if args.send else None
     except (RuntimeError, ValueError) as exc:
@@ -735,6 +786,14 @@ def main(argv: Iterable[str] | None = None) -> int:
             f"idle<={calibration.center_tolerance_x:.4f} "
             f"jump rise_y>={calibration.jump_rise_y_min:.4f} rise_bottom>={calibration.jump_rise_bottom_min:.4f}"
         )
+        applied = camera.exposure if camera is not None else None
+        if applied is None:
+            print(
+                "  exposure: 未適用。校正時と画素水準がずれる（--exposure auto/shutter/gain で指定）",
+                file=sys.stderr,
+            )
+        else:
+            print(f"  exposure: auto={applied[0]:g} shutter={applied[1]:g} gain={applied[2]:g}")
     elif not keyboard_mode:
         print("calibration: 未使用（--no-calibration）。閾値は実測ではなく固定値", file=sys.stderr)
     if not args.no_preview:
