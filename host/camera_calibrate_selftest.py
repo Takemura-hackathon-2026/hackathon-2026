@@ -18,6 +18,7 @@ from camera_calibrate import (
     CalibrationSession,
     CandidateDetector,
     FrameIdGenerator,
+    LED_TEXT_MAX_CHARS,
     Measurement,
     atomic_write_json,
     build_background_model,
@@ -25,6 +26,7 @@ from camera_calibrate import (
     render_led_frame,
     rotate_frame,
     rotate_point,
+    _wrap_led_text,
     write_calibration_result,
 )
 
@@ -57,6 +59,17 @@ def test_rendering() -> None:
         assert frame.shape == (CANVAS_HEIGHT, CANVAS_WIDTH), (stage, frame.shape)
         assert frame.dtype == np.uint8
         assert int(frame.min()) >= 0 and int(frame.max()) < 0x34
+
+    for text in (
+        "STAND STILL AT CENTER",
+        "STEP LEFT AND HOLD",
+        "JUMP REPEATEDLY",
+        "CANDIDATE INVALID",
+        "CALIBRATION FAIL",
+    ):
+        lines = _wrap_led_text(text)
+        assert all(len(line) <= LED_TEXT_MAX_CHARS for line in lines), (text, lines)
+        assert "".join(lines).replace(" ", "") == text.replace(" ", "")
 
 
 def test_frame_ids() -> None:

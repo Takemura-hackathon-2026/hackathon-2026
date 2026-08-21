@@ -2,7 +2,10 @@
 """カメラ非依存のブロック崩し・入力分類器検証。"""
 from __future__ import annotations
 
+import json
 import sys
+import tempfile
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -12,8 +15,14 @@ from block_breaker import (  # noqa: E402
     BlockBreaker,
     GameInput,
     InputClassifier,
+    POSE_COORDINATE_SPACE,
+    POSE_DIRECTION_CONVENTION,
+    PoseCalibration,
+    PoseInputClassifier,
+    PoseMeasurement,
     keyboard_action,
     load_calibration,
+    load_pose_calibration,
 )
 from palettes import FC6_LIMIT  # noqa: E402
 
@@ -69,6 +78,92 @@ def check_calibrated_classifier(errors: list[str]) -> None:
         errors.append("reset後に校正値を維持しない")
 
 
+def check_pose_calibrated_classifier(errors: list[str]) -> None:
+    """姿勢校正値の読み込み、本人基準の左右、胴長単位のジャンプを確認する。"""
+    base = PoseMeasurement(.5, .5, .9, .2, .25, 1.0, 1.0)
+    calibration = PoseCalibration(
+        baseline=base,
+        center_tolerance_x=.03,
+        center_tolerance_y=.03,
+        center_tolerance_bottom=.03,
+        left_delta_min=.10,
+        right_delta_min=.10,
+        jump_rise_y_min=.10,
+        jump_rise_bottom_min=.10,
+        rotation="none",
+        device=0,
+        width=640,
+        height=480,
+        exposure=(1.0, 2.0, 3.0),
+        date="selftest",
+        source=Path("selftest.json"),
+    )
+
+    classifier = PoseInputClassifier(calibration)
+    left = replace(base, x=base.x + .11 * base.scale)
+    for now in (0.0, .05, .13):
+        state = classifier.update(left, now)
+    if state.lateral != -1:
+        errors.append("本人基準のLEFT（画像x増加）を確定しない")
+
+    classifier.reset()
+    right = replace(base, x=base.x - .11 * base.scale)
+    for now in (0.0, .05, .13):
+        state = classifier.update(right, now)
+    if state.lateral != 1:
+        errors.append("本人基準のRIGHT（画像x減少）を確定しない")
+
+    classifier.reset()
+    jump = replace(base, y=base.y - .11 * base.scale, bottom=base.bottom - .11 * base.scale)
+    classifier.update(jump, 1.0)
+    if not classifier.update(jump, 1.05).jump:
+        errors.append("胴長単位の校正ジャンプを確定しない")
+
+    payload = {
+        "status": "PASS",
+        "valid": True,
+        "coordinate_space": POSE_COORDINATE_SPACE,
+        "direction_convention": POSE_DIRECTION_CONVENTION,
+        "camera": {
+            "device": 0,
+            "rotation": "none",
+            "width": 640,
+            "height": 480,
+            "exposure": [1.0, 2.0, 3.0],
+        },
+        "baseline": {
+            "x": base.x,
+            "y": base.y,
+            "bottom": base.bottom,
+            "area": base.area,
+            "scale": base.scale,
+        },
+        "thresholds": {
+            "units": "torso_lengths",
+            "center_tolerance": {"x": .03, "y": .03, "bottom": .03},
+            "left": {"delta_min": .10},
+            "right": {"delta_min": .10},
+            "jump": {"rise_y_min": .10, "rise_bottom_min": .10},
+        },
+        "quality": {"valid": True, "reasons": []},
+    }
+    with tempfile.TemporaryDirectory() as temp_dir:
+        path = Path(temp_dir) / "pose_calibration.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        loaded = load_pose_calibration(path)
+        if loaded.left_delta_min != .10 or loaded.exposure != (1.0, 2.0, 3.0):
+            errors.append("姿勢校正JSONから閾値・露出を読み込まない")
+        payload["status"] = "FAIL"
+        payload["valid"] = False
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        try:
+            load_pose_calibration(path)
+        except ValueError:
+            pass
+        else:
+            errors.append("FAILの姿勢校正JSONを拒否しない")
+
+
 def main() -> int:
     errors: list[str] = []
     classifier = InputClassifier(samples=3)
@@ -111,6 +206,7 @@ def main() -> int:
             break
         game.step(1 / 60, GameInput(-1 if step % 60 < 30 else 1), .4 + step / 60)
     check_calibrated_classifier(errors)
+    check_pose_calibrated_classifier(errors)
     for error in errors:
         print(f"ERROR: {error}")
     print(f"{len(errors)} errors")

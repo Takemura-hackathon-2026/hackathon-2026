@@ -38,7 +38,9 @@ from camera_calibrate import (  # noqa: E402
     CandidateDetector,
     build_background_model,
     _process_frame as process_frame,
+    rotate_frame,
 )
+from pose_input import DEFAULT_MODEL_DIR, PoseMeasurement, PoseTracker  # noqa: E402
 
 
 # 正本 host/palettes.py 内のFC6インデックスだけを使う。
@@ -100,6 +102,31 @@ class Calibration:
     source: Path
 
 
+POSE_COORDINATE_SPACE = "pose_landmarks_normalized_by_torso"
+POSE_DIRECTION_CONVENTION = "player_relative"
+
+
+@dataclass(frozen=True)
+class PoseCalibration:
+    """pose_calibrate.py が書いた校正結果のうち、ゲーム判定に必要な部分。"""
+
+    baseline: PoseMeasurement
+    center_tolerance_x: float
+    center_tolerance_y: float
+    center_tolerance_bottom: float
+    left_delta_min: float
+    right_delta_min: float
+    jump_rise_y_min: float
+    jump_rise_bottom_min: float
+    rotation: str
+    device: int | str
+    width: int
+    height: int
+    exposure: tuple[float, float, float] | None
+    date: str
+    source: Path
+
+
 def _require(mapping: dict, key: str, where: str) -> object:
     if key not in mapping or mapping[key] is None:
         raise ValueError(f"校正ファイルの {where}.{key} が欠けている（校正をやり直す）")
@@ -110,6 +137,13 @@ def _positive(value: object, where: str) -> float:
     number = float(value)  # type: ignore[arg-type]
     if not math.isfinite(number) or number <= 0:
         raise ValueError(f"校正ファイルの {where} が正の有限値でない: {value!r}")
+    return number
+
+
+def _nonnegative(value: object, where: str) -> float:
+    number = float(value)  # type: ignore[arg-type]
+    if not math.isfinite(number) or number < 0:
+        raise ValueError(f"校正ファイルの {where} が0以上の有限値でない: {value!r}")
     return number
 
 
@@ -206,6 +240,102 @@ def load_calibration(path: Path) -> Calibration:
         exposure=_exposure_from(camera),
         date=str(payload.get("date") or "unknown"),
         background_median_luma=(payload.get("background") or {}).get("median_luma"),
+        source=path,
+    )
+
+
+def _pose_exposure_from(camera: dict) -> tuple[float, float, float] | None:
+    """姿勢校正の露出（リスト形式）を読み、旧形式の辞書も受け入れる。"""
+    value = camera.get("exposure")
+    if isinstance(value, dict):
+        value = (value.get("requested") or {}).get("values") or (
+            (value.get("requested") or {}).get("auto"),
+            (value.get("requested") or {}).get("shutter"),
+            (value.get("requested") or {}).get("gain"),
+        )
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        return None
+    numbers = tuple(float(item) for item in value)
+    if not all(math.isfinite(item) for item in numbers):
+        return None
+    return numbers  # type: ignore[return-value]
+
+
+def load_pose_calibration(path: Path) -> PoseCalibration:
+    """姿勢校正JSONを読み、PASS済みの値だけをゲームへ渡す。"""
+    if not path.exists():
+        raise ValueError(f"姿勢校正ファイルがない: {path}（先に pose_calibrate.py を実行する）")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"姿勢校正ファイルを読めない: {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"姿勢校正ファイルの形式が不正: {path}")
+
+    status = payload.get("status")
+    if not payload.get("valid") or status != "PASS":
+        reasons = payload.get("quality", {}).get("reasons", [])
+        raise ValueError(f"姿勢校正が未完了（status={status} reasons={reasons}）: {path}")
+    if payload.get("coordinate_space") != POSE_COORDINATE_SPACE:
+        raise ValueError(
+            f"姿勢校正の座標系が想定と違う: {payload.get('coordinate_space')!r} != {POSE_COORDINATE_SPACE!r}"
+        )
+    if payload.get("direction_convention") != POSE_DIRECTION_CONVENTION:
+        raise ValueError(
+            "姿勢校正の左右定義が想定と違う: "
+            f"{payload.get('direction_convention')!r} != {POSE_DIRECTION_CONVENTION!r}"
+        )
+
+    baseline_data = payload.get("baseline")
+    thresholds = payload.get("thresholds")
+    camera = payload.get("camera")
+    if not isinstance(baseline_data, dict) or not isinstance(thresholds, dict) or not isinstance(camera, dict):
+        raise ValueError(f"姿勢校正ファイルのbaseline/thresholds/cameraが不正: {path}")
+    if thresholds.get("units") != "torso_lengths":
+        raise ValueError(f"姿勢校正の閾値単位が不正: {thresholds.get('units')!r}")
+
+    baseline = PoseMeasurement(
+        float(_require(baseline_data, "x", "baseline")),
+        float(_require(baseline_data, "y", "baseline")),
+        float(_require(baseline_data, "bottom", "baseline")),
+        float(_require(baseline_data, "area", "baseline")),
+        _positive(_require(baseline_data, "scale", "baseline"), "baseline.scale"),
+        1.0,
+        1.0,
+    )
+    if not all(math.isfinite(value) for value in (baseline.x, baseline.y, baseline.bottom, baseline.area)):
+        raise ValueError(f"姿勢校正のbaselineに有限でない値がある: {path}")
+
+    tolerance = thresholds.get("center_tolerance")
+    left = thresholds.get("left")
+    right = thresholds.get("right")
+    jump = thresholds.get("jump")
+    if not all(isinstance(value, dict) for value in (tolerance, left, right, jump)):
+        raise ValueError(f"姿勢校正のthresholds内に必要な項目がない: {path}")
+
+    rotation = str(camera.get("rotation") or "none")
+    if rotation not in {"none", "cw", "ccw", "180"}:
+        raise ValueError(f"姿勢校正のrotationが不正: {rotation!r}")
+    width = int(camera.get("width") or 0)
+    height = int(camera.get("height") or 0)
+    if width <= 0 or height <= 0:
+        raise ValueError(f"姿勢校正のカメラ解像度が不正: {width}x{height}")
+
+    return PoseCalibration(
+        baseline=baseline,
+        center_tolerance_x=_nonnegative(tolerance["x"], "thresholds.center_tolerance.x"),  # type: ignore[index]
+        center_tolerance_y=_nonnegative(tolerance["y"], "thresholds.center_tolerance.y"),  # type: ignore[index]
+        center_tolerance_bottom=_nonnegative(tolerance["bottom"], "thresholds.center_tolerance.bottom"),  # type: ignore[index]
+        left_delta_min=_positive(left["delta_min"], "thresholds.left.delta_min"),  # type: ignore[index]
+        right_delta_min=_positive(right["delta_min"], "thresholds.right.delta_min"),  # type: ignore[index]
+        jump_rise_y_min=_positive(jump["rise_y_min"], "thresholds.jump.rise_y_min"),  # type: ignore[index]
+        jump_rise_bottom_min=_positive(jump["rise_bottom_min"], "thresholds.jump.rise_bottom_min"),  # type: ignore[index]
+        rotation=rotation,
+        device=camera.get("device", 0),
+        width=width,
+        height=height,
+        exposure=_pose_exposure_from(camera),
+        date=str(payload.get("date") or "unknown"),
         source=path,
     )
 
@@ -320,6 +450,83 @@ class InputClassifier:
             self.jump_latched, self.last_jump = True, now
         elif rise_y < self.release_y and rise_bottom < self.release_bottom:
             self.jump_latched = False
+        self.last, self.last_time = body, now
+        return InputState(self.lateral, jump, True, True)
+
+
+class PoseInputClassifier:
+    """胴長で正規化したPoseMeasurementをゲーム入力へ変換する。"""
+
+    def __init__(self, calibration: PoseCalibration) -> None:
+        self.calibration = calibration
+        self.last: PoseMeasurement | None = None
+        self.last_time = 0.0
+        self.lateral = 0
+        self.candidate = 0
+        self.candidate_since = 0.0
+        self.jump_latched = False
+        self.jump_candidates = 0
+        self.last_jump = -math.inf
+
+    @property
+    def calibrated(self) -> bool:
+        return True
+
+    def reset(self) -> None:
+        self.__init__(self.calibration)
+
+    def update(self, body: PoseMeasurement | None, now: float) -> InputState:
+        if body is None or not body.valid:
+            self.last = None
+            self.lateral = 0
+            self.candidate = 0
+            self.jump_latched = False
+            self.jump_candidates = 0
+            return InputState(calibrated=True)
+
+        base = self.calibration.baseline
+        scale = body.scale
+        offset_x = (body.x - base.x) / scale
+        left_amount = offset_x  # 正面カメラでは参加者本人の左が画像右。
+        right_amount = -offset_x
+        if left_amount >= self.calibration.left_delta_min:
+            target = -1
+        elif right_amount >= self.calibration.right_delta_min:
+            target = 1
+        elif abs(offset_x) <= self.calibration.center_tolerance_x:
+            target = 0
+        else:
+            target = self.lateral
+
+        if target != self.lateral:
+            if target != self.candidate:
+                self.candidate, self.candidate_since = target, now
+            elif target == 0 or now - self.candidate_since >= 0.12:
+                self.lateral, self.candidate = target, target
+        else:
+            self.candidate = target
+
+        rise_y = (base.y - body.y) / scale
+        rise_bottom = (base.bottom - body.bottom) / scale
+        pose = (
+            rise_y >= self.calibration.jump_rise_y_min
+            and rise_bottom >= self.calibration.jump_rise_bottom_min
+        )
+        self.jump_candidates = self.jump_candidates + 1 if pose else 0
+        jump = (
+            self.jump_candidates >= 2
+            and not self.jump_latched
+            and now - self.last_jump >= 0.65
+        )
+        if jump:
+            self.jump_latched, self.last_jump = True, now
+        elif (
+            rise_y < max(self.calibration.center_tolerance_y, self.calibration.jump_rise_y_min * 0.45)
+            and rise_bottom
+            < max(self.calibration.center_tolerance_bottom, self.calibration.jump_rise_bottom_min * 0.45)
+        ):
+            self.jump_latched = False
+
         self.last, self.last_time = body, now
         return InputState(self.lateral, jump, True, True)
 
@@ -474,6 +681,87 @@ class CameraController:
             cv2.imshow("block breaker camera", self.debug)
         if self.mask is not None:
             cv2.imshow("block breaker foreground mask", self.mask)
+
+
+class PoseCameraController:
+    """カメラ → BlazePose追跡 → 姿勢校正値によるゲーム入力。"""
+
+    def __init__(
+        self,
+        device: int | str,
+        calibration: PoseCalibration,
+        model_dir: Path = DEFAULT_MODEL_DIR,
+        threads: int = 4,
+        redetect_after: int = 5,
+        exposure: tuple[float, float, float] | None = None,
+    ) -> None:
+        self.capture = cv2.VideoCapture(device)
+        if not self.capture.isOpened():
+            raise RuntimeError(f"カメラ {device} を開けない")
+        self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, calibration.width)
+        self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, calibration.height)
+        self.capture.set(cv2.CAP_PROP_FPS, 60)
+        self.exposure = exposure if exposure is not None else calibration.exposure
+        if self.exposure is not None:
+            self.capture.set(cv2.CAP_PROP_AUTO_EXPOSURE, self.exposure[0])
+            self.capture.set(cv2.CAP_PROP_EXPOSURE, self.exposure[1])
+            self.capture.set(cv2.CAP_PROP_GAIN, self.exposure[2])
+        try:
+            self.tracker = PoseTracker(
+                model_dir=model_dir,
+                threads=threads,
+                redetect_after=redetect_after,
+            )
+        except Exception:
+            self.capture.release()
+            raise
+        self.calibration = calibration
+        self.classifier = PoseInputClassifier(calibration)
+        self.debug: np.ndarray | None = None
+        self.last_state = InputState(calibrated=True)
+
+    @property
+    def stage(self) -> str:
+        return "READY" if self.last_state.body_present else "POSE"
+
+    def read(self, now: float) -> InputState:
+        ok, source = self.capture.read()
+        if not ok:
+            self.last_state = InputState(calibrated=True)
+            return self.last_state
+        frame = source if self.calibration.rotation == "none" else rotate_frame(source, self.calibration.rotation)
+        measurement = self.tracker.update(frame)
+        self.last_state = self.classifier.update(measurement, now)
+
+        debug = frame.copy()
+        landmarks = self.tracker.landmarks
+        if landmarks is not None:
+            for point in np.asarray(landmarks)[:33, :2]:
+                x, y = int(round(float(point[0]))), int(round(float(point[1])))
+                if 0 <= x < debug.shape[1] and 0 <= y < debug.shape[0]:
+                    cv2.circle(debug, (x, y), 2, (0, 220, 0), -1, lineType=cv2.LINE_AA)
+        label = "POSE READY" if measurement is not None else "POSE SEARCH"
+        cv2.putText(debug, label, (6, 20), cv2.FONT_HERSHEY_SIMPLEX, .6, (0, 230, 230), 1, cv2.LINE_AA)
+        if measurement is not None:
+            cv2.putText(
+                debug,
+                f"x={measurement.x:.3f} scale={measurement.scale:.3f} lat={self.last_state.lateral}",
+                (6, 42),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                .48,
+                (0, 230, 230),
+                1,
+                cv2.LINE_AA,
+            )
+        self.debug = debug
+        return self.last_state
+
+    def close(self) -> None:
+        self.capture.release()
+
+    def show_debug(self) -> None:
+        if self.debug is not None:
+            cv2.imshow("block breaker pose", self.debug)
 
 
 @dataclass
@@ -678,6 +966,7 @@ def parse_camera(value: str) -> int | str:
 
 
 DEFAULT_CALIBRATION = HOST.parent / "camera_calibration.json"
+DEFAULT_POSE_CALIBRATION = HOST.parent / "pose_calibration.json"
 
 
 def parser() -> argparse.ArgumentParser:
@@ -694,6 +983,16 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="校正JSONを使わず、固定値の従来判定で動かす",
     )
+    result.add_argument(
+        "--pose-calibration",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=f"pose_calibrate.py が書いたPASS済み校正JSON（例: {DEFAULT_POSE_CALIBRATION.name}）",
+    )
+    result.add_argument("--pose-model-dir", type=Path, default=DEFAULT_MODEL_DIR)
+    result.add_argument("--pose-threads", type=int, default=4)
+    result.add_argument("--pose-redetect-after", type=int, default=5)
     result.add_argument(
         "--exposure",
         type=parse_exposure,
@@ -737,27 +1036,42 @@ def main(argv: Iterable[str] | None = None) -> int:
     ):
         print("error: --fps/--preview-scale/--jump-rise-* または --pi の指定が不正", file=sys.stderr)
         return 2
-    camera: CameraController | None = None
+    camera: CameraController | PoseCameraController | None = None
     calibration: Calibration | None = None
+    pose_calibration: PoseCalibration | None = None
     try:
         keyboard_mode = args.keyboard or args.no_camera
+        if args.pose_calibration is not None and args.no_calibration:
+            print("error: --pose-calibration と --no-calibration は同時指定できない", file=sys.stderr)
+            return 2
         if not keyboard_mode:
-            if not args.no_calibration:
-                calibration = load_calibration(args.calibration)
-            # デバイス指定は常に引数を優先する。校正JSONのdeviceは記録用であり、
-            # カメラの増減で /dev/videoN の採番が変わるため復元には使えない。
-            camera = CameraController(
-                args.camera,
-                calibration.width if calibration is not None else args.camera_width,
-                calibration.height if calibration is not None else args.camera_height,
-                args.camera_background_seconds,
-                args.min_foreground_area,
-                args.roi,
-                args.jump_rise_y_min,
-                args.jump_rise_bottom_min,
-                calibration,
-                args.exposure,
-            )
+            if args.pose_calibration is not None:
+                pose_calibration = load_pose_calibration(args.pose_calibration)
+                camera = PoseCameraController(
+                    args.camera,
+                    pose_calibration,
+                    model_dir=args.pose_model_dir,
+                    threads=args.pose_threads,
+                    redetect_after=args.pose_redetect_after,
+                    exposure=args.exposure,
+                )
+            else:
+                if not args.no_calibration:
+                    calibration = load_calibration(args.calibration)
+                # デバイス指定は常に引数を優先する。校正JSONのdeviceは記録用であり、
+                # カメラの増減で /dev/videoN の採番が変わるため復元には使えない。
+                camera = CameraController(
+                    args.camera,
+                    calibration.width if calibration is not None else args.camera_width,
+                    calibration.height if calibration is not None else args.camera_height,
+                    args.camera_background_seconds,
+                    args.min_foreground_area,
+                    args.roi,
+                    args.jump_rise_y_min,
+                    args.jump_rise_bottom_min,
+                    calibration,
+                    args.exposure,
+                )
         sender = UdpFrameSender([parse_pi(value) for value in args.pi], args.chunk_size) if args.send else None
     except (RuntimeError, ValueError) as exc:
         print(f"error: {exc}（開発用には --keyboard）", file=sys.stderr)
@@ -771,9 +1085,27 @@ def main(argv: Iterable[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, stop)
     started = last = deadline = time.monotonic()
     period = 1 / args.fps
-    input_label = "keyboard" if keyboard_mode else f"camera={args.camera}"
+    input_label = "keyboard" if keyboard_mode else (
+        f"camera+pose={args.camera}" if pose_calibration is not None else f"camera={args.camera}"
+    )
     print(f"block breaker: canvas={CANVAS_WIDTH}x{CANVAS_HEIGHT} palette=FC6 input={input_label} send={'yes' if sender else 'no'}")
-    if calibration is not None:
+    if pose_calibration is not None:
+        print(
+            f"pose calibration: {pose_calibration.source.name} date={pose_calibration.date} "
+            f"rotation={pose_calibration.rotation} direction={POSE_DIRECTION_CONVENTION}"
+        )
+        print(
+            f"  thresholds(torso): left>={pose_calibration.left_delta_min:.4f} "
+            f"right>={pose_calibration.right_delta_min:.4f} "
+            f"jump rise_y>={pose_calibration.jump_rise_y_min:.4f} "
+            f"rise_bottom>={pose_calibration.jump_rise_bottom_min:.4f}"
+        )
+        applied = camera.exposure if camera is not None else None
+        if applied is None:
+            print("  exposure: 未指定（校正時も露出指定なし）")
+        else:
+            print(f"  exposure: auto={applied[0]:g} shutter={applied[1]:g} gain={applied[2]:g}")
+    elif calibration is not None:
         # 校正がいつ・どの構成で取られたかを必ず出す。カメラを動かした後の
         # 古い校正で走っていることに気づけるようにするため。
         print(

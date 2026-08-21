@@ -70,6 +70,13 @@ LED_RED = 0x04
 LED_BLUE = 0x21
 LED_GRAY = 0x31
 
+# 論理画面は幅192×高さ384の縦長レイアウト。5×7フォントを2倍で描くと、
+# 左右マージンを除いた1行の上限は14文字になる。
+LED_MARGIN_X = 8
+LED_TEXT_SCALE = 2
+LED_TEXT_STEP = 18
+LED_TEXT_MAX_CHARS = (CANVAS_WIDTH - 2 * LED_MARGIN_X) // (6 * LED_TEXT_SCALE)
+
 
 # 5x7の小型ASCIIフォント。LEDには短い英語の指示を表示する。
 FONT_5X7: dict[str, tuple[str, ...]] = {
@@ -187,6 +194,52 @@ def _font_text(frame: np.ndarray, text: str, x: int, y: int, color: int, scale: 
     return cursor
 
 
+def _wrap_led_text(text: str, max_chars: int = LED_TEXT_MAX_CHARS) -> list[str]:
+    """LEDの表示幅に収まるよう、英語の指示を単語境界で折り返す。"""
+    if max_chars < 1:
+        raise ValueError("max_chars は1以上")
+    words = text.upper().split()
+    if not words:
+        return [""]
+
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        # 将来、空白のない長いトークンを渡しても右端を越えないよう分割する。
+        while len(word) > max_chars:
+            if current:
+                lines.append(current)
+                current = ""
+            lines.append(word[:max_chars])
+            word = word[max_chars:]
+        if not word:
+            continue
+        candidate = word if not current else f"{current} {word}"
+        if len(candidate) <= max_chars:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines or [""]
+
+
+def _draw_led_lines(
+    frame: np.ndarray,
+    text: str,
+    y: int,
+    color: int,
+    scale: int = LED_TEXT_SCALE,
+) -> int:
+    """折り返した文字列を描き、次の描画位置を返す。"""
+    lines = _wrap_led_text(text, (CANVAS_WIDTH - 2 * LED_MARGIN_X) // (6 * scale))
+    for line in lines:
+        _font_text(frame, line, LED_MARGIN_X, y, color, scale)
+        y += LED_TEXT_STEP if scale == LED_TEXT_SCALE else 7 * scale + 4
+    return y
+
+
 def render_led_frame(
     stage: str,
     instruction: str,
@@ -202,21 +255,27 @@ def render_led_frame(
     stage_color = LED_CYAN if stage in MAIN_STAGES[:2] else LED_BLUE
     if stage in ("PASS", "RETRY", "FAIL"):
         stage_color = {"PASS": LED_GREEN, "RETRY": LED_YELLOW, "FAIL": LED_RED}[stage]
-    _font_text(frame, stage, 8, 8, stage_color, 3)
-    _font_text(frame, instruction[:28], 8, 42, FC6_WHITE, 2)
 
-    frame[76:78, 8:376] = LED_GRAY
-    end = 8 + int(round(368 * progress))
-    if end > 8:
-        frame[76:78, 8:end] = LED_GREEN if candidate_valid else LED_YELLOW
+    # 旧実装は横384pxを前提にしたX座標（376、262）を使っていたため、
+    # 192px幅の実機では指示文・ID・進捗バーが画面外へ切れていた。
+    y = _draw_led_lines(frame, stage, LED_MARGIN_X, stage_color)
+    y = _draw_led_lines(frame, instruction, y + 4, FC6_WHITE)
+
+    bar_y = min(CANVAS_HEIGHT - 2, y + 2)
+    bar_x0 = LED_MARGIN_X
+    bar_x1 = CANVAS_WIDTH - LED_MARGIN_X
+    frame[bar_y:bar_y + 2, bar_x0:bar_x1] = LED_GRAY
+    end = bar_x0 + int(round((bar_x1 - bar_x0) * progress))
+    if end > bar_x0:
+        frame[bar_y:bar_y + 2, bar_x0:end] = LED_GREEN if candidate_valid else LED_YELLOW
 
     candidate_label = "CANDIDATE VALID" if candidate_valid else "CANDIDATE INVALID"
-    _font_text(frame, candidate_label, 8, 94, LED_GREEN if candidate_valid else LED_RED, 2)
+    y = _draw_led_lines(frame, candidate_label, bar_y + 14, LED_GREEN if candidate_valid else LED_RED)
     if remaining is not None:
-        _font_text(frame, f"TIME {max(0.0, remaining):04.1f}S", 8, 126, FC6_WHITE, 2)
+        y = _draw_led_lines(frame, f"TIME {max(0.0, remaining):04.1f}S", y + 2, FC6_WHITE)
     if result:
-        _font_text(frame, f"RESULT {result}", 8, 154, stage_color, 2)
-    _font_text(frame, f"ID {int(frame_id) & 0xFFFFFFFF:08X}", 262, 178, LED_GRAY, 1)
+        _draw_led_lines(frame, f"RESULT {result}", y + 2, stage_color)
+    _font_text(frame, f"ID {int(frame_id) & 0xFFFFFFFF:08X}", LED_MARGIN_X, CANVAS_HEIGHT - 15, LED_GRAY, 1)
     return frame
 
 
@@ -462,6 +521,7 @@ def robust_stats(values: Sequence[float]) -> dict[str, float | int]:
         "median": median,
         "p75": float(np.percentile(array, 75)),
         "p90": float(np.percentile(array, 90)),
+        "p95": float(np.percentile(array, 95)),
         "max": float(np.max(array)),
         "mad": mad,
     }

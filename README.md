@@ -185,6 +185,27 @@ python3 host/block_breaker.py --camera 0 --send \
 python3 host/block_breaker_selftest.py
 ```
 
+### 姿勢推定校正値で操作する場合
+
+背景差分を使わずBlazePoseで人物を追跡し、閾値を胴長で正規化する。左右は参加者本人から見た左右で記録する。
+校正JSONが`PASS`でない場合、ゲームは起動せず校正を要求する。
+
+```bash
+python3 host/pose_calibrate.py \
+  --camera /dev/v4l/by-id/usb-e-con_systems_See3CAM_130_311CC209-video-index0 \
+  --rotation none --exposure 1/312/2 --send \
+  --pi 192.168.10.101:5000 --pi 192.168.10.102:5000 \
+  --pi 192.168.10.103:5000 --pi 192.168.10.104:5000
+```
+
+```bash
+python3 host/pose_game.py \
+  --camera /dev/v4l/by-id/usb-e-con_systems_See3CAM_130_311CC209-video-index0 \
+  --pose-calibration pose_calibration.json --send \
+  --pi 192.168.10.101:5000 --pi 192.168.10.102:5000 \
+  --pi 192.168.10.103:5000 --pi 192.168.10.104:5000
+```
+
 ## Pi 常駐表示クライアント
 
 `pi-client/` は Raspberry Pi 上で動く C++ の表示専用プロセス。UDP 5000 で 192×96 の

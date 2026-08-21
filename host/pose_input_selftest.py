@@ -59,6 +59,20 @@ def main() -> int:
     if not m.valid:
         errors.append("validがFalse")
 
+    # 代表可視度が低い計測は、追跡・校正へ通さない。
+    low_visibility = base.copy()
+    low_visibility[list(FOOT_POINTS), 3] = 0.1
+    low = measure(low_visibility, 0.9, WIDTH, HEIGHT)
+    if low is None or low.valid:
+        errors.append("可視度の低い計測をvalidとして受け入れる")
+
+    # 足点の1つだけが外れてもbottom全体をフレーム外へ飛ばさない。
+    noisy_feet = base.copy()
+    noisy_feet[FOOT_POINTS[0], 1] = 900
+    noisy = measure(noisy_feet, 0.9, WIDTH, HEIGHT)
+    if noisy is None or abs(noisy.bottom - 290 / HEIGHT) > 1e-9:
+        errors.append(f"足点1つの外れ値を抑制できない: {None if noisy is None else noisy.bottom}")
+
     # 距離不変性: 同じ姿勢で人物が小さく写っても、胴長で割った量は変わらない。
     near = measure(synthetic(120, 180, 60, 290), 0.9, WIDTH, HEIGHT)
     far = measure(synthetic(120, 180, 30, 235), 0.9, WIDTH, HEIGHT)

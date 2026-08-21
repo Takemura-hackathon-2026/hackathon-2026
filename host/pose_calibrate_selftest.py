@@ -8,7 +8,7 @@ from pathlib import Path
 HOST = Path(__file__).resolve().parent
 sys.path.insert(0, str(HOST))
 
-from pose_calibrate import MIN_SAMPLES, STAGES, analyze  # noqa: E402
+from pose_calibrate import DIRECTION_CONVENTION, MIN_SAMPLES, STAGES, analyze  # noqa: E402
 from pose_input import PoseMeasurement  # noqa: E402
 
 
@@ -23,9 +23,10 @@ def build(count: int = MIN_SAMPLES + 10) -> tuple[dict, dict]:
     samples = {
         # 静止: ごく小さなばらつき。中央値がちょうど0.50になるよう対称にする。
         "CENTER/STANCE": [sample(0.50 + 0.001 * ((i % 3) - 1), 0.40, 0.90) for i in range(count)],
-        # 左右: 胴長0.20に対し 0.06 動く = 胴長0.3個ぶん
-        "LEFT": [sample(0.44, 0.40, 0.90) for _ in range(count)],
-        "RIGHT": [sample(0.56, 0.40, 0.90) for _ in range(count)],
+        # 正面カメラでは本人の左が画像右、本人の右が画像左。
+        # 胴長0.20に対し 0.06 動く = 胴長0.3個ぶん。
+        "LEFT": [sample(0.56, 0.40, 0.90) for _ in range(count)],
+        "RIGHT": [sample(0.44, 0.40, 0.90) for _ in range(count)],
         # ジャンプ: 足元が0.06上がる = 胴長0.3個ぶん
         "JUMP": [sample(0.50, 0.34, 0.84) for _ in range(count)],
         "VALIDATE": [sample(0.50, 0.40, 0.90) for _ in range(count)],
@@ -45,6 +46,8 @@ def main() -> int:
     thresholds = result["thresholds"]
     if thresholds.get("units") != "torso_lengths":
         errors.append("閾値の単位が胴長でない")
+    if DIRECTION_CONVENTION != "player_relative":
+        errors.append(f"左右規約が本人基準でない: {DIRECTION_CONVENTION}")
     for key in ("left", "right", "jump", "center_tolerance"):
         if key not in thresholds:
             errors.append(f"閾値 {key} が出ていない")
@@ -91,9 +94,9 @@ def main() -> int:
     if "left_motion_not_separated_from_center" not in flat_result["quality"]["reasons"]:
         errors.append("左右の非分離を検出しない")
 
-    # 静止時の外れ値が閾値を越える場合を検出すること。
+    # 単発の姿勢推定外れ値では落とさず、ノイズが一定割合続く場合は検出すること。
     noisy = dict(samples)
-    noisy["CENTER/STANCE"] = list(samples["CENTER/STANCE"]) + [sample(0.50, 0.40, 0.60)]
+    noisy["CENTER/STANCE"] = list(samples["CENTER/STANCE"]) + [sample(0.50, 0.40, 0.60) for _ in range(6)]
     noisy_result = analyze(noisy, attempts)
     if "center_noise_exceeds_jump_threshold" not in noisy_result["quality"]["reasons"]:
         errors.append("静止時ノイズが閾値を越えることを検出しない")

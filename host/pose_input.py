@@ -36,6 +36,7 @@ LEFT_SHOULDER, RIGHT_SHOULDER = 11, 12
 LEFT_HIP, RIGHT_HIP = 23, 24
 FOOT_POINTS = (27, 28, 29, 30, 31, 32)  # 足首・かかと・つま先
 BODY_POINTS = 33  # 33以降は補助点なので、体の範囲には使わない
+MIN_VISIBILITY = 0.5  # 使用点の代表可視度。モデルの推論閾値と同じ下限を使う。
 
 
 @dataclass(frozen=True)
@@ -48,11 +49,18 @@ class PoseMeasurement:
     area: float  # キーポイント全体のバウンディングボックス面積比
     scale: float  # 胴長（肩中心〜腰中心）。フレーム高さで正規化
     confidence: float
-    visible: float  # 使用キーポイントの可視度の最小値
+    visible: float  # 使用キーポイントの可視度の中央値
 
     @property
     def valid(self) -> bool:
-        return self.scale > 0 and math.isfinite(self.scale)
+        return (
+            self.scale > 0
+            and math.isfinite(self.scale)
+            and math.isfinite(self.confidence)
+            and self.confidence >= 0.5
+            and math.isfinite(self.visible)
+            and self.visible >= MIN_VISIBILITY
+        )
 
 
 def _mid(points: np.ndarray, a: int, b: int) -> np.ndarray:
@@ -81,7 +89,10 @@ def measure(landmarks: np.ndarray, confidence: float, width: int, height: int) -
         return None
 
     feet = points[list(FOOT_POINTS)]
-    bottom = float(np.max(feet[:, 1]))
+    # つま先・かかとのうち1点だけが外れたときに、max()だと全身のbottomが
+    # フレーム外へ飛ぶ。6点の75パーセンタイルなら、片足の外れ値を除きつつ
+    # 両足の下端を保持できる。
+    bottom = float(np.percentile(feet[:, 1], 75.0))
     center = (hip + shoulder) / 2.0
 
     lo = np.min(points, axis=0)
@@ -96,7 +107,8 @@ def measure(landmarks: np.ndarray, confidence: float, width: int, height: int) -
         area=box / float(width * height),
         scale=torso / height,
         confidence=float(confidence),
-        visible=float(np.min(visibility[used])),
+        # 足先の一部が隠れても、使用点全体の代表的な可視度を残す。
+        visible=float(np.median(visibility[used])),
     )
 
 
@@ -239,12 +251,19 @@ class PoseTracker:
             if self.misses >= self.redetect_after:
                 self.reset()
             return None
-        self.misses = 0
         landmarks, confidence = result[1], result[5]
-        self.landmarks = landmarks
+        measurement = measure(landmarks, confidence, width, height)
+        if measurement is None or not measurement.valid:
+            self.misses += 1
+            self.landmarks = None
+            if self.misses >= self.redetect_after:
+                self.reset()
+            return None
         try:
             self.track = person_row_from_landmarks(landmarks)
         except ValueError:
             self.reset()
             return None
-        return measure(landmarks, confidence, width, height)
+        self.misses = 0
+        self.landmarks = landmarks
+        return measurement
