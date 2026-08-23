@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""USBカメラで操作する192x384 RGB LEDブロック崩し。
+"""STRUCTURE Sensorで操作する192x384 RGB LEDブロック崩し。
 
-主機でカメラ判定、ゲーム更新、FC6パレット番号での描画を完結する。完成フレームは
+主機でセンサー判定、ゲーム更新、FC6パレット番号での描画を完結する。完成フレームは
 既存の UdpFrameSender が192x96ずつ4台のPiへ送るため、Pi側へ人物映像・人物マスク・
 ゲームロジックを渡さない。
 """
@@ -27,6 +27,7 @@ for directory in (HOST, HOST / "test_mode"):
         sys.path.insert(0, str(directory))
 
 from palettes import FC6, FC6_BLACK, FC6_LIMIT, FC6_WHITE, PaletteMode  # noqa: E402
+from frame_source import StructureSensorSource, depth_preview  # noqa: E402
 from test_mode import CANVAS_HEIGHT, CANVAS_WIDTH, PI_COUNT, UdpFrameSender, parse_pi  # noqa: E402
 
 
@@ -153,12 +154,11 @@ class InputClassifier:
         return InputState(self.lateral, jump, True, True)
 
 
-class CameraController:
-    """MOG2背景差分 → 最大連結成分 → InputClassifier の入力段。"""
+class SensorController:
+    """STRUCTURE Sensorの深度背景差分 → 最大連結成分 → 入力段。"""
 
     def __init__(
         self,
-        device: int,
         width: int,
         height: int,
         background_seconds: float,
@@ -166,18 +166,17 @@ class CameraController:
         roi: tuple[int, int, int, int] | None,
         jump_rise_y_min: float,
         jump_rise_bottom_min: float,
+        depth_min_change_mm: float,
     ) -> None:
-        self.capture = cv2.VideoCapture(device)
-        if not self.capture.isOpened():
-            raise RuntimeError(f"カメラ {device} を開けない")
-        self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        self.capture.set(cv2.CAP_PROP_FPS, 60)
+        self.capture = StructureSensorSource(width, height, 60.0)
         self.background_seconds = max(.2, background_seconds)
         self.min_area = max(1, min_area)
         self.roi = roi
+        self.depth_min_change_mm = max(0.0, float(depth_min_change_mm))
         self.started: float | None = None
-        self.subtractor = cv2.createBackgroundSubtractorMOG2(history=240, varThreshold=20, detectShadows=False)
+        self.depth_frames: list[np.ndarray] = []
+        self.depth_background: np.ndarray | None = None
+        self.depth_noise_p95 = 0.0
         self.classifier = InputClassifier(
             jump_rise_y_min=jump_rise_y_min,
             jump_rise_bottom_min=jump_rise_bottom_min,
@@ -192,12 +191,10 @@ class CameraController:
         return "READY" if self.classifier.calibrated else "STANCE"
 
     def close(self) -> None:
-        self.capture.release()
+        self.capture.close()
 
     def read(self, now: float) -> InputState:
-        ok, source = self.capture.read()
-        if not ok:
-            return InputState(calibrated=self.classifier.calibrated)
+        source = self.capture.read()
         if self.started is None:
             self.started = now
         if self.roi is not None:
@@ -205,16 +202,35 @@ class CameraController:
             source_height, source_width = source.shape[:2]
             if x < 0 or y < 0 or width <= 0 or height <= 0 or x + width > source_width or y + height > source_height:
                 raise ValueError(
-                    f"ROI {x},{y},{width},{height} がカメラ画像 {source_width}x{source_height} を超える"
+                    f"ROI {x},{y},{width},{height} が深度画像 {source_width}x{source_height} を超える"
                 )
             source = source[y:y + height, x:x + width]
         width = 240
         height = max(1, round(source.shape[0] * width / source.shape[1]))
-        image = cv2.resize(source, (width, height), interpolation=cv2.INTER_AREA)
-        gray = cv2.GaussianBlur(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), (5, 5), 0)
         background_phase = now - self.started < self.background_seconds
-        foreground = self.subtractor.apply(gray, learningRate=.35 if background_phase else 0.0)
-        _, mask = cv2.threshold(foreground, 200, 255, cv2.THRESH_BINARY)
+        image = cv2.resize(source, (width, height), interpolation=cv2.INTER_NEAREST)
+        if background_phase:
+            self.depth_frames.append(np.asarray(image).copy())
+        elif self.depth_background is None:
+            if not self.depth_frames:
+                raise RuntimeError("STRUCTURE Sensorの背景フレームがない")
+            stack = np.asarray(self.depth_frames, dtype=np.float32)
+            self.depth_background = np.median(stack, axis=0).astype(np.float32)
+            self.depth_noise_p95 = float(np.percentile(
+                np.abs(stack - self.depth_background[None, :, :]), 95.0
+            ))
+            self.depth_frames.clear()
+        if background_phase or self.depth_background is None:
+            mask = np.zeros(image.shape, dtype=np.uint8)
+        else:
+            depth = np.asarray(image, dtype=np.float32)
+            background = self.depth_background
+            valid = (depth > 0) & (background > 0)
+            # 人物は背景より手前に現れるため、遠くなる変化は入力候補にしない。
+            nearer = background - depth
+            threshold = max(1.0, self.depth_noise_p95 * 3.0, self.depth_min_change_mm)
+            mask = ((valid & (nearer >= threshold)).astype(np.uint8) * 255)
+        debug = depth_preview(image)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
         body: BodyMeasurement | None = None
@@ -233,7 +249,6 @@ class CameraController:
                         float((y + h) / height),
                         area / float(width * height),
                     )
-        debug = image.copy()
         if contour is not None:
             cv2.drawContours(debug, [contour], -1, (0, 255, 0), 1)
         cv2.putText(debug, self.stage, (6, 18), cv2.FONT_HERSHEY_SIMPLEX, .55, (0, 230, 230), 1, cv2.LINE_AA)
@@ -242,7 +257,7 @@ class CameraController:
 
     def show_debug(self) -> None:
         if self.debug is not None:
-            cv2.imshow("block breaker camera", self.debug)
+            cv2.imshow("block breaker depth", self.debug)
         if self.mask is not None:
             cv2.imshow("block breaker foreground mask", self.mask)
 
@@ -561,7 +576,7 @@ class BlockBreaker:
         cv2.putText(mask, text, origin, cv2.FONT_HERSHEY_SIMPLEX, scale, 255, 1, cv2.LINE_AA)
         frame[mask > 96] = color
 
-    def render(self, camera_stage: str, boundaries: bool = False) -> np.ndarray:
+    def render(self, sensor_stage: str, boundaries: bool = False) -> np.ndarray:
         frame = np.full((CANVAS_HEIGHT, CANVAS_WIDTH), SKY, np.uint8)
         for index in range(30):
             frame[30 + (index * 71 + 13) % 300, (index * 47 + 19) % CANVAS_WIDTH] = SKY_DOT
@@ -607,10 +622,10 @@ class BlockBreaker:
         elif self.game_over_until:
             self._text(frame, "GAME OVER", (43, 228), 0x06, .72)
         elif self.serving:
-            self._text(frame, "JUMP TO LAUNCH" if camera_stage == "READY" else "CAMERA CAL", (25, 232), 0x0E, .48)
-            if camera_stage == "BACKGROUND":
-                self._text(frame, "CLEAR CAMERA", (32, 252), TEXT, .40)
-            elif camera_stage == "STANCE":
+            self._text(frame, "JUMP TO LAUNCH" if sensor_stage == "READY" else "SENSOR CAL", (25, 232), 0x0E, .48)
+            if sensor_stage == "BACKGROUND":
+                self._text(frame, "CLEAR SENSOR", (32, 252), TEXT, .40)
+            elif sensor_stage == "STANCE":
                 self._text(frame, "STAND STILL", (37, 252), TEXT, .40)
         if boundaries:
             for y in (96, 192, 288):
@@ -629,14 +644,13 @@ def parse_roi(value: str) -> tuple[int, int, int, int]:
 
 
 def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(description="USBカメラまたはキーボードで操作する192x384 LEDブロック崩し")
-    result.add_argument("--camera", type=int, default=0)
-    result.add_argument("--keyboard", action="store_true", help="カメラを使わず、プレビューをキーボードで操作")
-    result.add_argument("--no-camera", action="store_true", help="--keyboard の後方互換エイリアス")
-    result.add_argument("--camera-width", type=int, default=640)
-    result.add_argument("--camera-height", type=int, default=480)
-    result.add_argument("--camera-background-seconds", type=float, default=2.0)
+    result = argparse.ArgumentParser(description="STRUCTURE Sensorまたはキーボードで操作する192x384 LEDブロック崩し")
+    result.add_argument("--keyboard", action="store_true", help="センサーを使わず、プレビューをキーボードで操作")
+    result.add_argument("--sensor-width", type=int, default=640)
+    result.add_argument("--sensor-height", type=int, default=480)
+    result.add_argument("--sensor-background-seconds", type=float, default=2.0)
     result.add_argument("--min-foreground-area", type=int, default=420)
+    result.add_argument("--depth-min-change-mm", type=float, default=0.0, help="深度の手前側変化量。0は背景ノイズから自動決定")
     result.add_argument("--roi", type=parse_roi, default=None, help="検出ROI x,y,width,height")
     result.add_argument("--jump-rise-y-min", type=float, default=0.05, help="ジャンプ判定の重心上昇量（既定0.05）")
     result.add_argument("--jump-rise-bottom-min", type=float, default=0.04, help="ジャンプ判定の下端上昇量（既定0.04）")
@@ -648,7 +662,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--chunk-size", type=int, default=1200)
     result.add_argument("--no-preview", action="store_true")
     result.add_argument("--preview-scale", type=int, default=2)
-    result.add_argument("--debug-camera", action="store_true")
+    result.add_argument("--debug-depth", action="store_true", help="深度プレビューと前景マスクを表示")
     result.add_argument("--boundaries", action="store_true")
     return result
 
@@ -661,26 +675,29 @@ def main(argv: Iterable[str] | None = None) -> int:
     args = parser().parse_args(argv)
     if (
         args.fps <= 0
+        or args.sensor_width <= 0
+        or args.sensor_height <= 0
         or args.preview_scale <= 0
         or args.jump_rise_y_min <= 0
         or args.jump_rise_bottom_min <= 0
+        or args.depth_min_change_mm < 0
         or (args.send and len(args.pi) != PI_COUNT)
     ):
         print("error: --fps/--preview-scale/--jump-rise-* または --pi の指定が不正", file=sys.stderr)
         return 2
-    camera: CameraController | None = None
+    sensor: SensorController | None = None
     try:
-        keyboard_mode = args.keyboard or args.no_camera
+        keyboard_mode = args.keyboard
         if not keyboard_mode:
-            camera = CameraController(
-                args.camera,
-                args.camera_width,
-                args.camera_height,
-                args.camera_background_seconds,
+            sensor = SensorController(
+                args.sensor_width,
+                args.sensor_height,
+                args.sensor_background_seconds,
                 args.min_foreground_area,
                 args.roi,
                 args.jump_rise_y_min,
                 args.jump_rise_bottom_min,
+                args.depth_min_change_mm,
             )
         sender = UdpFrameSender([parse_pi(value) for value in args.pi], args.chunk_size) if args.send else None
     except (RuntimeError, ValueError) as exc:
@@ -696,7 +713,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, stop)
     started = last = deadline = time.monotonic()
     period = 1 / args.fps
-    input_label = "keyboard" if keyboard_mode else f"camera={args.camera}"
+    input_label = "keyboard" if keyboard_mode else "structure-depth"
     print(f"block breaker: canvas={CANVAS_WIDTH}x{CANVAS_HEIGHT} palette=FC6 input={input_label} send={'yes' if sender else 'no'}")
     if not args.no_preview:
         print("keys: A/D or LEFT/RIGHT = paddle, SPACE/W/UP = launch, R = reset, Q/ESC = quit")
@@ -705,14 +722,14 @@ def main(argv: Iterable[str] | None = None) -> int:
             now = time.monotonic()
             if args.seconds and now - started >= args.seconds:
                 break
-            body = camera.read(now) if camera else InputState(calibrated=True)
+            body = sensor.read(now) if sensor else InputState(calibrated=True)
             x11_lateral = keyboard_state.lateral() if keyboard_state is not None else 0
             if manual_lateral and now >= manual_until:
                 manual_lateral = 0
             lateral = x11_lateral or manual_lateral or (body.lateral if body.calibrated else 0)
             game.step(min(.05, now - last), GameInput(lateral, body.jump or manual_jump), now)
             manual_jump, last = False, now
-            indexed = game.render(camera.stage if camera else "READY", args.boundaries)
+            indexed = game.render(sensor.stage if sensor else "READY", args.boundaries)
             if indexed.shape != (CANVAS_HEIGHT, CANVAS_WIDTH) or int(indexed.max()) >= FC6_LIMIT:
                 raise RuntimeError("送出フレームがFC6の192x384条件を満たさない")
             if sender:
@@ -722,8 +739,8 @@ def main(argv: Iterable[str] | None = None) -> int:
                 if args.preview_scale != 1:
                     display = cv2.resize(display, (CANVAS_WIDTH * args.preview_scale, CANVAS_HEIGHT * args.preview_scale), interpolation=cv2.INTER_NEAREST)
                 cv2.imshow("RGB LED block breaker", display)
-                if args.debug_camera and camera:
-                    camera.show_debug()
+                if args.debug_depth and sensor:
+                    sensor.show_debug()
                 action = keyboard_action(cv2.waitKeyEx(1))
                 if action == "quit":
                     running = False
@@ -747,8 +764,8 @@ def main(argv: Iterable[str] | None = None) -> int:
     finally:
         if sender:
             sender.close()
-        if camera:
-            camera.close()
+        if sensor:
+            sensor.close()
         if keyboard_state is not None:
             keyboard_state.close()
         if not args.no_preview:

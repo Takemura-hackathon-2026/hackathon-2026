@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""カメラ非依存のブロック崩し・入力分類器検証。"""
+"""センサー非依存のブロック崩し・入力分類器検証。"""
 from __future__ import annotations
 
 import sys

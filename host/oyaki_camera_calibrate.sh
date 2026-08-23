@@ -11,6 +11,8 @@ REMOTE_LOG="${REMOTE_LOG:-/tmp/camera_calibrate_run.log}"
 REMOTE_OUTPUT="${REMOTE_OUTPUT:-$OYAKI_REPO/camera_calibration.json}"
 REMOTE_STANDBY_PID="${REMOTE_STANDBY_PID:-/tmp/led_standby.pid}"
 REMOTE_STANDBY_LOG="${REMOTE_STANDBY_LOG:-/tmp/led_standby_run.log}"
+REMOTE_DEPTH_VIEW_PID="${REMOTE_DEPTH_VIEW_PID:-/tmp/structure_depth_view.pid}"
+REMOTE_DEPTH_VIEW_LOG="${REMOTE_DEPTH_VIEW_LOG:-/tmp/structure_depth_view.log}"
 PI_SSH_USER="${PI_SSH_USER:-}"
 PI_STAGE="${PI_STAGE:-/tmp/hackathon-2026-pi-client}"
 PI_RGB_LIB_DISTRIBUTION="${PI_RGB_LIB_DISTRIBUTION:-}"
@@ -22,7 +24,7 @@ ssh_remote() {
 
 usage() {
   cat <<'EOF'
-MacからoyakiのカメラキャリブレーションとPi表示クライアントを操作する。
+MacからoyakiのSTRUCTURE SensorキャリブレーションとPi表示クライアントを操作する。
 
 使い方:
   host/oyaki_camera_calibrate.sh check
@@ -36,6 +38,11 @@ MacからoyakiのカメラキャリブレーションとPi表示クライアン�
   host/oyaki_camera_calibrate.sh standby-foreground
   host/oyaki_camera_calibrate.sh standby-status
   host/oyaki_camera_calibrate.sh standby-stop
+  host/oyaki_camera_calibrate.sh depth-view-build
+  host/oyaki_camera_calibrate.sh depth-view-start
+  host/oyaki_camera_calibrate.sh depth-view-foreground
+  host/oyaki_camera_calibrate.sh depth-view-status
+  host/oyaki_camera_calibrate.sh depth-view-stop
   host/oyaki_camera_calibrate.sh start
   host/oyaki_camera_calibrate.sh foreground
   host/oyaki_camera_calibrate.sh status
@@ -45,14 +52,13 @@ MacからoyakiのカメラキャリブレーションとPi表示クライアン�
   host/oyaki_camera_calibrate.sh fetch 出力先ディレクトリ
 
 環境変数: OYAKI_TARGET OYAKI_HOSTNAME OYAKI_REPO CALIBRATION_MAX_SECONDS REMOTE_STANDBY_PID REMOTE_STANDBY_LOG
+          REMOTE_DEPTH_VIEW_PID REMOTE_DEPTH_VIEW_LOG
           PI_SSH_USER PI_STAGE PI_RGB_LIB_DISTRIBUTION
 EOF
 }
 
 calibration_args=(
-  --camera 0
   --rotation ccw
-  --fixed-light 52,32,142,60
   --send
   --pi 192.168.10.101:5000
   --pi 192.168.10.102:5000
@@ -64,6 +70,14 @@ calibration_args=(
 standby_args=(
   --mode status
   --send
+  --pi 192.168.10.101:5000
+  --pi 192.168.10.102:5000
+  --pi 192.168.10.103:5000
+  --pi 192.168.10.104:5000
+)
+
+depth_view_args=(
+  --rotation ccw
   --pi 192.168.10.101:5000
   --pi 192.168.10.102:5000
   --pi 192.168.10.103:5000
@@ -92,10 +106,13 @@ cmd_check() {
   ssh_remote "set -u
     hostname
     test -x '$OYAKI_REPO/.venv/bin/python'
+    test -f '$OYAKI_REPO/host/frame_source.py'
+    test -f '$OYAKI_REPO/host/structure_depth_view.cpp'
+    test -f '$OYAKI_REPO/host/structure_depth_capture.cpp'
     test -f '$OYAKI_REPO/host/camera_calibrate.py'
     test -f '$OYAKI_REPO/host/standby.py'
     test -f '$OYAKI_REPO/host/test_mode/single-eye-catch_2800x1040.png'
-    printf 'camera_processes='; pgrep -af camera_calibrate.py || true
+    printf 'sensor_processes='; pgrep -af camera_calibrate.py || true
     for ip in 192.168.10.101 192.168.10.102 192.168.10.103 192.168.10.104; do
       if ping -c 1 -W 1 \"\$ip\" >/dev/null 2>&1; then printf 'pi=%s reachable\\n' \"\$ip\"; else printf 'pi=%s unreachable\\n' \"\$ip\"; fi
     done"
@@ -105,17 +122,22 @@ cmd_deploy() {
   local stamp
   stamp="$(date +%Y%m%d%H%M%S)"
   ssh_remote "set -u
-    for f in '$OYAKI_REPO/host/camera_calibrate.py' '$OYAKI_REPO/host/camera_calibrate_selftest.py' '$OYAKI_REPO/host/standby.py' '$OYAKI_REPO/host/test_mode/test_mode.py' '$OYAKI_REPO/host/test_mode/single-eye-catch_2800x1040.png'; do
+    for f in '$OYAKI_REPO/host/frame_source.py' '$OYAKI_REPO/host/structure_depth_view.cpp' '$OYAKI_REPO/host/structure_depth_capture.cpp' '$OYAKI_REPO/host/camera_calibrate.py' '$OYAKI_REPO/host/camera_calibrate_selftest.py' '$OYAKI_REPO/host/block_breaker.py' '$OYAKI_REPO/host/jump_detector.py' '$OYAKI_REPO/host/standby.py' '$OYAKI_REPO/host/test_mode/test_mode.py' '$OYAKI_REPO/host/test_mode/single-eye-catch_2800x1040.png'; do
       if test -e \"\$f\"; then cp -p \"\$f\" \"\$f.bak.$stamp\"; fi
     done
     mkdir -p '$OYAKI_REPO/host/test_mode'"
   scp -p -o ConnectTimeout=10 -o HostKeyAlias=192.168.20.1 -o "HostName=$OYAKI_HOSTNAME" \
-    "$SCRIPT_DIR/camera_calibrate.py" "$SCRIPT_DIR/camera_calibrate_selftest.py" "$SCRIPT_DIR/standby.py" \
+    "$SCRIPT_DIR/frame_source.py" "$SCRIPT_DIR/structure_depth_view.cpp" "$SCRIPT_DIR/structure_depth_capture.cpp" "$SCRIPT_DIR/camera_calibrate.py" "$SCRIPT_DIR/camera_calibrate_selftest.py" \
+    "$SCRIPT_DIR/block_breaker.py" "$SCRIPT_DIR/jump_detector.py" "$SCRIPT_DIR/standby.py" \
     "$OYAKI_TARGET:$OYAKI_REPO/host/"
   scp -p -o ConnectTimeout=10 -o HostKeyAlias=192.168.20.1 -o "HostName=$OYAKI_HOSTNAME" \
     "$SCRIPT_DIR/test_mode/test_mode.py" "$SCRIPT_DIR/test_mode/single-eye-catch_2800x1040.png" \
     "$OYAKI_TARGET:$OYAKI_REPO/host/test_mode/"
-  ssh_remote "'$OYAKI_REPO/.venv/bin/python' -m py_compile '$OYAKI_REPO/host/camera_calibrate.py' '$OYAKI_REPO/host/camera_calibrate_selftest.py' '$OYAKI_REPO/host/standby.py' '$OYAKI_REPO/host/test_mode/test_mode.py'"
+  ssh_remote "'$OYAKI_REPO/.venv/bin/python' -m py_compile '$OYAKI_REPO/host/frame_source.py' '$OYAKI_REPO/host/camera_calibrate.py' '$OYAKI_REPO/host/camera_calibrate_selftest.py' '$OYAKI_REPO/host/block_breaker.py' '$OYAKI_REPO/host/jump_detector.py' '$OYAKI_REPO/host/standby.py' '$OYAKI_REPO/host/test_mode/test_mode.py'
+    g++ -std=c++17 -O2 '$OYAKI_REPO/host/structure_depth_view.cpp' -o '$OYAKI_REPO/host/structure_depth_view' \$(pkg-config --cflags --libs opencv4)
+    g++ -std=c++17 -O2 '$OYAKI_REPO/host/structure_depth_capture.cpp' -o '$OYAKI_REPO/host/structure_depth_capture' \$(pkg-config --cflags --libs opencv4)
+    test -x '$OYAKI_REPO/host/structure_depth_view'
+    test -x '$OYAKI_REPO/host/structure_depth_capture'"
   printf 'deployed: %s\n' "$OYAKI_REPO/host"
 }
 
@@ -259,6 +281,70 @@ cmd_standby_stop() {
     echo stopped"
 }
 
+cmd_depth_view_build() {
+  ssh_remote "set -e
+    test -f '$OYAKI_REPO/host/structure_depth_view.cpp'
+    test -f '$OYAKI_REPO/host/structure_depth_capture.cpp'
+    g++ -std=c++17 -O2 '$OYAKI_REPO/host/structure_depth_view.cpp' -o '$OYAKI_REPO/host/structure_depth_view' \$(pkg-config --cflags --libs opencv4)
+    g++ -std=c++17 -O2 '$OYAKI_REPO/host/structure_depth_capture.cpp' -o '$OYAKI_REPO/host/structure_depth_capture' \$(pkg-config --cflags --libs opencv4)
+    test -x '$OYAKI_REPO/host/structure_depth_view'
+    test -x '$OYAKI_REPO/host/structure_depth_capture'
+    echo 'built: $OYAKI_REPO/host/structure_depth_view'"
+}
+
+cmd_depth_view_start() {
+  local args
+  args="$(printf '%q ' "${depth_view_args[@]}")"
+  ssh_remote "set -e
+    test -x '$OYAKI_REPO/host/structure_depth_view'
+    if test -f '$REMOTE_DEPTH_VIEW_PID'; then
+      pid=\$(cat '$REMOTE_DEPTH_VIEW_PID')
+      if test -r /proc/\$pid/cmdline && tr '\0' ' ' </proc/\$pid/cmdline | grep -q structure_depth_view; then
+        echo 'already running'; exit 1
+      fi
+      rm -f '$REMOTE_DEPTH_VIEW_PID'
+    fi
+    nohup '$OYAKI_REPO/host/structure_depth_view' $args >'$REMOTE_DEPTH_VIEW_LOG' 2>&1 </dev/null &
+    echo \$! >'$REMOTE_DEPTH_VIEW_PID'
+    echo started pid=\$(cat '$REMOTE_DEPTH_VIEW_PID')"
+}
+
+cmd_depth_view_foreground() {
+  local args
+  args="$(printf '%q ' "${depth_view_args[@]}")"
+  ssh_remote "cd '$OYAKI_REPO' && '$OYAKI_REPO/host/structure_depth_view' $args"
+}
+
+cmd_depth_view_status() {
+  ssh_remote "set -u
+    if test -f '$REMOTE_DEPTH_VIEW_PID'; then
+      pid=\$(cat '$REMOTE_DEPTH_VIEW_PID')
+      if test -r /proc/\$pid/cmdline && tr '\0' ' ' </proc/\$pid/cmdline | grep -q structure_depth_view; then
+        echo \"running pid=\$pid\"
+      else
+        echo 'not running (stale pid)'
+      fi
+    else
+      echo 'not running'
+    fi
+    tail -n 5 '$REMOTE_DEPTH_VIEW_LOG' 2>/dev/null || true"
+}
+
+cmd_depth_view_stop() {
+  ssh_remote "set -e
+    test -f '$REMOTE_DEPTH_VIEW_PID' || { echo 'not running'; exit 0; }
+    pid=\$(cat '$REMOTE_DEPTH_VIEW_PID')
+    if test -r /proc/\$pid/cmdline && tr '\0' ' ' </proc/\$pid/cmdline | grep -q structure_depth_view; then
+      kill -TERM \"\$pid\"
+      for _ in 1 2 3 4 5 6 7 8 9 10; do
+        test -r /proc/\$pid/cmdline || break
+        sleep 1
+      done
+    fi
+    rm -f '$REMOTE_DEPTH_VIEW_PID'
+    echo stopped"
+}
+
 cmd_start() {
   local args
   args="$(printf '%q ' "${calibration_args[@]}")"
@@ -321,7 +407,7 @@ cmd_stop() {
 }
 
 cmd_result() {
-  ssh_remote "'$OYAKI_REPO/.venv/bin/python' -c 'import json, pathlib; p=pathlib.Path(\"$REMOTE_OUTPUT\"); q=pathlib.Path(\"${REMOTE_OUTPUT%.json}.invalid.json\"); p=q if not p.exists() else p; o=json.loads(p.read_text(encoding=\"utf-8\")); json.dumps(o, allow_nan=False); print(json.dumps({k:o.get(k) for k in (\"valid\",\"status\",\"sample_counts\",\"quality\",\"camera\",\"thresholds\")}, ensure_ascii=False, sort_keys=True))'"
+  ssh_remote "'$OYAKI_REPO/.venv/bin/python' -c 'import json, pathlib; p=pathlib.Path(\"$REMOTE_OUTPUT\"); q=pathlib.Path(\"${REMOTE_OUTPUT%.json}.invalid.json\"); p=q if not p.exists() else p; o=json.loads(p.read_text(encoding=\"utf-8\")); json.dumps(o, allow_nan=False); print(json.dumps({k:o.get(k) for k in (\"valid\",\"status\",\"sample_counts\",\"quality\",\"sensor\",\"thresholds\")}, ensure_ascii=False, sort_keys=True))'"
 }
 
 cmd_fetch() {
@@ -353,6 +439,11 @@ case "$command" in
   standby-foreground) cmd_standby_foreground "$@" ;;
   standby-status) cmd_standby_status "$@" ;;
   standby-stop) cmd_standby_stop "$@" ;;
+  depth-view-build) cmd_depth_view_build "$@" ;;
+  depth-view-start) cmd_depth_view_start "$@" ;;
+  depth-view-foreground) cmd_depth_view_foreground "$@" ;;
+  depth-view-status) cmd_depth_view_status "$@" ;;
+  depth-view-stop) cmd_depth_view_stop "$@" ;;
   start) cmd_start "$@" ;;
   foreground) cmd_foreground "$@" ;;
   status) cmd_status "$@" ;;

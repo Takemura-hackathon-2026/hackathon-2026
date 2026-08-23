@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""camera_calibrate.py のカメラ・ネットワーク非依存assertテスト。"""
+"""camera_calibrate.py のセンサー・ネットワーク非依存assertテスト。"""
 from __future__ import annotations
 
 import json
@@ -101,6 +101,26 @@ def test_background_noise_is_not_candidate() -> None:
     assert session.active_elapsed == 0.0
 
 
+def test_depth_near_candidate_is_detected() -> None:
+    """深度値が背景より手前へ変化した人物候補を検出する。"""
+    background = np.full((PROCESS_HEIGHT, PROCESS_WIDTH), 2400, dtype=np.uint16)
+    frames = [background.copy() for _ in range(12)]
+    model = build_background_model(frames, signal_type="depth")
+    detector = CandidateDetector(model)
+
+    person = background.copy()
+    person[40:280, 88:152] = 1400
+    first = detector.detect(person)
+    second = detector.detect(person)
+    assert not first.candidate_valid
+    assert second.candidate_valid
+    assert second.measurement is not None
+    assert abs(second.measurement.x - 0.5) <= 0.02
+    assert abs(second.measurement.y - 0.5) <= 0.02
+    assert abs(second.measurement.bottom - 0.875) <= 0.02
+    assert second.measurement.background_score > 1.0
+
+
 def test_valid_distribution_and_thresholds() -> dict[str, object]:
     session = _run_session(min_samples=4, samples_per_stage=4)
     assert session.status == "PASS", session.status
@@ -118,7 +138,9 @@ def test_valid_distribution_and_thresholds() -> dict[str, object]:
             "height": 240,
             "fps": 30.0,
             "rotation": "ccw",
-            "exposure": {"requested": {"auto": 1.0, "shutter": 312.0, "gain": 2.0}, "auto_readback": 1.0, "shutter_readback": 312.0, "gain_readback": 2.0},
+            "backend": "OpenNI2 ASUS via structure_depth_capture",
+            "pixel_format": "CV_16UC1",
+            "unit": "mm",
         },
         None,
         [(52, 32, 142, 60)],
@@ -183,6 +205,7 @@ def main() -> int:
         test_frame_ids()
         test_rotations()
         test_background_noise_is_not_candidate()
+        test_depth_near_candidate_is_detected()
         valid_payload = test_valid_distribution_and_thresholds()
         test_insufficient_motion_is_invalid()
         test_strict_json_and_invalid_atomic_output(valid_payload)
@@ -190,7 +213,7 @@ def main() -> int:
     except (AssertionError, ValueError, OSError, json.JSONDecodeError) as exc:
         print(f"selftest: 1 error: {exc}")
         return 1
-    print("selftest: 8 tests, 0 errors")
+    print("selftest: 9 tests, 0 errors")
     return 0
 
 

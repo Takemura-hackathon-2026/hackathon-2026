@@ -8,19 +8,20 @@ Raspberry Pi 4 台の外部同期で駆動する縦型ディスプレー・ゲ�
 加えて主機側テストモード 4 種（TEST1〜4）と Pi 常駐表示クライアントの同期段階 A
 （受信 → CRC 確認 → LUT 変換 → HUB75 出力）までを実装済み。
 
-`host/block_breaker.py` は、背景差分による `LEFT` / `RIGHT` / `JUMP` 判定、192×384の
+`host/block_breaker.py` は、既定でSTRUCTURE Sensorの深度背景差分による
+`LEFT` / `RIGHT` / `JUMP` 判定、192×384の
 FC6描画、既存UDP経路への4分割送信を主機だけで行う。ゲームは画像キャラクターを倒すボス戦で、
 左右移動でパドルを動かし、ジャンプでボスの口元からボールを発射する。人物映像・人物マスクは
 LEDへ送らない。
 
-ジャンプ判定は重心上昇0.05、下端上昇0.04（0〜1正規化）を既定値とする。カメラ設置や
+ジャンプ判定は重心上昇0.05、下端上昇0.04（0〜1正規化）を既定値とする。センサー設置や
 身体の映り方に合わせて、`--jump-rise-y-min` と `--jump-rise-bottom-min` で個別調整できる。
 
 ジャンプだけを確認する場合は、ゲーム更新・左右移動・LED送信を行わない専用CLIを使う。
-背景学習後にジャンプイベントを標準出力へ記録し、`--preview`指定時はカメラ画像とマスクを表示する。
+背景学習後にジャンプイベントを標準出力へ記録し、`--preview`指定時は深度プレビューとマスクを表示する。
 
 ```bash
-python3 host/jump_detector.py --camera 0 --seconds 30 --preview
+python3 host/jump_detector.py --seconds 30 --preview
 python3 host/jump_detector_selftest.py
 ```
 
@@ -61,7 +62,7 @@ host/oyaki_camera_calibrate.sh standby-status
 host/oyaki_camera_calibrate.sh standby-stop
 ```
 
-`--mode logo --image PATH`で別ロゴ素材へ切り替えられる。既存の`start`／`foreground`はカメラ校正用として残している。
+`--mode logo --image PATH`で別ロゴ素材へ切り替えられる。既存の`start`／`foreground`はセンサー校正用として残している。
 
 ## 構成
 
@@ -77,8 +78,12 @@ host/oyaki_camera_calibrate.sh standby-stop
 │   ├── make_palette_sheet.py   # docs/assets のパレット見本画像を再生成
 │   ├── palettes.json           # 機械可読定義
 │   ├── fc6.pal / msx16.pal     # 生 RGB パレット（156 byte / 48 byte）
-│   ├── block_breaker.py         # カメラ操作ブロック崩し・FC6描画・UDP送信
-│   ├── block_breaker_selftest.py # カメラ不要のゲーム・入力分類器検証
+│   ├── block_breaker.py         # STRUCTURE Sensor操作ブロック崩し・FC6描画・UDP送信
+│   ├── block_breaker_selftest.py # センサー不要のゲーム・入力分類器検証
+│   ├── frame_source.py          # C++取得ヘルパーから深度フレームを受信
+│   ├── structure_depth_capture.cpp # OpenNI2深度取得ヘルパー
+│   ├── structure_depth_view.cpp # 深度ビューのFC6/UDP表示
+│   ├── jump_detector.py         # ジャンプ判定専用CLI
 │   ├── standby.py                # 時刻・主機/Pi温度を表示する192x384縦画面のホスト常時起動
 │   └── test_mode/
 │       ├── test_mode.py        # TEST1: WebP を DVD ロゴ風に反射移動・量子化・4分割 UDP 送信
@@ -186,7 +191,7 @@ cd host/test_mode && python3 test_mode.py --no-preview --send \
 
 詳細は [host/test_mode/README.md](host/test_mode/README.md)。
 
-## カメラ操作ブロック崩し
+## STRUCTURE Sensor操作ブロック崩し
 
 通常ゲーム表示はFC6（52色）で固定する。主機が192×384の完成済みパレットインデックス配列を
 描き、既存の`UdpFrameSender`が上から192×96ずつ4台へ送る。Pi側のコードとUDP形式は変更しない。
@@ -204,7 +209,7 @@ cd host/test_mode && python3 test_mode.py --no-preview --send \
 - HPが0になると`BOSS DOWN`を約1.8秒表示し、その後自動的に初期画面へ戻る
 - ボールを3回落とすと`GAME OVER`になり、約1.8秒後に最初からやり直す
 
-起動時は、まず誰も写さない状態で背景を約2秒学習する。次に参加者がカメラ正面で静止すると、
+起動時は、まず誰もいない状態で深度背景を約2秒学習する。次に参加者がセンサー正面で静止すると、
 立ち位置を校正する。校正後の操作は次の通り。
 
 | 身体操作 | ゲーム操作 |
@@ -223,46 +228,45 @@ Linux/X11環境では左右キーの押下・解放を毎フレーム取得す�
 python3 host/block_breaker.py --keyboard
 ```
 
-USBカメラとPi 4台を使う場合:
+STRUCTURE SensorとPi 4台を使う場合:
 
 ```bash
-python3 host/block_breaker.py --camera 0 --send \
+python3 host/block_breaker.py --send \
   --pi 192.168.10.101:5000 --pi 192.168.10.102:5000 \
   --pi 192.168.10.103:5000 --pi 192.168.10.104:5000
 ```
 
-カメラ画面と前景マスクは`--debug-camera`で主機だけに表示する。LEDへの送出内容はゲーム画面だけである。
-背景幕や床以外を検出対象から外すには、`--roi x,y,width,height`でカメラ画像内のROIを指定できる。
+深度プレビューと前景マスクは`--debug-depth`で主機だけに表示する。LEDへの送出内容はゲーム画面だけである。
+背景幕や床以外を検出対象から外すには、`--roi x,y,width,height`で深度画像内のROIを指定できる。
 
 ```bash
 python3 host/block_breaker_selftest.py
 ```
 
-## カメラキャリブレーション
+## STRUCTURE Sensorキャリブレーション
 
-`host/camera_calibrate.py` は、固定照明・床反射を背景として学習し、CENTER/STANCE、LEFT、RIGHT、JUMP、VALIDATEの順に姿勢・移動・ジャンプを約60〜90秒で計測する。回転、ROI、固定照明領域、各ステージ時間はCLIで指定できる。回転はROI・背景差分・計測より先に適用され、将来のoyaki標準例は`ccw`とする。LEDへ送るのは既存FC6の192×384インデックス画像だけで、カメラ映像やマスクは送らない。
+`host/camera_calibrate.py` はSTRUCTURE Sensorの深度背景を学習し、CENTER/STANCE、LEFT、RIGHT、JUMP、VALIDATEの順に姿勢・移動・ジャンプを約60〜90秒で計測する。回転、ROI、深度変化量、各ステージ時間はCLIで指定できる。回転はROI・背景差分・計測より先に適用され、oyaki標準例は`ccw`とする。LEDへ送るのは既存FC6の192×384インデックス画像だけで、センサー映像やマスクは送らない。
 
-ローカルでカメラ・ネットワークなしの表示デモを実行する。各ステージ画面と背景/候補の代表PNGを指定先へ保存する。
+ローカルでセンサー・ネットワークなしの表示デモを実行する。各ステージ画面と背景/候補の代表PNGを指定先へ保存する。
 
 ```bash
 python3 host/camera_calibrate.py --demo --demo-output /tmp/camera-calibrate-demo
 ```
 
-固定照明の指定は処理後240×320画像の座標で行う。例えば`52,32,142,60`は`--fixed-light 52,32,142,60`と指定する。背景から抽出する安定高輝度マスクも併用するが、瞬間的な明るさの変化や白い服を一律には除外しない。
+STRUCTURE Sensorでは固定照明マスクを使わず、背景深度より手前に変化した画素を候補にする。`--depth-min-change-mm 0`（既定）は背景フレームのノイズから閾値を自動決定する。
 
-oyaki上で実カメラと4台のPiへ接続するコマンド例:
+oyaki上でSTRUCTURE Sensorと4台のPiへ接続するコマンド例:
 
 ```bash
-python3 host/camera_calibrate.py --camera 0 --rotation ccw \
-  --fixed-light 52,32,142,60 --send \
+python3 host/camera_calibrate.py --rotation ccw --send \
   --pi 192.168.10.101:5000 --pi 192.168.10.102:5000 \
   --pi 192.168.10.103:5000 --pi 192.168.10.104:5000 \
   --output camera_calibration.json
 ```
 
-露出CLIの既定値は`1/312/2`で、カメラが返した実際の解像度・FPS・回転・露出readbackをJSONへ記録する。成功時は`camera_calibration.json`へatomic writeし、品質ゲートに失敗した結果は`camera_calibration.invalid.json`へatomic writeするため、既存のvalid JSONを上書きしない。JSONには`version`、`date`、`valid`、`camera`、`ROI`、`fixed_light`、`background`、`baseline`、`motion_stats`、`thresholds`、`quality`、`sample_counts`を含み、NaN/Infinityは許可しない。
+oyakiではOpenNI2対応C++ OpenCVの`CAP_OPENNI2_ASUS`と`CAP_OPENNI_DEPTH_MAP`で`CV_16UC1`のmm値を取得し、`structure_depth_capture`がPythonへ渡す。成功時は`camera_calibration.json`へatomic writeし、品質ゲートに失敗した結果は`camera_calibration.invalid.json`へatomic writeするため、既存のvalid JSONを上書きしない。JSONには`version`、`date`、`valid`、`sensor`、`ROI`、`fixed_light`、`background`、`baseline`、`motion_stats`、`thresholds`、`quality`、`sample_counts`を含み、NaN/Infinityは許可しない。
 
-終了コードは、`0`=valid校正成功、`1`=RETRY/FAILまたは中止、`2`=引数・カメラ等の実行エラー。`/tmp`のデモ出力は揮発性なので、必要な診断PNGは別の保存先へコピーする。自己テストは`python3 host/camera_calibrate_selftest.py`でカメラ・ネットワークなしに実行できる。
+終了コードは、`0`=valid校正成功、`1`=RETRY/FAILまたは中止、`2`=引数・センサー等の実行エラー。`/tmp`のデモ出力は揮発性なので、必要な診断PNGは別の保存先へコピーする。自己テストは`python3 host/camera_calibrate_selftest.py`でセンサー・ネットワークなしに実行できる。
 
 Macからは`host/oyaki_camera_calibrate.sh`でSSH操作できる。SSH鍵とHANDOFF記載のIPv6ゾーン指定を使い、秘密はスクリプトへ埋め込まない。`start`はPiクライアントを起動せず、既に4台が待受している前提で校正だけをバックグラウンド実行する。
 
@@ -278,7 +282,22 @@ host/oyaki_camera_calibrate.sh stop
 host/oyaki_camera_calibrate.sh fetch /tmp/camera-calibration-result
 ```
 
-今回の実機確認では、4台の`pi_client`を手動起動した後、FC6テスト送信でtarget 0〜3の`displayed`増加と`dropped=0`を確認した。本版キャリブレーションは`rotation=ccw`、640×480/30fps、露出readback 1/312/2で`valid=true`を生成した。背景のみスモークは安定状態で303フレーム中候補0だったが、照明変動時に誤候補が出た試行もあるため、設置後の再測定を推奨する。
+深度取得ヘルパーはC++標準出力のバイナリフレームをPythonへ渡し、Python側のOpenNI2非対応配布版cv2には依存しない。設置後は背景学習をやり直し、`--depth-min-change-mm`と`--roi`を必要に応じて調整する。
+
+## STRUCTURE Sensor深度ビュー
+
+`host/structure_depth_view.cpp` は、STRUCTURE Sensorの深度マップをFC6の色相ランプへ変換し、既存のUDP送信形式で4台のPiへ送る実機確認用プログラムである。近い部分ほど明るい色、無効深度は黒になる。既定の深度表示範囲は各フレームの2〜98パーセンタイルで、必要なら`--near-mm`／`--far-mm`で固定できる。
+
+oyakiへ配備・コンパイルする:
+
+```bash
+host/oyaki_camera_calibrate.sh deploy
+host/oyaki_camera_calibrate.sh depth-view-start
+host/oyaki_camera_calibrate.sh depth-view-status
+host/oyaki_camera_calibrate.sh depth-view-stop
+```
+
+前景で実行する場合は`depth-view-foreground`、再コンパイルだけ行う場合は`depth-view-build`を使う。ビューと取得ヘルパーはOpenCV C++のOpenNI2バックエンド（`CAP_OPENNI2_ASUS`）を使用するため、oyaki側のOpenCVが`WITH_OPENNI2=ON`でビルドされている必要がある。Python venvのOpenCVとは別に、`pkg-config opencv4`で参照されるC++ OpenCVを使う。
 
 ## Pi 常駐表示クライアント
 
@@ -325,7 +344,7 @@ cd host/test_mode && python3 selftest.py
 1. 実機での表示確認（`pi-client` のビルドと 4 台での TEST1〜4）
 2. 4 台の論理フレーム同期（READY 返送・UDP 5100 のバリア、`frame_id` 一致）
 3. M5StickC Plus の物理同期パルスと GPIO 同期待機、走査位相の評価
-4. 実機でのブロック崩し・カメラ入力の校正（左右・ジャンプの精度と遅延）
+4. 実機でのブロック崩し・センサー入力の校正（左右・ジャンプの精度と遅延）
 5. 会場照明下での誤検出対策とゲーム難易度調整
 
 ## ライセンス

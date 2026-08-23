@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ジャンプ判定専用CLIのカメラ非依存セルフテスト。"""
+"""ジャンプ判定専用CLIのセンサー非依存セルフテスト。"""
 from __future__ import annotations
 
 import argparse
@@ -13,6 +13,8 @@ from jump_detector import build_parser, parse_roi  # noqa: E402
 def main() -> int:
     errors: list[str] = []
     args = build_parser().parse_args([])
+    if args.sensor_width != 640 or args.sensor_height != 480 or args.depth_min_change_mm != 0.0:
+        errors.append("STRUCTURE Sensorの既定値が不正")
     if args.jump_rise_y_min != 0.05 or args.jump_rise_bottom_min != 0.04:
         errors.append("既定のジャンプ閾値が不正")
     args = build_parser().parse_args(["--jump-rise-y-min", "0.03", "--jump-rise-bottom-min", "0.025"])

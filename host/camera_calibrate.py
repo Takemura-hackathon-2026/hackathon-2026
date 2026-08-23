@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""固定照明に強い、主機側カメラキャリブレーション。
+"""深度背景に対応した、主機側STRUCTURE Sensorキャリブレーション。
 
-カメラ映像を主機だけで処理し、LEDへはFC6インデックスの192x384フレームだけを
-送る。カメラを開かない ``--demo`` と、カメラ・UDPを使わない自己テストからも
+深度を主機だけで処理し、LEDへはFC6インデックスの192x384フレームだけを
+送る。センサーを開かない ``--demo`` と、センサー・UDPを使わない自己テストからも
 利用できるよう、計測・判定・描画を小さな部品へ分離している。
 """
 from __future__ import annotations
@@ -32,6 +32,7 @@ for import_path in (HOST_ROOT, TEST_MODE_ROOT):
     if str(import_path) not in sys.path:
         sys.path.insert(0, str(import_path))
 
+from frame_source import StructureSensorSource, depth_preview  # noqa: E402
 from palettes import FC6, FC6_BLACK, FC6_LIMIT, FC6_WHITE, PaletteMode  # noqa: E402
 from test_mode import PI_COUNT, UdpFrameSender, parse_pi  # noqa: E402
 
@@ -41,7 +42,7 @@ CANVAS_HEIGHT = 384
 CANVAS_WIDTH = 192
 PROCESS_HEIGHT = 320
 PROCESS_WIDTH = 240
-VERSION = "1.0"
+VERSION = "1.2"
 
 MAIN_STAGES = (
     "BACKGROUND",
@@ -131,19 +132,8 @@ def parse_rect(value: str) -> tuple[int, int, int, int]:
     return parts  # type: ignore[return-value]
 
 
-def parse_exposure(value: str) -> tuple[float, float, float]:
-    """露出設定 ``auto/shutter/gain`` を読む。既定値は1/312/2。"""
-    try:
-        parts = tuple(float(part) for part in value.split("/"))
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("露出は auto/shutter/gain 形式") from exc
-    if len(parts) != 3 or not all(math.isfinite(part) for part in parts):
-        raise argparse.ArgumentTypeError("露出は有限な3値 auto/shutter/gain")
-    return parts  # type: ignore[return-value]
-
-
 def rotate_frame(frame: np.ndarray, rotation: str) -> np.ndarray:
-    """カメラフレームを回転する。ROI・背景差分・計測より先に呼ぶ。"""
+    """深度フレームを回転する。ROI・背景差分・計測より先に呼ぶ。"""
     if rotation == "none":
         return np.ascontiguousarray(frame)
     if rotation == "cw":
@@ -290,6 +280,8 @@ class BackgroundModel:
     fixed_light_mask: np.ndarray
     noise_p95: float
     frame_count: int
+    signal_type: str = "gray"
+    min_change: float = 0.0
 
     @property
     def ignore_mask(self) -> np.ndarray:
@@ -305,22 +297,38 @@ class BackgroundModel:
 
 
 def build_background_model(
-    frames: Sequence[np.ndarray], fixed_regions: Sequence[tuple[int, int, int, int]] = ()
+    frames: Sequence[np.ndarray],
+    fixed_regions: Sequence[tuple[int, int, int, int]] = (),
+    signal_type: str = "gray",
+    min_change: float = 0.0,
 ) -> BackgroundModel:
-    """背景フレームから安定高輝度領域とノイズ統計を作る。"""
+    """背景フレームから信号種別に応じた背景モデルとノイズ統計を作る。"""
     if len(frames) < 2:
         raise ValueError("背景モデルには2フレーム以上必要")
-    stack = np.asarray([np.asarray(frame, dtype=np.float32) for frame in frames])
+    if signal_type not in ("gray", "depth"):
+        raise ValueError("信号種別はgrayまたはdepth")
+    if min_change < 0 or not math.isfinite(float(min_change)):
+        raise ValueError("最小変化量は0以上の有限値")
+    arrays = [np.asarray(frame) for frame in frames]
+    if any(array.ndim != 2 for array in arrays):
+        raise ValueError("背景画像は2次元のグレースケールまたは深度画像")
+    if any(array.shape != (PROCESS_HEIGHT, PROCESS_WIDTH) for array in arrays):
+        raise ValueError(f"背景画像は{PROCESS_WIDTH}x{PROCESS_HEIGHT}")
+    stack = np.asarray([array.astype(np.float32, copy=False) for array in arrays])
     if stack.ndim != 3 or stack.shape[1:] != (PROCESS_HEIGHT, PROCESS_WIDTH):
-        raise ValueError(f"背景画像は{PROCESS_WIDTH}x{PROCESS_HEIGHT}のグレースケール")
+        raise ValueError(f"背景画像は{PROCESS_WIDTH}x{PROCESS_HEIGHT}")
     median = np.median(stack, axis=0)
     std = np.std(stack, axis=0)
-    bright_cut = max(220.0, float(np.percentile(median, 97.0)))
-    stable_std_cut = max(4.0, float(np.percentile(std, 50.0) * 1.5))
-    stable = (median >= bright_cut) & (std <= stable_std_cut)
-    # 画像全体が白い場合に人の変化まで一律除外しない。
-    if float(np.mean(stable)) > 0.40:
-        stable = np.zeros_like(stable, dtype=bool)
+    if signal_type == "depth":
+        # 深度値に輝度という概念はないため、固定照明マスクは生成しない。
+        stable = np.zeros_like(median, dtype=bool)
+    else:
+        bright_cut = max(220.0, float(np.percentile(median, 97.0)))
+        stable_std_cut = max(4.0, float(np.percentile(std, 50.0) * 1.5))
+        stable = (median >= bright_cut) & (std <= stable_std_cut)
+        # 画像全体が白い場合に人の変化まで一律除外しない。
+        if float(np.mean(stable)) > 0.40:
+            stable = np.zeros_like(stable, dtype=bool)
     fixed = np.zeros_like(stable, dtype=bool)
     for x, y, width, height in fixed_regions:
         if x + width > PROCESS_WIDTH or y + height > PROCESS_HEIGHT:
@@ -334,6 +342,8 @@ def build_background_model(
         fixed_light_mask=fixed,
         noise_p95=noise_p95,
         frame_count=len(frames),
+        signal_type=signal_type,
+        min_change=float(min_change),
     )
 
 
@@ -370,12 +380,21 @@ class CandidateDetector:
         self.persistence = 0
 
     def detect(self, gray: np.ndarray) -> Detection:
-        image = np.asarray(gray, dtype=np.uint8)
+        raw = np.asarray(gray)
+        image = raw.astype(np.float32, copy=False)
         if image.shape != (PROCESS_HEIGHT, PROCESS_WIDTH):
             raise ValueError("検出画像は240x320")
-        diff = np.abs(image.astype(np.float32) - self.model.median)
-        threshold = max(10.0, self.model.noise_p95 * 3.0)
-        binary = (diff >= threshold) & ~self.model.ignore_mask
+        if self.model.signal_type == "depth":
+            # STRUCTURE Sensorでは、人物が背景より手前に来る変化だけを採用する。
+            valid = (image > 0) & (self.model.median > 0)
+            diff = np.maximum(self.model.median - image, 0.0)
+            threshold = max(1.0, self.model.noise_p95 * 3.0, self.model.min_change)
+            binary = (diff >= threshold) & valid & ~self.model.ignore_mask
+        else:
+            image = raw.astype(np.uint8, copy=False).astype(np.float32)
+            diff = np.abs(image - self.model.median)
+            threshold = max(10.0, self.model.noise_p95 * 3.0)
+            binary = (diff >= threshold) & ~self.model.ignore_mask
         mask = (binary.astype(np.uint8) * 255)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
@@ -719,7 +738,7 @@ class CalibrationSession:
 
 def make_calibration_payload(
     session: CalibrationSession,
-    camera: dict[str, object],
+    sensor: dict[str, object],
     roi: tuple[int, int, int, int] | None,
     fixed_regions: Sequence[tuple[int, int, int, int]],
     background_model: BackgroundModel | None,
@@ -729,18 +748,21 @@ def make_calibration_payload(
     background = {
         "frames": int(session.background_frames),
         "ready": background_model is not None,
+        "signal_type": None if background_model is None else background_model.signal_type,
         "noise_p95": None if background_model is None else background_model.noise_p95,
         "stable_bright_mask_fraction": None if background_model is None else background_model.stable_light_fraction,
         "fixed_mask_fraction": None if background_model is None else background_model.fixed_light_fraction,
-        "median_luma": None if background_model is None else float(np.median(background_model.median)),
-        "std_luma": None if background_model is None else float(np.median(background_model.std)),
+        "median_luma": None if background_model is None or background_model.signal_type == "depth" else float(np.median(background_model.median)),
+        "std_luma": None if background_model is None or background_model.signal_type == "depth" else float(np.median(background_model.std)),
+        "median_depth_mm": None if background_model is None or background_model.signal_type != "depth" else float(np.median(background_model.median[background_model.median > 0])) if np.any(background_model.median > 0) else None,
+        "std_depth_mm": None if background_model is None or background_model.signal_type != "depth" else float(np.median(background_model.std)),
     }
     payload: dict[str, object] = {
         "version": VERSION,
         "date": datetime.now(timezone.utc).isoformat(),
         "valid": bool(analysis["valid"]) and session.status == "PASS",
         "status": session.status,
-        "camera": camera,
+        "sensor": sensor,
         "ROI": {
             "after_rotation": None if roi is None else list(roi),
             "processed_size": [PROCESS_WIDTH, PROCESS_HEIGHT],
@@ -748,7 +770,11 @@ def make_calibration_payload(
         "fixed_light": {
             "regions": [list(region) for region in fixed_regions],
             "coordinate_space": "processed_240x320_after_rotation_and_roi",
-            "stable_background_mask": "stable_high_luminance_low_variance_only",
+            "stable_background_mask": (
+                "not_applicable_for_depth"
+                if background_model is not None and background_model.signal_type == "depth"
+                else "stable_high_luminance_low_variance_only"
+            ),
         },
         "background": background,
         "baseline": analysis["baseline"],
@@ -804,7 +830,7 @@ def _gray_to_canvas(gray: np.ndarray) -> np.ndarray:
 
 
 def run_demo(output_dir: Path) -> int:
-    """カメラ・ネットワークなしで全ステージと診断画像を保存する。"""
+    """センサー・ネットワークなしで全ステージと診断画像を保存する。"""
     output_dir.mkdir(parents=True, exist_ok=True)
     for index, stage in enumerate(DISPLAY_STAGES, start=1):
         instruction = {
@@ -844,74 +870,47 @@ def run_demo(output_dir: Path) -> int:
     return 0
 
 
-class CameraSource:
-    """OpenCVカメラの設定・readback・cleanupを閉じ込める。"""
+class SensorSource:
+    """STRUCTURE Sensorの設定・フレーム取得・cleanupを閉じ込める。"""
 
-    def __init__(self, device: int, width: int, height: int, fps: float, exposure: tuple[float, float, float]) -> None:
-        self.device = device
-        self.requested_size = (int(width), int(height))
-        self.capture = cv2.VideoCapture(device)
-        if not self.capture.isOpened():
-            self.capture.release()
-            raise RuntimeError(f"カメラ {device} を開けない")
-        self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        self.capture.set(cv2.CAP_PROP_FPS, fps)
-        self.capture.set(cv2.CAP_PROP_AUTO_EXPOSURE, exposure[0])
-        self.capture.set(cv2.CAP_PROP_EXPOSURE, exposure[1])
-        self.capture.set(cv2.CAP_PROP_GAIN, exposure[2])
-        self.requested = {"auto": exposure[0], "shutter": exposure[1], "gain": exposure[2]}
-        self.last_shape: tuple[int, int] | None = None
+    def __init__(
+        self,
+        width: int,
+        height: int,
+        fps: float,
+    ) -> None:
+        self.frame_source = StructureSensorSource(width, height, fps)
+
+    @property
+    def is_depth(self) -> bool:
+        return self.frame_source.is_depth
 
     def read(self) -> np.ndarray:
-        ok, frame = self.capture.read()
-        if not ok or frame is None:
-            raise RuntimeError("カメラフレームを読めない")
-        self.last_shape = (int(frame.shape[1]), int(frame.shape[0]))
-        return frame
+        return self.frame_source.read()
 
     def metadata(self, rotation: str) -> dict[str, object]:
-        def readback(prop: int, integer: bool = False) -> int | float | None:
-            value = float(self.capture.get(prop))
-            if not math.isfinite(value):
-                return None
-            return int(round(value)) if integer else value
-
-        width = readback(cv2.CAP_PROP_FRAME_WIDTH, integer=True)
-        height = readback(cv2.CAP_PROP_FRAME_HEIGHT, integer=True)
-        if (width is None or width <= 0) and self.last_shape is not None:
-            width = self.last_shape[0]
-        if (height is None or height <= 0) and self.last_shape is not None:
-            height = self.last_shape[1]
-        return {
-            "device": int(self.device),
-            "requested_width": self.requested_size[0],
-            "requested_height": self.requested_size[1],
-            "width": width,
-            "height": height,
-            "fps": readback(cv2.CAP_PROP_FPS),
-            "rotation": rotation,
-            "exposure": {
-                "requested": self.requested,
-                "auto_readback": readback(cv2.CAP_PROP_AUTO_EXPOSURE),
-                "shutter_readback": readback(cv2.CAP_PROP_EXPOSURE),
-                "gain_readback": readback(cv2.CAP_PROP_GAIN),
-            },
-        }
+        return self.frame_source.metadata(rotation)
 
     def close(self) -> None:
-        self.capture.release()
+        self.frame_source.close()
 
 
-def _process_frame(source: np.ndarray, rotation: str, roi: tuple[int, int, int, int] | None) -> tuple[np.ndarray, np.ndarray]:
+def _process_frame(
+    source: np.ndarray,
+    rotation: str,
+    roi: tuple[int, int, int, int] | None,
+    is_depth: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """回転・ROI・縮小を適用し、検出用2D配列を返す。"""
     rotated = rotate_frame(source, rotation)
     if roi is not None:
         x, y, width, height = roi
         if x + width > rotated.shape[1] or y + height > rotated.shape[0]:
             raise ValueError(f"ROI {roi} が回転後画像{rotated.shape[1]}x{rotated.shape[0]}を超える")
         rotated = rotated[y:y + height, x:x + width]
-    processed = cv2.resize(rotated, (PROCESS_WIDTH, PROCESS_HEIGHT), interpolation=cv2.INTER_AREA)
-    gray = cv2.cvtColor(processed, cv2.COLOR_BGR2GRAY) if processed.ndim == 3 else processed
+    interpolation = cv2.INTER_NEAREST if is_depth else cv2.INTER_AREA
+    processed = cv2.resize(rotated, (PROCESS_WIDTH, PROCESS_HEIGHT), interpolation=interpolation)
+    gray = processed if is_depth else cv2.cvtColor(processed, cv2.COLOR_BGR2GRAY) if processed.ndim == 3 else processed
     return processed, gray
 
 
@@ -939,18 +938,13 @@ def _stage_instruction(stage: str) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="固定照明に強いカメラ姿勢・移動・ジャンプ校正")
-    parser.add_argument("--camera", type=int, default=0)
-    parser.add_argument("--camera-width", type=int, default=320)
-    parser.add_argument("--camera-height", type=int, default=240)
-    parser.add_argument("--camera-fps", type=float, default=30.0)
+    parser = argparse.ArgumentParser(description="STRUCTURE Sensorの姿勢・移動・ジャンプ校正")
+    parser.add_argument("--sensor-width", type=int, default=640)
+    parser.add_argument("--sensor-height", type=int, default=480)
+    parser.add_argument("--sensor-fps", type=float, default=30.0)
     parser.add_argument("--rotation", choices=("none", "cw", "ccw", "180"), default="none")
-    parser.add_argument("--roi", type=parse_rect, default=None, help="回転後カメラ画像のROI x,y,width,height")
-    parser.add_argument(
-        "--fixed-light", action="append", type=parse_rect, default=[], metavar="X,Y,W,H",
-        help="処理後240x320画像の固定照明領域。複数指定可",
-    )
-    parser.add_argument("--exposure", type=parse_exposure, default=(1.0, 312.0, 2.0), help="auto/shutter/gain（既定1/312/2）")
+    parser.add_argument("--roi", type=parse_rect, default=None, help="回転後深度画像のROI x,y,width,height")
+    parser.add_argument("--depth-min-change-mm", type=float, default=0.0, help="深度の手前側変化量。0は背景ノイズから自動決定")
     parser.add_argument("--background-seconds", type=float, default=12.0)
     parser.add_argument("--stance-seconds", type=float, default=12.0)
     parser.add_argument("--left-seconds", type=float, default=10.0)
@@ -964,12 +958,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pi", action="append", default=None, metavar="HOST[:PORT]")
     parser.add_argument("--chunk-size", type=int, default=1200)
     parser.add_argument("--preview", action="store_true", help="OpenCVプレビューを表示")
-    parser.add_argument("--demo", action="store_true", help="カメラ・ネットワークなしの表示デモ")
+    parser.add_argument("--demo", action="store_true", help="センサー・ネットワークなしの表示デモ")
     parser.add_argument("--demo-output", type=Path, default=Path("/tmp/camera-calibrate-demo"))
     return parser
 
 
-def run_camera(args: argparse.Namespace) -> int:
+def run_sensor(args: argparse.Namespace) -> int:
     durations = {
         "BACKGROUND": args.background_seconds,
         "CENTER/STANCE": args.stance_seconds,
@@ -979,9 +973,14 @@ def run_camera(args: argparse.Namespace) -> int:
         "VALIDATE": args.validate_seconds,
     }
     session = CalibrationSession(durations, args.min_samples)
-    source: CameraSource | None = None
+    source: SensorSource | None = None
     sender: UdpFrameSender | None = None
-    builder = BackgroundBuilder(args.background_frames, args.fixed_light)
+    builder = BackgroundBuilder(
+        args.background_frames,
+        (),
+        signal_type="depth",
+        min_change=args.depth_min_change_mm,
+    )
     detector: CandidateDetector | None = None
     preview_requested = bool(args.preview)
     running = True
@@ -992,7 +991,7 @@ def run_camera(args: argparse.Namespace) -> int:
         running = False
 
     try:
-        source = CameraSource(args.camera, args.camera_width, args.camera_height, args.camera_fps, args.exposure)
+        source = SensorSource(args.sensor_width, args.sensor_height, args.sensor_fps)
         if args.send:
             values = args.pi if args.pi is not None else [
                 "192.168.10.101:5000", "192.168.10.102:5000", "192.168.10.103:5000", "192.168.10.104:5000"
@@ -1007,17 +1006,17 @@ def run_camera(args: argparse.Namespace) -> int:
         frame_ids = FrameIdGenerator()
         last = time.monotonic()
         deadline = last
-        period = 1.0 / max(1.0, args.camera_fps)
+        period = 1.0 / max(1.0, args.sensor_fps)
         processed_preview: np.ndarray | None = None
-        print(f"camera calibration: rotation={args.rotation} duration={sum(durations.values()):.1f}s send={'yes' if sender else 'no'}")
+        print(f"sensor calibration: source=structure rotation={args.rotation} duration={sum(durations.values()):.1f}s send={'yes' if sender else 'no'}")
         print("keys: q/ESC 中止, r 現在ステージをリセット（--preview時はOpenCV、headless時はTTY）")
         while running and session.status == "RUNNING":
             now = time.monotonic()
             dt = min(0.5, max(0.0, now - last))
             last = now
             source_frame = source.read()
-            processed, gray = _process_frame(source_frame, args.rotation, args.roi)
-            processed_preview = processed
+            processed, gray = _process_frame(source_frame, args.rotation, args.roi, source.is_depth)
+            processed_preview = depth_preview(processed) if source.is_depth else processed
             if builder.model is None:
                 builder.add(gray)
             if builder.model is not None and detector is None:
@@ -1047,9 +1046,9 @@ def run_camera(args: argparse.Namespace) -> int:
             if args.preview:
                 try:
                     preview = cv2.resize(indexed_to_bgr(indexed), None, fx=2.0, fy=2.0, interpolation=cv2.INTER_NEAREST)
-                    cv2.imshow("camera calibration LED", preview)
-                    cv2.imshow("camera calibration camera", processed_preview)
-                    cv2.imshow("camera calibration mask", detection.mask)
+                    cv2.imshow("sensor calibration LED", preview)
+                    cv2.imshow("sensor calibration depth", processed_preview)
+                    cv2.imshow("sensor calibration mask", detection.mask)
                     pressed = cv2.waitKey(1)
                     if pressed >= 0:
                         key = chr(pressed & 0xFF).lower()
@@ -1078,8 +1077,8 @@ def run_camera(args: argparse.Namespace) -> int:
         if not running and session.status == "RUNNING":
             session.abort("signal_abort")
 
-        camera_meta = source.metadata(args.rotation)
-        payload = make_calibration_payload(session, camera_meta, args.roi, args.fixed_light, builder.model)
+        sensor_meta = source.metadata(args.rotation)
+        payload = make_calibration_payload(session, sensor_meta, args.roi, (), builder.model)
         target = write_calibration_result(args.output, payload)
         print(f"result: {session.status} valid={payload['valid']} output={target}")
         return 0 if bool(payload["valid"]) else 1
@@ -1100,9 +1099,17 @@ def run_camera(args: argparse.Namespace) -> int:
 class BackgroundBuilder:
     """背景モデルを最初の安定フレームだけから一度作る。"""
 
-    def __init__(self, minimum_frames: int, fixed_regions: Sequence[tuple[int, int, int, int]]) -> None:
+    def __init__(
+        self,
+        minimum_frames: int,
+        fixed_regions: Sequence[tuple[int, int, int, int]],
+        signal_type: str = "gray",
+        min_change: float = 0.0,
+    ) -> None:
         self.minimum_frames = max(2, int(minimum_frames))
         self.fixed_regions = tuple(fixed_regions)
+        self.signal_type = signal_type
+        self.min_change = float(min_change)
         self.frames: list[np.ndarray] = []
         self.model: BackgroundModel | None = None
 
@@ -1113,9 +1120,17 @@ class BackgroundBuilder:
     def add(self, gray: np.ndarray) -> None:
         if self.model is not None:
             return
-        self.frames.append(np.asarray(gray, dtype=np.uint8).copy())
+        image = np.asarray(gray)
+        if image.ndim != 2:
+            raise ValueError("背景フレームは2次元でなければならない")
+        self.frames.append(image.copy())
         if len(self.frames) >= self.minimum_frames:
-            self.model = build_background_model(self.frames, self.fixed_regions)
+            self.model = build_background_model(
+                self.frames,
+                self.fixed_regions,
+                signal_type=self.signal_type,
+                min_change=self.min_change,
+            )
 
     def reset(self) -> None:
         self.frames.clear()
@@ -1129,8 +1144,11 @@ def main(argv: Iterable[str] | None = None) -> int:
             print("error: --demoでは--sendを指定できない", file=sys.stderr)
             return 2
         return run_demo(args.demo_output)
-    if args.background_frames < 2 or args.min_samples < 1 or args.camera_fps <= 0:
-        print("error: background-frames/min-samples/camera-fpsが不正", file=sys.stderr)
+    if (
+        args.sensor_width <= 0 or args.sensor_height <= 0 or args.sensor_fps <= 0
+        or args.background_frames < 2 or args.min_samples < 1 or args.depth_min_change_mm < 0
+    ):
+        print("error: sensor/background-frames/min-samples/depth-min-change-mmが不正", file=sys.stderr)
         return 2
     for name in MAIN_STAGES:
         duration = {
@@ -1144,7 +1162,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         if duration <= 0:
             print(f"error: {name}の時間は正", file=sys.stderr)
             return 2
-    return run_camera(args)
+    return run_sensor(args)
 
 
 if __name__ == "__main__":
