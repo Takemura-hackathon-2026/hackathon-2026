@@ -229,6 +229,32 @@ Linux/X11環境では左右キーの押下・解放を毎フレーム取得す�
 python3 host/block_breaker.py --keyboard
 ```
 
+### 通常ステージ＋エクストラボス戦（キーボード試作）
+
+`host/extra_stage_block_breaker.py`は、通常のブロック崩し1面をクリアすると警告演出を経て
+ボス戦へ移行する、主機プレビュー専用の試作版。カメラ入力・Pi送信・実機への自動反映は行わない。
+
+- `A`/`D`または左右矢印: パドル移動
+- `Space`/`W`または上矢印: ボール発射
+- `C`: パドルを画面全幅にするチートの切り替え
+- `S`: 通常ステージを即時クリアして遷移演出を確認
+- `B`: ボス遷移へスキップ
+- `R`: 通常ステージ1からリセット
+- `Q`または`Esc`: 終了
+
+通常面クリア後は`STAGE CLEAR`、赤い`WARNING`、ボス降下、HPバー出現の順に進む。
+ボス撃破時は高速点滅、0.5秒間隔の点滅、爆発四散、`BOSS DOWN`を経て通常ステージ1へ戻る。
+
+```bash
+python3 host/extra_stage_block_breaker.py
+```
+
+画面を開かず起動確認だけ行う場合:
+
+```bash
+python3 host/extra_stage_block_breaker.py --headless --frames 5
+```
+
 STRUCTURE SensorとPi 4台を使う場合:
 
 ```bash
