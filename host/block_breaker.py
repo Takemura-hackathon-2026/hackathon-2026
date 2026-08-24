@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import ctypes.util
+import json
 import math
 import signal
 import sys
@@ -45,6 +46,13 @@ UP_KEYS = frozenset((82, 2490368, 65362, 63232))
 # X11のキー状態取得が使えない環境でのフォールバック用。
 KEYBOARD_EVENT_HOLD_SECONDS = 0.08
 BOSS_IMAGE = HOST / "assets" / "takemuraface_fc6.png"
+DEFAULT_START_SETTINGS = {
+    "center_tolerance": 0.18,
+    "width_gain_min": 0.06,
+    "upper_width_gain_min": 0.04,
+    "upper_width_min": 0.30,
+    "area_gain_min": 0.05,
+}
 
 
 def load_boss_sprite(path: Path = BOSS_IMAGE) -> tuple[np.ndarray, np.ndarray]:
@@ -69,6 +77,9 @@ class BodyMeasurement:
     y: float
     bottom: float
     area: float
+    width: float = 0.0
+    height: float = 0.0
+    upper_width: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -77,16 +88,27 @@ class InputState:
     jump: bool = False  # 1フレームのイベント
     body_present: bool = False
     calibrated: bool = False
+    launch: bool = False  # 腕で輪を作った1フレームの開始イベント（互換用）
+    start_trigger: bool = False  # 通過検知または腕輪でカウントダウンを開始するイベント
+    body_x: float | None = None  # 平滑化済み人物中心X（0〜1）。バー同期用
 
 
 class InputClassifier:
-    """校正済み重心の時系列をLEFT/RIGHT/JUMPへ変換する。"""
+    """校正済み人物領域の時系列をLEFT/RIGHT/JUMP/開始へ変換する。"""
 
     def __init__(
         self,
         samples: int = 30,
         jump_rise_y_min: float = 0.05,
         jump_rise_bottom_min: float = 0.04,
+        lateral_confirm_frames: int = 4,
+        start_center_tolerance: float = 0.18,
+        start_width_gain: float = 0.06,
+        start_upper_width_gain: float = 0.04,
+        start_upper_width_min: float = 0.30,
+        start_area_gain: float = 0.05,
+        start_confirm_frames: int = 4,
+        start_rearm_frames: int = 6,
     ) -> None:
         self.required_samples = max(3, samples)
         if (
@@ -98,50 +120,117 @@ class InputClassifier:
             raise ValueError("ジャンプ閾値は正の値")
         self.jump_rise_y_min = float(jump_rise_y_min)
         self.jump_rise_bottom_min = float(jump_rise_bottom_min)
+        self.lateral_confirm_frames = max(2, int(lateral_confirm_frames))
+        if (
+            not math.isfinite(start_center_tolerance)
+            or not math.isfinite(start_width_gain)
+            or not math.isfinite(start_upper_width_gain)
+            or not math.isfinite(start_upper_width_min)
+            or not math.isfinite(start_area_gain)
+            or start_center_tolerance <= 0
+            or start_width_gain <= 0
+            or start_upper_width_gain <= 0
+            or start_upper_width_min <= 0
+            or start_area_gain <= 0
+        ):
+            raise ValueError("腕輪スタート判定の閾値は正の有限値")
+        self.start_center_tolerance = float(start_center_tolerance)
+        self.start_width_gain = float(start_width_gain)
+        self.start_upper_width_gain = float(start_upper_width_gain)
+        self.start_upper_width_min = float(start_upper_width_min)
+        self.start_area_gain = float(start_area_gain)
+        self.start_confirm_frames = max(2, int(start_confirm_frames))
+        self.start_rearm_frames = max(2, int(start_rearm_frames))
         self.samples: list[BodyMeasurement] = []
         self.baseline: BodyMeasurement | None = None
         self.last: BodyMeasurement | None = None
         self.last_time = 0.0
+        self.x_history: list[float] = []
         self.lateral = 0
         self.candidate = 0
-        self.candidate_since = 0.0
+        self.candidate_frames = 0
         self.jump_latched = False
         self.last_jump = -math.inf
+        self.start_latched = False
+        self.start_pose_frames = 0
+        self.start_rearm_count = 0
 
     @property
     def calibrated(self) -> bool:
         return self.baseline is not None
 
     def reset(self) -> None:
-        self.__init__(self.required_samples, self.jump_rise_y_min, self.jump_rise_bottom_min)
+        self.__init__(
+            self.required_samples,
+            self.jump_rise_y_min,
+            self.jump_rise_bottom_min,
+            self.lateral_confirm_frames,
+            self.start_center_tolerance,
+            self.start_width_gain,
+            self.start_upper_width_gain,
+            self.start_upper_width_min,
+            self.start_area_gain,
+            self.start_confirm_frames,
+            self.start_rearm_frames,
+        )
+
+    def _arm_circle_pose(self, body: BodyMeasurement, baseline: BodyMeasurement) -> bool:
+        """深度領域の広がりから、両腕で輪を作る姿勢を近似する。"""
+        # 現在のSTRUCTURE Sensor経路には関節点がないため、中央維持、人物幅、
+        # 上半身幅、面積の増加を組み合わせる。単なるジャンプは幅が増えない。
+        if body.width <= 0.0 or body.upper_width <= 0.0:
+            return False
+        if abs(body.x - baseline.x) > self.start_center_tolerance:
+            return False
+        return (
+            body.width - baseline.width >= self.start_width_gain
+            and body.upper_width - baseline.upper_width >= self.start_upper_width_gain
+            and body.upper_width >= self.start_upper_width_min
+            and body.area >= baseline.area * (1.0 + self.start_area_gain)
+        )
 
     def update(self, body: BodyMeasurement | None, now: float) -> InputState:
         if body is None:
             self.last = None
+            self.x_history.clear()
             self.lateral = 0
             self.candidate = 0
+            self.candidate_frames = 0
+            self.start_latched = False
+            self.start_pose_frames = 0
+            self.start_rearm_count = 0
             return InputState(calibrated=self.calibrated)
         if self.baseline is None:
             self.samples.append(body)
             if len(self.samples) >= self.required_samples:
-                data = np.asarray([[v.x, v.y, v.bottom, v.area] for v in self.samples])
+                data = np.asarray(
+                    [[v.x, v.y, v.bottom, v.area, v.width, v.height, v.upper_width] for v in self.samples]
+                )
                 values = np.median(data, axis=0)
                 self.baseline = BodyMeasurement(*[float(v) for v in values])
                 self.samples.clear()
+                self.x_history = [body.x]
             self.last, self.last_time = body, now
-            return InputState(body_present=True, calibrated=self.calibrated)
+            return InputState(body_present=True, calibrated=self.calibrated, body_x=body.x)
 
         base = self.baseline
-        velocity_x = 0.0 if self.last is None else (body.x - self.last.x) / max(.001, now - self.last_time)
-        offset = body.x - base.x
+        self.x_history.append(body.x)
+        if len(self.x_history) > 5:
+            self.x_history.pop(0)
+        filtered_x = float(np.median(np.asarray(self.x_history, dtype=np.float32)))
+        offset = filtered_x - base.x
         target = -1 if offset <= -.10 else 1 if offset >= .10 else 0 if abs(offset) <= .045 else self.lateral
         if target != self.lateral:
             if target != self.candidate:
-                self.candidate, self.candidate_since = target, now
-            elif target == 0 or ((velocity_x * target >= .03 or abs(offset) >= .17) and now - self.candidate_since >= .12):
-                self.lateral, self.candidate = target, target
+                self.candidate, self.candidate_frames = target, 1
+            else:
+                self.candidate_frames += 1
+                if self.candidate_frames >= self.lateral_confirm_frames:
+                    self.lateral, self.candidate = target, target
+                    self.candidate_frames = 0
         else:
             self.candidate = target
+            self.candidate_frames = 0
 
         rise_y, rise_bottom = base.y - body.y, base.bottom - body.bottom
         pose = rise_y >= self.jump_rise_y_min and rise_bottom >= self.jump_rise_bottom_min
@@ -150,12 +239,188 @@ class InputClassifier:
             self.jump_latched, self.last_jump = True, now
         elif rise_y < self.jump_rise_y_min * .45 and rise_bottom < self.jump_rise_bottom_min * .45:
             self.jump_latched = False
+        arm_circle = self._arm_circle_pose(body, base)
+        launch = False
+        if arm_circle:
+            self.start_pose_frames += 1
+            self.start_rearm_count = 0
+            if self.start_pose_frames >= self.start_confirm_frames and not self.start_latched:
+                self.start_latched = True
+                launch = True
+        else:
+            self.start_pose_frames = 0
+            if self.start_latched:
+                self.start_rearm_count += 1
+                if self.start_rearm_count >= self.start_rearm_frames:
+                    self.start_latched = False
+                    self.start_rearm_count = 0
         self.last, self.last_time = body, now
-        return InputState(self.lateral, jump, True, True)
+        return InputState(
+            lateral=self.lateral,
+            jump=jump,
+            body_present=True,
+            calibrated=True,
+            launch=launch,
+            body_x=filtered_x,
+        )
+
+
+class PassbyStartDetector:
+    """人物候補の出現を一度だけ開始イベントへ変換する。"""
+
+    def __init__(self, confirm_frames: int = 4, rearm_frames: int = 15) -> None:
+        self.confirm_frames = max(2, int(confirm_frames))
+        self.rearm_frames = max(2, int(rearm_frames))
+        self.present_frames = 0
+        self.absent_frames = 0
+        self.latched = False
+
+    def reset(self) -> None:
+        self.present_frames = 0
+        self.absent_frames = 0
+        self.latched = False
+
+    def update(self, body_present: bool) -> bool:
+        """人物が連続検知された瞬間だけTrueを返す。"""
+        if body_present:
+            self.present_frames += 1
+            self.absent_frames = 0
+            if not self.latched and self.present_frames >= self.confirm_frames:
+                self.latched = True
+                return True
+            return False
+        self.present_frames = 0
+        if self.latched:
+            self.absent_frames += 1
+            if self.absent_frames >= self.rearm_frames:
+                self.latched = False
+                self.absent_frames = 0
+        return False
+
+
+class ForegroundGate:
+    """深度差分から、床・背景変化ではない人物候補だけを通す。"""
+
+    # 実機フレームの下端約16%は床面。人物の上半身を残し、床帯だけを候補から外す。
+    FLOOR_CUTOFF_RATIO = 0.84
+    # センサー左右端は反射・無効深度のちらつきが出るため、人物候補から外す。
+    SIDE_CUTOFF_RATIO = 0.15
+    MIN_AREA_RATIO = 0.012
+    MAX_AREA_RATIO = 0.60
+    MIN_HEIGHT_RATIO = 0.25
+    MIN_WIDTH_RATIO = 0.08
+    MAX_WIDTH_RATIO = 0.65
+    MIN_ASPECT_RATIO = 1.05
+    MAX_ASPECT_RATIO = 8.0
+    MIN_FILL_RATIO = 0.10
+    MIN_DEPTH_GAIN_MM = 80.0
+    MIN_PERSISTENCE = 3
+    MAX_CENTER_STEP = 0.12
+
+    def __init__(self, min_area: int) -> None:
+        self.min_area = max(1, int(min_area))
+        self.last_center: tuple[float, float] | None = None
+        self.last_size: tuple[float, float] | None = None
+        self.persistence = 0
+
+    def reset(self) -> None:
+        self.last_center = None
+        self.last_size = None
+        self.persistence = 0
+
+    def detect(
+        self,
+        mask: np.ndarray,
+        nearer: np.ndarray,
+        threshold: float,
+    ) -> tuple[BodyMeasurement | None, np.ndarray | None, np.ndarray]:
+        binary = np.asarray(mask, dtype=np.uint8).copy()
+        depth_gain = np.asarray(nearer, dtype=np.float32)
+        if binary.ndim != 2 or depth_gain.shape != binary.shape:
+            raise ValueError("人物候補のマスクと深度差分の形状が一致しない")
+        height, width = binary.shape
+        floor_start = min(height, max(0, int(round(height * self.FLOOR_CUTOFF_RATIO))))
+        binary[floor_start:, :] = 0
+        side_start = min(width // 2, max(0, int(round(width * self.SIDE_CUTOFF_RATIO))))
+        binary[:, :side_start] = 0
+        binary[:, width - side_start:] = 0
+
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        total = float(width * height)
+        min_area = max(float(self.min_area), total * self.MIN_AREA_RATIO)
+        chosen: tuple[np.ndarray, tuple[int, int, int, int], float, float, float] | None = None
+        for contour in sorted(contours, key=cv2.contourArea, reverse=True):
+            area = float(cv2.contourArea(contour))
+            x, y, box_width, box_height = cv2.boundingRect(contour)
+            area_ratio = area / total
+            if area < min_area or area_ratio > self.MAX_AREA_RATIO:
+                continue
+            if box_height / height < self.MIN_HEIGHT_RATIO:
+                continue
+            if box_width / width < self.MIN_WIDTH_RATIO or box_width / width > self.MAX_WIDTH_RATIO:
+                continue
+            aspect_ratio = box_height / max(1.0, float(box_width))
+            if aspect_ratio < self.MIN_ASPECT_RATIO or aspect_ratio > self.MAX_ASPECT_RATIO:
+                continue
+            fill_ratio = area / max(1.0, float(box_width * box_height))
+            if fill_ratio < self.MIN_FILL_RATIO:
+                continue
+            moments = cv2.moments(contour)
+            if moments["m00"] == 0:
+                continue
+            center_x = float(moments["m10"] / moments["m00"] / width)
+            center_y = float(moments["m01"] / moments["m00"] / height)
+            if not (0.04 <= center_x <= 0.96 and 0.04 <= center_y <= 0.96):
+                continue
+            values = depth_gain[y:y + box_height, x:x + box_width][
+                binary[y:y + box_height, x:x + box_width] > 0
+            ]
+            if values.size == 0:
+                continue
+            median_gain = float(np.median(values))
+            if median_gain < max(self.MIN_DEPTH_GAIN_MM, float(threshold) * 0.75):
+                continue
+            chosen = (contour, (x, y, box_width, box_height), center_x, center_y, area_ratio)
+            break
+
+        if chosen is None:
+            self.reset()
+            return None, None, binary
+
+        contour, bbox, center_x, center_y, area_ratio = chosen
+        _, _, box_width, box_height = bbox
+        size = (box_width / width, box_height / height)
+        if self.last_center is not None and self.last_size is not None:
+            center_step = math.hypot(center_x - self.last_center[0], center_y - self.last_center[1])
+            size_step = max(abs(size[0] - self.last_size[0]), abs(size[1] - self.last_size[1]))
+            self.persistence = self.persistence + 1 if center_step <= self.MAX_CENTER_STEP and size_step <= 0.35 else 1
+        else:
+            self.persistence = 1
+        self.last_center = (center_x, center_y)
+        self.last_size = size
+        x, y, box_width, box_height = bbox
+        component = binary[y:y + box_height, x:x + box_width] > 0
+        upper_height = max(1, int(round(box_height * 0.72)))
+        row_spans: list[int] = []
+        for row in component[:upper_height]:
+            columns = np.flatnonzero(row)
+            if columns.size:
+                row_spans.append(int(columns[-1] - columns[0] + 1))
+        upper_width = max(row_spans, default=0) / width
+        body = BodyMeasurement(
+            center_x,
+            center_y,
+            float(y + box_height) / height,
+            area_ratio,
+            box_width / width,
+            box_height / height,
+            upper_width,
+        )
+        return (body if self.persistence >= self.MIN_PERSISTENCE else None), contour, binary
 
 
 class SensorController:
-    """STRUCTURE Sensorの深度背景差分 → 最大連結成分 → 入力段。"""
+    """STRUCTURE Sensorの深度背景差分 → 人物候補ゲート → 入力段。"""
 
     def __init__(
         self,
@@ -167,8 +432,20 @@ class SensorController:
         jump_rise_y_min: float,
         jump_rise_bottom_min: float,
         depth_min_change_mm: float,
+        capture: StructureSensorSource | None = None,
+        start_mode: str = "passby",
+        passby_confirm_frames: int = 4,
+        passby_rearm_frames: int = 15,
+        start_center_tolerance: float = 0.18,
+        start_width_gain: float = 0.06,
+        start_upper_width_gain: float = 0.04,
+        start_upper_width_min: float = 0.30,
+        start_area_gain: float = 0.05,
     ) -> None:
-        self.capture = StructureSensorSource(width, height, 60.0)
+        if start_mode not in ("passby", "arm-circle"):
+            raise ValueError("開始モードはpassbyまたはarm-circle")
+        self.capture = capture if capture is not None else StructureSensorSource(width, height, 60.0)
+        self.start_mode = start_mode
         self.background_seconds = max(.2, background_seconds)
         self.min_area = max(1, min_area)
         self.roi = roi
@@ -177,17 +454,29 @@ class SensorController:
         self.depth_frames: list[np.ndarray] = []
         self.depth_background: np.ndarray | None = None
         self.depth_noise_p95 = 0.0
+        self.foreground_gate = ForegroundGate(self.min_area)
         self.classifier = InputClassifier(
             jump_rise_y_min=jump_rise_y_min,
             jump_rise_bottom_min=jump_rise_bottom_min,
+            start_center_tolerance=start_center_tolerance,
+            start_width_gain=start_width_gain,
+            start_upper_width_gain=start_upper_width_gain,
+            start_upper_width_min=start_upper_width_min,
+            start_area_gain=start_area_gain,
         )
+        self.passby_detector = PassbyStartDetector(passby_confirm_frames, passby_rearm_frames)
         self.debug: np.ndarray | None = None
         self.mask: np.ndarray | None = None
+        # ForegroundGateで形状・継続判定まで通った、ゲーム入力と同一の確定領域。
+        self.accepted_mask: np.ndarray | None = None
+        self.depth_image: np.ndarray | None = None
 
     @property
     def stage(self) -> str:
         if self.started is None or time.monotonic() - self.started < self.background_seconds:
             return "BACKGROUND"
+        if self.start_mode == "passby":
+            return "READY"
         return "READY" if self.classifier.calibrated else "STANCE"
 
     def close(self) -> None:
@@ -209,6 +498,7 @@ class SensorController:
         height = max(1, round(source.shape[0] * width / source.shape[1]))
         background_phase = now - self.started < self.background_seconds
         image = cv2.resize(source, (width, height), interpolation=cv2.INTER_NEAREST)
+        self.depth_image = np.asarray(image).copy()
         if background_phase:
             self.depth_frames.append(np.asarray(image).copy())
         elif self.depth_background is None:
@@ -216,44 +506,54 @@ class SensorController:
                 raise RuntimeError("STRUCTURE Sensorの背景フレームがない")
             stack = np.asarray(self.depth_frames, dtype=np.float32)
             self.depth_background = np.median(stack, axis=0).astype(np.float32)
-            self.depth_noise_p95 = float(np.percentile(
-                np.abs(stack - self.depth_background[None, :, :]), 95.0
-            ))
+            valid_background = (stack > 0) & (self.depth_background[None, :, :] > 0)
+            noise_values = np.abs(stack - self.depth_background[None, :, :])[valid_background]
+            self.depth_noise_p95 = float(np.percentile(noise_values, 95.0)) if noise_values.size else 0.0
             self.depth_frames.clear()
+            self.foreground_gate.reset()
         if background_phase or self.depth_background is None:
             mask = np.zeros(image.shape, dtype=np.uint8)
+            body = None
+            contour = None
         else:
             depth = np.asarray(image, dtype=np.float32)
             background = self.depth_background
             valid = (depth > 0) & (background > 0)
             # 人物は背景より手前に現れるため、遠くなる変化は入力候補にしない。
             nearer = background - depth
-            threshold = max(1.0, self.depth_noise_p95 * 3.0, self.depth_min_change_mm)
+            threshold = max(60.0, self.depth_noise_p95 * 3.0, self.depth_min_change_mm)
             mask = ((valid & (nearer >= threshold)).astype(np.uint8) * 255)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+            body, contour, mask = self.foreground_gate.detect(mask, nearer, threshold)
+        accepted_mask = np.zeros_like(mask)
+        if body is not None and contour is not None:
+            cv2.drawContours(accepted_mask, [contour], -1, 255, -1)
         debug = depth_preview(image)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
-        body: BodyMeasurement | None = None
-        contour = None
-        if not background_phase:
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if contours:
-                contour = max(contours, key=cv2.contourArea)
-                area = float(cv2.contourArea(contour))
-                moments = cv2.moments(contour)
-                if area >= self.min_area and moments["m00"]:
-                    _, y, _, h = cv2.boundingRect(contour)
-                    body = BodyMeasurement(
-                        float(moments["m10"] / moments["m00"] / width),
-                        float(moments["m01"] / moments["m00"] / height),
-                        float((y + h) / height),
-                        area / float(width * height),
-                    )
-        if contour is not None:
+        if body is not None and contour is not None:
             cv2.drawContours(debug, [contour], -1, (0, 255, 0), 1)
         cv2.putText(debug, self.stage, (6, 18), cv2.FONT_HERSHEY_SIMPLEX, .55, (0, 230, 230), 1, cv2.LINE_AA)
-        self.debug, self.mask = debug, mask
-        return InputState() if background_phase else self.classifier.update(body, now)
+        self.debug, self.mask, self.accepted_mask = debug, mask, accepted_mask
+        if background_phase:
+            self.passby_detector.reset()
+            return InputState()
+        state = self.classifier.update(body, now)
+        if self.start_mode == "passby":
+            start_trigger = self.passby_detector.update(body is not None)
+        else:
+            self.passby_detector.reset()
+            start_trigger = state.launch
+        if not start_trigger:
+            return state
+        return InputState(
+            lateral=state.lateral,
+            jump=state.jump,
+            body_present=state.body_present,
+            calibrated=state.calibrated,
+            launch=state.launch,
+            start_trigger=True,
+            body_x=state.body_x,
+        )
 
     def show_debug(self) -> None:
         if self.debug is not None:
@@ -274,6 +574,7 @@ class Ball:
 class GameInput:
     lateral: int = 0
     launch: bool = False
+    paddle_center_x: float | None = None
 
 
 def keyboard_action(key: int) -> str | None:
@@ -542,7 +843,16 @@ class BlockBreaker:
             return
         if self.boss_defeated:
             return
-        self.paddle_x = min(max(0.0, self.paddle_x + max(-1, min(1, controls.lateral)) * self.paddle_speed * dt), CANVAS_WIDTH - self.paddle_width)
+        if controls.paddle_center_x is not None and math.isfinite(float(controls.paddle_center_x)):
+            self.paddle_x = min(
+                max(0.0, float(controls.paddle_center_x) - self.paddle_width / 2),
+                CANVAS_WIDTH - self.paddle_width,
+            )
+        else:
+            self.paddle_x = min(
+                max(0.0, self.paddle_x + max(-1, min(1, controls.lateral)) * self.paddle_speed * dt),
+                CANVAS_WIDTH - self.paddle_width,
+            )
         if self.serving:
             self._place_ball_at_mouth()
             if controls.launch:
@@ -576,7 +886,13 @@ class BlockBreaker:
         cv2.putText(mask, text, origin, cv2.FONT_HERSHEY_SIMPLEX, scale, 255, 1, cv2.LINE_AA)
         frame[mask > 96] = color
 
-    def render(self, sensor_stage: str, boundaries: bool = False) -> np.ndarray:
+    def render(
+        self,
+        sensor_stage: str,
+        boundaries: bool = False,
+        countdown: int | None = None,
+        start_mode: str = "arm-circle",
+    ) -> np.ndarray:
         frame = np.full((CANVAS_HEIGHT, CANVAS_WIDTH), SKY, np.uint8)
         for index in range(30):
             frame[30 + (index * 71 + 13) % 300, (index * 47 + 19) % CANVAS_WIDTH] = SKY_DOT
@@ -622,7 +938,11 @@ class BlockBreaker:
         elif self.game_over_until:
             self._text(frame, "GAME OVER", (43, 228), 0x06, .72)
         elif self.serving:
-            self._text(frame, "JUMP TO LAUNCH" if sensor_stage == "READY" else "SENSOR CAL", (25, 232), 0x0E, .48)
+            if countdown is not None and countdown > 0:
+                self._text(frame, f"START IN {countdown}", (50, 232), 0x0E, .58)
+            else:
+                prompt = "WALK PAST TO START" if start_mode == "passby" else "ARMS CIRCLE TO LAUNCH"
+                self._text(frame, prompt if sensor_stage == "READY" else "SENSOR CAL", (16, 232), 0x0E, .42)
             if sensor_stage == "BACKGROUND":
                 self._text(frame, "CLEAR SENSOR", (32, 252), TEXT, .40)
             elif sensor_stage == "STANCE":
@@ -652,8 +972,18 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--min-foreground-area", type=int, default=420)
     result.add_argument("--depth-min-change-mm", type=float, default=0.0, help="深度の手前側変化量。0は背景ノイズから自動決定")
     result.add_argument("--roi", type=parse_roi, default=None, help="検出ROI x,y,width,height")
+    result.add_argument("--start-mode", choices=("passby", "arm-circle"), default="passby", help="開始条件（既定: 通過検知）")
+    result.add_argument("--start-countdown-seconds", type=float, default=3.0, help="通過検知から開始までの秒数（既定3）")
+    result.add_argument("--passby-confirm-frames", type=int, default=4, help="通過検知を確定する連続フレーム数")
+    result.add_argument("--passby-rearm-frames", type=int, default=15, help="再通過を受け付けるまでの無検知フレーム数")
     result.add_argument("--jump-rise-y-min", type=float, default=0.05, help="ジャンプ判定の重心上昇量（既定0.05）")
     result.add_argument("--jump-rise-bottom-min", type=float, default=0.04, help="ジャンプ判定の下端上昇量（既定0.04）")
+    result.add_argument("--calibration", type=Path, default=None, help="🙆学習済みcamera_calibration.json（既定: リポジトリ直下/camera_calibration.json）")
+    result.add_argument("--start-center-tolerance", type=float, default=None, help="腕輪スタート時の中央許容幅。未指定時は校正値")
+    result.add_argument("--start-width-gain", type=float, default=None, help="腕輪スタート時の人物幅増加。未指定時は校正値")
+    result.add_argument("--start-upper-width-gain", type=float, default=None, help="腕輪スタート時の上半身幅増加。未指定時は校正値")
+    result.add_argument("--start-upper-width-min", type=float, default=None, help="腕輪スタート時の上半身幅下限。未指定時は校正値")
+    result.add_argument("--start-area-gain", type=float, default=None, help="腕輪スタート時の人物面積増加率。未指定時は校正値")
     result.add_argument("--fps", type=float, default=60.0)
     result.add_argument("--frames", type=int, default=0)
     result.add_argument("--seconds", type=float, default=0.0)
@@ -671,8 +1001,61 @@ def preview(indexed: np.ndarray) -> np.ndarray:
     return np.asarray([item[:3] for item in FC6], np.uint8)[indexed][:, :, ::-1]
 
 
+def load_start_calibration(path: Path | None) -> dict[str, float]:
+    """valid校正JSONから🙆判定の学習値だけを安全に読み込む。"""
+    if path is None or not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or data.get("valid") is not True:
+            return {}
+        thresholds = data.get("thresholds")
+        start = thresholds.get("start") if isinstance(thresholds, dict) else None
+        if not isinstance(start, dict):
+            return {}
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    result: dict[str, float] = {}
+    for key in DEFAULT_START_SETTINGS:
+        value = start.get(key)
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number) and number > 0.0:
+            result[key] = number
+    return result
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    calibration_path = args.calibration or HOST.parent / "camera_calibration.json"
+    learned_start = load_start_calibration(calibration_path)
+    start_center_tolerance = (
+        args.start_center_tolerance
+        if args.start_center_tolerance is not None
+        else learned_start.get("center_tolerance", DEFAULT_START_SETTINGS["center_tolerance"])
+    )
+    start_width_gain = (
+        args.start_width_gain
+        if args.start_width_gain is not None
+        else learned_start.get("width_gain_min", DEFAULT_START_SETTINGS["width_gain_min"])
+    )
+    start_upper_width_gain = (
+        args.start_upper_width_gain
+        if args.start_upper_width_gain is not None
+        else learned_start.get("upper_width_gain_min", DEFAULT_START_SETTINGS["upper_width_gain_min"])
+    )
+    start_upper_width_min = (
+        args.start_upper_width_min
+        if args.start_upper_width_min is not None
+        else learned_start.get("upper_width_min", DEFAULT_START_SETTINGS["upper_width_min"])
+    )
+    start_area_gain = (
+        args.start_area_gain
+        if args.start_area_gain is not None
+        else learned_start.get("area_gain_min", DEFAULT_START_SETTINGS["area_gain_min"])
+    )
     if (
         args.fps <= 0
         or args.sensor_width <= 0
@@ -680,6 +1063,14 @@ def main(argv: Iterable[str] | None = None) -> int:
         or args.preview_scale <= 0
         or args.jump_rise_y_min <= 0
         or args.jump_rise_bottom_min <= 0
+        or start_center_tolerance <= 0
+        or start_width_gain <= 0
+        or start_upper_width_gain <= 0
+        or start_upper_width_min <= 0
+        or start_area_gain <= 0
+        or args.start_countdown_seconds <= 0
+        or args.passby_confirm_frames < 2
+        or args.passby_rearm_frames < 2
         or args.depth_min_change_mm < 0
         or (args.send and len(args.pi) != PI_COUNT)
     ):
@@ -698,6 +1089,14 @@ def main(argv: Iterable[str] | None = None) -> int:
                 args.jump_rise_y_min,
                 args.jump_rise_bottom_min,
                 args.depth_min_change_mm,
+                start_mode=args.start_mode,
+                passby_confirm_frames=args.passby_confirm_frames,
+                passby_rearm_frames=args.passby_rearm_frames,
+                start_center_tolerance=start_center_tolerance,
+                start_width_gain=start_width_gain,
+                start_upper_width_gain=start_upper_width_gain,
+                start_upper_width_min=start_upper_width_min,
+                start_area_gain=start_area_gain,
             )
         sender = UdpFrameSender([parse_pi(value) for value in args.pi], args.chunk_size) if args.send else None
     except (RuntimeError, ValueError) as exc:
@@ -705,7 +1104,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         return 2
     keyboard_state = X11KeyboardState() if not args.no_preview else None
     game, running, frame_id = BlockBreaker(), True, 0
-    manual_lateral, manual_until, manual_jump = 0, 0.0, False
+    manual_lateral, manual_until, manual_launch = 0, 0.0, False
+    countdown_remaining = 0.0
     def stop(_signum: int, _frame: object) -> None:
         nonlocal running
         running = False
@@ -714,22 +1114,74 @@ def main(argv: Iterable[str] | None = None) -> int:
     started = last = deadline = time.monotonic()
     period = 1 / args.fps
     input_label = "keyboard" if keyboard_mode else "structure-depth"
-    print(f"block breaker: canvas={CANVAS_WIDTH}x{CANVAS_HEIGHT} palette=FC6 input={input_label} send={'yes' if sender else 'no'}")
+    print(
+        f"block breaker: canvas={CANVAS_WIDTH}x{CANVAS_HEIGHT} palette=FC6 "
+        f"input={input_label} send={'yes' if sender else 'no'} "
+        f"start_mode={args.start_mode} countdown={args.start_countdown_seconds:.1f}s",
+        flush=True,
+    )
+    if args.start_mode == "arm-circle" and learned_start:
+        print(f"start calibration=learned path={calibration_path}", flush=True)
+    elif args.start_mode == "arm-circle":
+        print("start calibration=defaults", flush=True)
+    else:
+        print("start calibration=not-used mode=passby", flush=True)
     if not args.no_preview:
-        print("keys: A/D or LEFT/RIGHT = paddle, SPACE/W/UP = launch, R = reset, Q/ESC = quit")
+        print("keys: A/D or LEFT/RIGHT = paddle, SPACE/W/UP = launch, R = reset, Q/ESC = quit", flush=True)
+    last_sensor_stage: str | None = None
+    last_lateral: int | None = None
     try:
         while running and (args.frames <= 0 or frame_id < args.frames):
             now = time.monotonic()
             if args.seconds and now - started >= args.seconds:
                 break
             body = sensor.read(now) if sensor else InputState(calibrated=True)
+            sensor_stage = sensor.stage if sensor else "READY"
+            if sensor_stage != last_sensor_stage:
+                print(f"sensor_stage={sensor_stage}", flush=True)
+                last_sensor_stage = sensor_stage
+            if body.launch and args.start_mode == "arm-circle":
+                print("event=arm-circle-launch", flush=True)
+            if body.start_trigger and game.serving and not game.game_started and countdown_remaining <= 0.0:
+                countdown_remaining = args.start_countdown_seconds
+                print(
+                    f"event={args.start_mode}-start-detected countdown={args.start_countdown_seconds:.1f}s",
+                    flush=True,
+                )
+            if body.lateral != last_lateral:
+                print(f"input=lateral:{body.lateral}", flush=True)
+                last_lateral = body.lateral
             x11_lateral = keyboard_state.lateral() if keyboard_state is not None else 0
             if manual_lateral and now >= manual_until:
                 manual_lateral = 0
             lateral = x11_lateral or manual_lateral or (body.lateral if body.calibrated else 0)
-            game.step(min(.05, now - last), GameInput(lateral, body.jump or manual_jump), now)
-            manual_jump, last = False, now
-            indexed = game.render(sensor.stage if sensor else "READY", args.boundaries)
+            paddle_center_x = (
+                body.body_x * CANVAS_WIDTH
+                if not keyboard_mode and body.body_present and body.body_x is not None
+                else None
+            )
+            dt = min(.05, max(0.0, now - last))
+            countdown_launch = False
+            if countdown_remaining > 0.0:
+                countdown_remaining = max(0.0, countdown_remaining - dt)
+                if countdown_remaining == 0.0:
+                    countdown_launch = True
+                    print("event=game-launch-countdown", flush=True)
+            was_serving = game.serving
+            game.step(
+                dt,
+                GameInput(
+                    lateral=lateral,
+                    launch=countdown_launch or manual_launch,
+                    paddle_center_x=paddle_center_x,
+                ),
+                now,
+            )
+            if was_serving and not game.serving:
+                print("event=game-launch", flush=True)
+            manual_launch, last = False, now
+            countdown_display = int(math.ceil(countdown_remaining)) if countdown_remaining > 0.0 else None
+            indexed = game.render(sensor_stage, args.boundaries, countdown_display, args.start_mode)
             if indexed.shape != (CANVAS_HEIGHT, CANVAS_WIDTH) or int(indexed.max()) >= FC6_LIMIT:
                 raise RuntimeError("送出フレームがFC6の192x384条件を満たさない")
             if sender:
@@ -751,7 +1203,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                     if keyboard_state is None or not keyboard_state.available:
                         manual_lateral, manual_until = 1, now + KEYBOARD_EVENT_HOLD_SECONDS
                 elif action == "launch":
-                    manual_jump = True
+                    manual_launch = True
                 elif action == "reset":
                     game.reset(full=True)
             frame_id += 1

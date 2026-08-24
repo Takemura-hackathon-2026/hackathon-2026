@@ -33,6 +33,7 @@ for import_path in (HOST_ROOT, TEST_MODE_ROOT):
         sys.path.insert(0, str(import_path))
 
 from frame_source import StructureSensorSource, depth_preview  # noqa: E402
+from block_breaker import ForegroundGate  # noqa: E402
 from palettes import FC6, FC6_BLACK, FC6_LIMIT, FC6_WHITE, PaletteMode  # noqa: E402
 from test_mode import PI_COUNT, UdpFrameSender, parse_pi  # noqa: E402
 
@@ -42,11 +43,12 @@ CANVAS_HEIGHT = 384
 CANVAS_WIDTH = 192
 PROCESS_HEIGHT = 320
 PROCESS_WIDTH = 240
-VERSION = "1.2"
+VERSION = "1.4"
 
 MAIN_STAGES = (
     "BACKGROUND",
     "CENTER/STANCE",
+    "START/CIRCLE",
     "LEFT",
     "RIGHT",
     "JUMP",
@@ -57,6 +59,7 @@ MEASUREMENT_STAGES = MAIN_STAGES[1:]
 DEFAULT_DURATIONS = {
     "BACKGROUND": 12.0,
     "CENTER/STANCE": 12.0,
+    "START/CIRCLE": 8.0,
     "LEFT": 10.0,
     "RIGHT": 10.0,
     "JUMP": 10.0,
@@ -203,7 +206,10 @@ def render_led_frame(
     candidate_label = "CANDIDATE VALID" if candidate_valid else "CANDIDATE INVALID"
     _font_text(frame, candidate_label, 8, 94, LED_GREEN if candidate_valid else LED_RED, 2)
     if remaining is not None:
-        _font_text(frame, f"TIME {max(0.0, remaining):04.1f}S", 8, 126, FC6_WHITE, 2)
+        if stage == "JUMP":
+            _font_text(frame, f"JUMPS LEFT {max(0, int(math.ceil(remaining))):02d}", 8, 126, FC6_WHITE, 2)
+        else:
+            _font_text(frame, f"TIME {max(0.0, remaining):04.1f}S", 8, 126, FC6_WHITE, 2)
     if result:
         _font_text(frame, f"RESULT {result}", 8, 154, stage_color, 2)
     _font_text(frame, f"ID {int(frame_id) & 0xFFFFFFFF:08X}", 262, 178, LED_GRAY, 1)
@@ -270,6 +276,9 @@ class Measurement:
     bbox: tuple[int, int, int, int] = (0, 0, 0, 0)
     persistence: int = 1
     background_score: float = 0.0
+    width: float = 0.0
+    height: float = 0.0
+    upper_width: float = 0.0
 
 
 @dataclass
@@ -294,6 +303,19 @@ class BackgroundModel:
     @property
     def fixed_light_fraction(self) -> float:
         return float(np.mean(self.fixed_light_mask))
+
+
+def _upper_width(binary: np.ndarray, bbox: tuple[int, int, int, int], frame_width: int) -> float:
+    """候補領域の上側72%で観測した最大横幅を0〜1へ正規化する。"""
+    x, y, width, height = bbox
+    component = np.asarray(binary[y:y + height, x:x + width]) > 0
+    upper_height = max(1, int(round(height * 0.72)))
+    row_spans: list[int] = []
+    for row in component[:upper_height]:
+        columns = np.flatnonzero(row)
+        if columns.size:
+            row_spans.append(int(columns[-1] - columns[0] + 1))
+    return max(row_spans, default=0) / max(1, frame_width)
 
 
 def build_background_model(
@@ -334,7 +356,12 @@ def build_background_model(
         if x + width > PROCESS_WIDTH or y + height > PROCESS_HEIGHT:
             raise ValueError(f"固定領域 {x},{y},{width},{height} が240x320を超える")
         fixed[y:y + height, x:x + width] = True
-    noise_p95 = float(np.percentile(np.abs(stack - median[None, :, :]), 95.0))
+    if signal_type == "depth":
+        valid_noise = (stack > 0) & (median[None, :, :] > 0)
+        noise_values = np.abs(stack - median[None, :, :])[valid_noise]
+        noise_p95 = float(np.percentile(noise_values, 95.0)) if noise_values.size else 0.0
+    else:
+        noise_p95 = float(np.percentile(np.abs(stack - median[None, :, :]), 95.0))
     return BackgroundModel(
         median=median.astype(np.float32),
         std=std.astype(np.float32),
@@ -355,7 +382,11 @@ class Detection:
 
 
 class CandidateDetector:
-    """背景統計と形状・持続性を併用して人物候補をゲートする。"""
+    """背景統計と形状・持続性を併用して人物候補をゲートする。
+
+    深度入力ではゲーム側のForegroundGateをそのまま使い、キャリブレーションと
+    ゲームで床・左右端・ドア状変化の扱いがずれないようにする。
+    """
 
     def __init__(
         self,
@@ -374,27 +405,58 @@ class CandidateDetector:
         self.min_persistence = max(1, min_persistence)
         self.last_center: tuple[float, float] | None = None
         self.persistence = 0
+        self.foreground_gate = ForegroundGate(min_area=420) if model.signal_type == "depth" else None
 
     def reset(self) -> None:
         self.last_center = None
         self.persistence = 0
+        if self.foreground_gate is not None:
+            self.foreground_gate.reset()
+
+    def _detect_depth(self, raw: np.ndarray) -> Detection:
+        image = raw.astype(np.float32, copy=False)
+        valid = (image > 0) & (self.model.median > 0)
+        depth_gain = self.model.median - image
+        threshold = max(60.0, self.model.noise_p95 * 3.0, self.model.min_change)
+        mask = ((valid & (depth_gain >= threshold)).astype(np.uint8) * 255)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+        if self.foreground_gate is None:
+            raise RuntimeError("深度用ForegroundGateが初期化されていない")
+        body, contour, filtered_mask = self.foreground_gate.detect(mask, depth_gain, threshold)
+        if body is None or contour is None:
+            return Detection(None, False, filtered_mask)
+
+        x, y, width, height = cv2.boundingRect(contour)
+        values = depth_gain[y:y + height, x:x + width][
+            filtered_mask[y:y + height, x:x + width] > 0
+        ]
+        background_score = float(np.median(values)) / max(threshold, 1.0) if values.size else 0.0
+        measurement = Measurement(
+            x=body.x,
+            y=body.y,
+            bottom=body.bottom,
+            area=body.area,
+            bbox=(x, y, width, height),
+            persistence=self.foreground_gate.persistence,
+            background_score=background_score,
+            width=body.width,
+            height=body.height,
+            upper_width=body.upper_width,
+        )
+        return Detection(measurement, True, filtered_mask)
 
     def detect(self, gray: np.ndarray) -> Detection:
         raw = np.asarray(gray)
-        image = raw.astype(np.float32, copy=False)
-        if image.shape != (PROCESS_HEIGHT, PROCESS_WIDTH):
+        if raw.shape != (PROCESS_HEIGHT, PROCESS_WIDTH):
             raise ValueError("検出画像は240x320")
         if self.model.signal_type == "depth":
-            # STRUCTURE Sensorでは、人物が背景より手前に来る変化だけを採用する。
-            valid = (image > 0) & (self.model.median > 0)
-            diff = np.maximum(self.model.median - image, 0.0)
-            threshold = max(1.0, self.model.noise_p95 * 3.0, self.model.min_change)
-            binary = (diff >= threshold) & valid & ~self.model.ignore_mask
-        else:
-            image = raw.astype(np.uint8, copy=False).astype(np.float32)
-            diff = np.abs(image - self.model.median)
-            threshold = max(10.0, self.model.noise_p95 * 3.0)
-            binary = (diff >= threshold) & ~self.model.ignore_mask
+            return self._detect_depth(raw)
+
+        image = raw.astype(np.uint8, copy=False).astype(np.float32)
+        diff = np.abs(image - self.model.median)
+        threshold = max(10.0, self.model.noise_p95 * 3.0)
+        binary = (diff >= threshold) & ~self.model.ignore_mask
         mask = (binary.astype(np.uint8) * 255)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
@@ -455,6 +517,9 @@ class CandidateDetector:
             bbox=bbox,
             persistence=self.persistence,
             background_score=background_score,
+            width=width / PROCESS_WIDTH,
+            height=height / PROCESS_HEIGHT,
+            upper_width=_upper_width(mask, bbox, PROCESS_WIDTH),
         )
         return Detection(measurement if self.persistence >= self.min_persistence else None, self.persistence >= self.min_persistence, mask)
 
@@ -494,14 +559,24 @@ def analyze_calibration(
     samples: dict[str, Sequence[Measurement]],
     background_frames: int,
     min_samples: int = 8,
+    jump_min_samples: int | None = None,
+    center_x: float | None = None,
+    center_y: float | None = None,
+    center_tolerance_x: float | None = None,
+    center_tolerance_y: float | None = None,
+    center_tolerance_bottom: float | None = None,
+    jump_rise_y_min: float | None = None,
+    jump_rise_bottom_min: float | None = None,
 ) -> dict[str, object]:
     """実測分布から校正結果・閾値・品質ゲートを算出する。"""
     reasons: list[str] = []
     if background_frames < 2:
         reasons.append("background_samples_insufficient")
     counts = {stage: len(samples.get(stage, ())) for stage in MEASUREMENT_STAGES}
+    required_jump_samples = min_samples if jump_min_samples is None else max(1, int(jump_min_samples))
     for stage, count in counts.items():
-        if count < min_samples:
+        required = required_jump_samples if stage == "JUMP" else min_samples
+        if count < required:
             reasons.append(f"{stage.lower().replace('/', '_')}_samples_insufficient")
 
     stats: dict[str, dict[str, object]] = {}
@@ -509,49 +584,75 @@ def analyze_calibration(
         stage_samples = samples.get(stage, ())
         stats[stage] = {
             field: robust_stats(_series(stage_samples, field))
-            for field in ("x", "y", "bottom", "area", "persistence", "background_score")
+            for field in (
+                "x",
+                "y",
+                "bottom",
+                "area",
+                "width",
+                "height",
+                "upper_width",
+                "persistence",
+                "background_score",
+            )
         }
 
     center = list(samples.get("CENTER/STANCE", ()))
-    baseline_values = {field: robust_stats(_series(center, field)) for field in ("x", "y", "bottom", "area")}
+    baseline_fields = ("x", "y", "bottom", "area", "width", "height", "upper_width")
+    baseline_values = {field: robust_stats(_series(center, field)) for field in baseline_fields}
     if center:
-        baseline = {field: float(baseline_values[field]["median"]) for field in ("x", "y", "bottom", "area")}
-        baseline["mad"] = {field: float(baseline_values[field]["mad"]) for field in ("x", "y", "bottom", "area")}
+        baseline = {field: float(baseline_values[field]["median"]) for field in baseline_fields}
+        baseline["mad"] = {field: float(baseline_values[field]["mad"]) for field in baseline_fields}
     else:
-        baseline = {field: None for field in ("x", "y", "bottom", "area")}
-        baseline["mad"] = {field: None for field in ("x", "y", "bottom", "area")}
+        baseline = {field: None for field in baseline_fields}
+        baseline["mad"] = {field: None for field in baseline_fields}
 
     thresholds: dict[str, object] = {
-        "center_tolerance": {"x": None, "y": None, "bottom": None},
+        "center_anchor": {"x": center_x, "y": center_y},
+        "center_tolerance": {
+            "x": center_tolerance_x,
+            "y": center_tolerance_y,
+            "bottom": center_tolerance_bottom,
+        },
         "left": {"x_max": None, "delta_min": None, "source": "LEFT measured p25 offset"},
         "right": {"x_min": None, "delta_min": None, "source": "RIGHT measured p25 offset"},
         "jump": {"rise_y_min": None, "rise_bottom_min": None, "source": "JUMP measured p25 rise"},
+        "start": {
+            "center_tolerance": None,
+            "width_gain_min": None,
+            "upper_width_gain_min": None,
+            "upper_width_min": None,
+            "area_gain_min": None,
+            "source": "START/CIRCLE measured p25 gain",
+        },
     }
     if center:
-        center_x, center_y, center_bottom = baseline["x"], baseline["y"], baseline["bottom"]
+        baseline_x, baseline_y, center_bottom = baseline["x"], baseline["y"], baseline["bottom"]
         center_mad_x = float(baseline["mad"]["x"])
         center_mad_y = float(baseline["mad"]["y"])
         center_mad_bottom = float(baseline["mad"]["bottom"])
-        # 画素量子化由来の最小幅だけを解像度から算出し、InputClassifierの固定値は使わない。
-        x_tolerance = max(3.0 * center_mad_x, 2.0 / PROCESS_WIDTH)
-        y_tolerance = max(3.0 * center_mad_y, 2.0 / PROCESS_HEIGHT)
-        bottom_tolerance = max(3.0 * center_mad_bottom, 2.0 / PROCESS_HEIGHT)
+        # 指定ゾーンを下限にし、実測揺れが大きい場合だけ自動で広げる。
+        x_tolerance = max(3.0 * center_mad_x, 2.0 / PROCESS_WIDTH, center_tolerance_x or 0.0)
+        y_tolerance = max(3.0 * center_mad_y, 2.0 / PROCESS_HEIGHT, center_tolerance_y or 0.0)
+        bottom_tolerance = max(3.0 * center_mad_bottom, 2.0 / PROCESS_HEIGHT, center_tolerance_bottom or 0.0)
         thresholds["center_tolerance"] = {"x": x_tolerance, "y": y_tolerance, "bottom": bottom_tolerance}
 
-        left_offsets = [center_x - sample.x for sample in samples.get("LEFT", ())]
-        right_offsets = [sample.x - center_x for sample in samples.get("RIGHT", ())]
-        jump_rise_y = [center_y - sample.y for sample in samples.get("JUMP", ())]
+        anchor_x = float(center_x) if center_x is not None else float(baseline_x)
+        anchor_y = float(center_y) if center_y is not None else float(baseline_y)
+        left_offsets = [anchor_x - sample.x for sample in samples.get("LEFT", ())]
+        right_offsets = [sample.x - anchor_x for sample in samples.get("RIGHT", ())]
+        jump_rise_y = [anchor_y - sample.y for sample in samples.get("JUMP", ())]
         jump_rise_bottom = [center_bottom - sample.bottom for sample in samples.get("JUMP", ())]
         left_stats, right_stats = robust_stats(left_offsets), robust_stats(right_offsets)
         jump_y_stats, jump_bottom_stats = robust_stats(jump_rise_y), robust_stats(jump_rise_bottom)
         if left_offsets:
             left_delta = float(left_stats["p25"])
-            thresholds["left"] = {"x_max": center_x - left_delta, "delta_min": left_delta, "source": "LEFT measured p25 offset"}
+            thresholds["left"] = {"x_max": anchor_x - left_delta, "delta_min": left_delta, "source": "LEFT measured p25 offset"}
             if left_stats["median"] <= x_tolerance:
                 reasons.append("left_motion_not_separated_from_center")
         if right_offsets:
             right_delta = float(right_stats["p25"])
-            thresholds["right"] = {"x_min": center_x + right_delta, "delta_min": right_delta, "source": "RIGHT measured p25 offset"}
+            thresholds["right"] = {"x_min": anchor_x + right_delta, "delta_min": right_delta, "source": "RIGHT measured p25 offset"}
             if right_stats["median"] <= x_tolerance:
                 reasons.append("right_motion_not_separated_from_center")
         if jump_rise_y and jump_rise_bottom:
@@ -562,8 +663,40 @@ def analyze_calibration(
                 "rise_bottom_min": jump_bottom_delta,
                 "source": "JUMP measured p25 rise",
             }
-            if jump_y_stats["median"] <= y_tolerance or jump_bottom_stats["median"] <= bottom_tolerance:
+            jump_y_separation = jump_rise_y_min if jump_rise_y_min is not None else y_tolerance
+            jump_bottom_separation = jump_rise_bottom_min if jump_rise_bottom_min is not None else bottom_tolerance
+            if jump_y_stats["median"] <= jump_y_separation or jump_bottom_stats["median"] <= jump_bottom_separation:
                 reasons.append("jump_motion_not_separated_from_center")
+        start_samples = samples.get("START/CIRCLE", ())
+        if start_samples and baseline["width"] and baseline["upper_width"] and baseline["area"]:
+            start_center_offsets = [abs(sample.x - anchor_x) for sample in start_samples]
+            start_width_gains = [sample.width - baseline["width"] for sample in start_samples]
+            start_upper_width_gains = [sample.upper_width - baseline["upper_width"] for sample in start_samples]
+            start_area_gains = [sample.area / baseline["area"] - 1.0 for sample in start_samples]
+            start_center_stats = robust_stats(start_center_offsets)
+            start_width_stats = robust_stats(start_width_gains)
+            start_upper_width_stats = robust_stats(start_upper_width_gains)
+            start_area_stats = robust_stats(start_area_gains)
+            thresholds["start"] = {
+                "center_tolerance": max(0.08, float(start_center_stats["p90"]) + 0.03),
+                "width_gain_min": float(start_width_stats["p25"]),
+                "upper_width_gain_min": float(start_upper_width_stats["p25"]),
+                "upper_width_min": float(np.percentile([sample.upper_width for sample in start_samples], 25.0)),
+                "area_gain_min": float(start_area_stats["p25"]),
+                "source": "START/CIRCLE measured p25 gain",
+            }
+            stats["START/CIRCLE"]["center_offset_x"] = start_center_stats
+            stats["START/CIRCLE"]["width_gain"] = start_width_stats
+            stats["START/CIRCLE"]["upper_width_gain"] = start_upper_width_stats
+            stats["START/CIRCLE"]["area_gain"] = start_area_stats
+            if (
+                start_width_stats["median"] <= 0.0
+                or start_upper_width_stats["median"] <= 0.0
+                or start_area_stats["median"] <= 0.0
+            ):
+                reasons.append("start_motion_not_separated_from_center")
+        elif start_samples:
+            reasons.append("start_geometry_unavailable")
         stats["LEFT"]["offset_x"] = left_stats
         stats["RIGHT"]["offset_x"] = right_stats
         stats["JUMP"]["rise_y"] = jump_y_stats
@@ -573,6 +706,10 @@ def analyze_calibration(
         stats["RIGHT"]["offset_x"] = {"count": 0}
         stats["JUMP"]["rise_y"] = {"count": 0}
         stats["JUMP"]["rise_bottom"] = {"count": 0}
+        stats["START/CIRCLE"]["center_offset_x"] = {"count": 0}
+        stats["START/CIRCLE"]["width_gain"] = {"count": 0}
+        stats["START/CIRCLE"]["upper_width_gain"] = {"count": 0}
+        stats["START/CIRCLE"]["area_gain"] = {"count": 0}
 
     valid = not reasons
     return {
@@ -583,6 +720,7 @@ def analyze_calibration(
             "valid": valid,
             "reasons": reasons,
             "minimum_samples_per_stage": min_samples,
+            "minimum_jump_samples": required_jump_samples,
             "background_frames": background_frames,
         },
         "sample_counts": counts,
@@ -591,13 +729,62 @@ def analyze_calibration(
 
 
 class CalibrationSession:
-    """候補が有効な時間だけ各ステージを進める状態機械。"""
+    """指定した中央ゾーンとジャンプ回数で進む状態機械。"""
 
-    def __init__(self, durations: dict[str, float] | None = None, min_samples: int = 8) -> None:
+    def __init__(
+        self,
+        durations: dict[str, float] | None = None,
+        min_samples: int = 8,
+        *,
+        center_x: float = 0.50,
+        center_y: float = 0.50,
+        center_tolerance_x: float = 0.20,
+        center_tolerance_y: float = 0.25,
+        center_tolerance_bottom: float = 0.25,
+        lateral_deadband: float = 0.08,
+        jump_rise_y_min: float = 0.03,
+        jump_rise_bottom_min: float = 0.025,
+        jump_count: int = 3,
+        start_width_gain: float = 0.03,
+        start_upper_width_gain: float = 0.03,
+        start_upper_width_min: float = 0.25,
+        start_area_gain: float = 0.03,
+    ) -> None:
         self.durations = {stage: float((durations or DEFAULT_DURATIONS)[stage]) for stage in MAIN_STAGES}
         if any(value <= 0 for value in self.durations.values()):
             raise ValueError("各ステージ時間は正")
         self.min_samples = max(1, int(min_samples))
+        self.center_x = float(center_x)
+        self.center_y = float(center_y)
+        self.center_tolerance_x = float(center_tolerance_x)
+        self.center_tolerance_y = float(center_tolerance_y)
+        self.center_tolerance_bottom = float(center_tolerance_bottom)
+        self.lateral_deadband = float(lateral_deadband)
+        self.jump_rise_y_min = float(jump_rise_y_min)
+        self.jump_rise_bottom_min = float(jump_rise_bottom_min)
+        self.jump_count = max(1, int(jump_count))
+        self.start_width_gain = float(start_width_gain)
+        self.start_upper_width_gain = float(start_upper_width_gain)
+        self.start_upper_width_min = float(start_upper_width_min)
+        self.start_area_gain = float(start_area_gain)
+        if not (0.0 <= self.center_x <= 1.0 and 0.0 <= self.center_y <= 1.0):
+            raise ValueError("中央座標は0〜1")
+        if any(
+            value <= 0.0
+            for value in (
+                self.center_tolerance_x,
+                self.center_tolerance_y,
+                self.center_tolerance_bottom,
+                self.lateral_deadband,
+                self.jump_rise_y_min,
+                self.jump_rise_bottom_min,
+                self.start_width_gain,
+                self.start_upper_width_gain,
+                self.start_upper_width_min,
+                self.start_area_gain,
+            )
+        ):
+            raise ValueError("中央許容幅・左右幅・ジャンプ閾値は正")
         self.stage_index = 0
         self.active_elapsed = 0.0
         self.status = "RUNNING"
@@ -605,6 +792,7 @@ class CalibrationSession:
         self.background_frames = 0
         self.samples: dict[str, list[Measurement]] = {stage: [] for stage in MEASUREMENT_STAGES}
         self.last_candidate_valid = False
+        self.jump_latched = False
 
     @property
     def stage(self) -> str:
@@ -620,31 +808,74 @@ class CalibrationSession:
     def progress(self) -> float:
         if self.status != "RUNNING":
             return 1.0
+        if self.stage == "JUMP":
+            return min(1.0, len(self.samples["JUMP"]) / self.jump_count)
         return min(1.0, self.active_elapsed / self.durations[self.stage])
 
     @property
     def remaining(self) -> float:
         if self.status != "RUNNING":
             return 0.0
+        if self.stage == "JUMP":
+            return float(max(0, self.jump_count - len(self.samples["JUMP"])))
         return max(0.0, self.durations[self.stage] - self.active_elapsed)
 
     def _baseline(self) -> dict[str, float] | None:
         center = self.samples["CENTER/STANCE"]
         if not center:
             return None
-        return {field: float(np.median(_series(center, field))) for field in ("x", "y", "bottom", "area")}
+        return {
+            field: float(np.median(_series(center, field)))
+            for field in ("x", "y", "bottom", "area", "width", "height", "upper_width")
+        }
 
     def _center_gates(self) -> tuple[float, float, float]:
-        center = self.samples["CENTER/STANCE"]
-        if not center:
-            return 2.0 / PROCESS_WIDTH, 2.0 / PROCESS_HEIGHT, 2.0 / PROCESS_HEIGHT
-        values = {field: np.asarray(_series(center, field), dtype=np.float64) for field in ("x", "y", "bottom")}
-        gates = []
-        for field, pixels in (("x", PROCESS_WIDTH), ("y", PROCESS_HEIGHT), ("bottom", PROCESS_HEIGHT)):
-            median = float(np.median(values[field]))
-            mad = float(np.median(np.abs(values[field] - median)))
-            gates.append(max(3.0 * mad, 2.0 / pixels))
-        return tuple(gates)  # type: ignore[return-value]
+        return self.center_tolerance_x, self.center_tolerance_y, self.center_tolerance_bottom
+
+    def _in_center_zone(self, measurement: Measurement) -> bool:
+        return (
+            abs(measurement.x - self.center_x) <= self.center_tolerance_x
+            and abs(measurement.y - self.center_y) <= self.center_tolerance_y
+        )
+
+    def _start_pose(self, measurement: Measurement) -> bool:
+        """学習ステージで収集する、中央の🙆姿勢候補。"""
+        baseline = self._baseline()
+        if baseline is None or baseline["width"] <= 0.0 or baseline["upper_width"] <= 0.0 or baseline["area"] <= 0.0:
+            return False
+        if (
+            abs(measurement.x - self.center_x) > self.center_tolerance_x
+            or abs(measurement.y - self.center_y) > self.center_tolerance_y
+        ):
+            return False
+        return (
+            measurement.width - baseline["width"] >= self.start_width_gain
+            and measurement.upper_width - baseline["upper_width"] >= self.start_upper_width_gain
+            and measurement.upper_width >= self.start_upper_width_min
+            and measurement.area >= baseline["area"] * (1.0 + self.start_area_gain)
+        )
+
+    def _jump_pose(self, measurement: Measurement | None, candidate_valid: bool) -> bool:
+        if measurement is None or not candidate_valid:
+            return False
+        baseline = self._baseline()
+        if baseline is None or abs(measurement.x - self.center_x) > self.center_tolerance_x:
+            return False
+        return (
+            baseline["y"] - measurement.y >= self.jump_rise_y_min
+            and baseline["bottom"] - measurement.bottom >= self.jump_rise_bottom_min
+        )
+
+    def _jump_rearmed(self, measurement: Measurement | None) -> bool:
+        if measurement is None:
+            return True
+        baseline = self._baseline()
+        if baseline is None:
+            return False
+        return (
+            baseline["y"] - measurement.y < self.jump_rise_y_min * 0.5
+            and baseline["bottom"] - measurement.bottom < self.jump_rise_bottom_min * 0.5
+        )
 
     def eligible(self, measurement: Measurement | None, candidate_valid: bool, background_ready: bool) -> bool:
         stage = self.stage
@@ -654,23 +885,22 @@ class CalibrationSession:
             return False
         baseline = self._baseline()
         if stage == "CENTER/STANCE":
-            return True
+            return self._in_center_zone(measurement)
         if baseline is None:
             return False
+        if stage == "START/CIRCLE":
+            return self._start_pose(measurement)
         gate_x, gate_y, gate_bottom = self._center_gates()
         if stage == "LEFT":
-            return measurement.x < baseline["x"] - gate_x
+            return measurement.x < self.center_x - self.lateral_deadband
         if stage == "RIGHT":
-            return measurement.x > baseline["x"] + gate_x
+            return measurement.x > self.center_x + self.lateral_deadband
         if stage == "JUMP":
-            return (
-                baseline["y"] - measurement.y > gate_y
-                and baseline["bottom"] - measurement.bottom > gate_bottom
-            )
+            return self._jump_pose(measurement, candidate_valid)
         if stage == "VALIDATE":
             return (
-                abs(measurement.x - baseline["x"]) <= gate_x
-                and abs(measurement.y - baseline["y"]) <= gate_y
+                abs(measurement.x - self.center_x) <= gate_x
+                and abs(measurement.y - self.center_y) <= gate_y
                 and abs(measurement.bottom - baseline["bottom"]) <= gate_bottom
             )
         return False
@@ -688,6 +918,18 @@ class CalibrationSession:
         dt = max(0.0, min(float(dt), 1.0))
         self.last_candidate_valid = bool(candidate_valid)
         self.background_frames = max(self.background_frames, int(background_frames))
+        if self.stage == "JUMP":
+            if self._jump_pose(measurement, candidate_valid):
+                if not self.jump_latched:
+                    self.samples["JUMP"].append(measurement)  # type: ignore[arg-type]
+                    self.jump_latched = True
+            elif self._jump_rearmed(measurement):
+                self.jump_latched = False
+            if len(self.samples["JUMP"]) >= self.jump_count:
+                self.stage_index += 1
+                self.active_elapsed = 0.0
+                self.jump_latched = False
+            return
         if self.eligible(measurement, candidate_valid, background_ready):
             self.active_elapsed += dt
             if measurement is not None and self.stage in MEASUREMENT_STAGES:
@@ -703,11 +945,12 @@ class CalibrationSession:
             self.active_elapsed = 0.0
             return
         if self.stage == "VALIDATE":
-            analysis = analyze_calibration(self.samples, self.background_frames, self.min_samples)
+            analysis = self.analysis()
             self.status = "PASS" if bool(analysis["valid"]) else "RETRY"
             return
         self.stage_index += 1
         self.active_elapsed = 0.0
+        self.jump_latched = False
 
     def reset_current_stage(self) -> None:
         """現在ステージの進捗と実測を破棄する。背景モデルは呼び出し側が再取得する。"""
@@ -715,6 +958,7 @@ class CalibrationSession:
             return
         self.active_elapsed = 0.0
         self.last_candidate_valid = False
+        self.jump_latched = False
         if self.stage == "BACKGROUND":
             self.background_frames = 0
         elif self.stage in MEASUREMENT_STAGES:
@@ -726,7 +970,19 @@ class CalibrationSession:
             self.abort_reason = reason
 
     def analysis(self) -> dict[str, object]:
-        analysis = analyze_calibration(self.samples, self.background_frames, self.min_samples)
+        analysis = analyze_calibration(
+            self.samples,
+            self.background_frames,
+            self.min_samples,
+            jump_min_samples=self.jump_count,
+            center_x=self.center_x,
+            center_y=self.center_y,
+            center_tolerance_x=self.center_tolerance_x,
+            center_tolerance_y=self.center_tolerance_y,
+            center_tolerance_bottom=self.center_tolerance_bottom,
+            jump_rise_y_min=self.jump_rise_y_min,
+            jump_rise_bottom_min=self.jump_rise_bottom_min,
+        )
         if self.abort_reason:
             quality = dict(analysis["quality"])
             quality["valid"] = False
@@ -836,6 +1092,7 @@ def run_demo(output_dir: Path) -> int:
         instruction = {
             "BACKGROUND": "NO PERSON",
             "CENTER/STANCE": "STAND STILL",
+            "START/CIRCLE": "HOLD ARM CIRCLE",
             "LEFT": "MOVE LEFT",
             "RIGHT": "MOVE RIGHT",
             "JUMP": "JUMP NOW",
@@ -848,7 +1105,7 @@ def run_demo(output_dir: Path) -> int:
             stage,
             instruction,
             0.65 if stage in MAIN_STAGES else 1.0,
-            stage in ("CENTER/STANCE", "LEFT", "RIGHT", "JUMP", "VALIDATE", "PASS"),
+            stage in ("CENTER/STANCE", "START/CIRCLE", "LEFT", "RIGHT", "JUMP", "VALIDATE", "PASS"),
             stage if stage in ("PASS", "RETRY", "FAIL") else None,
             frame_id=index,
             remaining=3.2 if stage in MAIN_STAGES else 0.0,
@@ -923,10 +1180,13 @@ def _stdin_key() -> str | None:
     return None
 
 
-def _stage_instruction(stage: str) -> str:
+def _stage_instruction(stage: str, jump_index: int = 0, jump_count: int = 0) -> str:
+    if stage == "JUMP" and jump_count > 0:
+        return f"JUMP {min(jump_index + 1, jump_count)}/{jump_count}"
     return {
         "BACKGROUND": "NO PERSON",
         "CENTER/STANCE": "STAND STILL",
+        "START/CIRCLE": "HOLD ARM CIRCLE",
         "LEFT": "MOVE LEFT",
         "RIGHT": "MOVE RIGHT",
         "JUMP": "JUMP NOW",
@@ -947,9 +1207,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--depth-min-change-mm", type=float, default=0.0, help="深度の手前側変化量。0は背景ノイズから自動決定")
     parser.add_argument("--background-seconds", type=float, default=12.0)
     parser.add_argument("--stance-seconds", type=float, default=12.0)
+    parser.add_argument("--start-seconds", type=float, default=8.0, help="🙆姿勢を学習する時間（既定8秒）")
     parser.add_argument("--left-seconds", type=float, default=10.0)
     parser.add_argument("--right-seconds", type=float, default=10.0)
-    parser.add_argument("--jump-seconds", type=float, default=10.0)
+    parser.add_argument("--jump-seconds", type=float, default=10.0, help=argparse.SUPPRESS)
+    parser.add_argument("--jump-count", type=int, default=3, help="JUMPステージで記録するジャンプ回数（既定3）")
+    parser.add_argument("--center-x", type=float, default=0.50, help="中央ゾーンの基準X（0〜1、既定0.50）")
+    parser.add_argument("--center-y", type=float, default=0.50, help="中央ゾーンの基準Y（0〜1、既定0.50）")
+    parser.add_argument("--center-tolerance-x", type=float, default=0.20, help="中央ゾーンのX許容幅（既定0.20）")
+    parser.add_argument("--center-tolerance-y", type=float, default=0.25, help="中央ゾーンのY許容幅（既定0.25）")
+    parser.add_argument("--center-tolerance-bottom", type=float, default=0.25, help="中央ゾーンの下端許容幅（既定0.25）")
+    parser.add_argument("--lateral-deadband", type=float, default=0.08, help="左右判定で中央から無視する幅（既定0.08）")
+    parser.add_argument("--jump-rise-y-min", type=float, default=0.03, help="ジャンプ1回とみなす重心上昇量（既定0.03）")
+    parser.add_argument("--jump-rise-bottom-min", type=float, default=0.025, help="ジャンプ1回とみなす下端上昇量（既定0.025）")
+    parser.add_argument("--start-width-gain", type=float, default=0.03, help="🙆学習時に必要な人物幅の増加（既定0.03）")
+    parser.add_argument("--start-upper-width-gain", type=float, default=0.03, help="🙆学習時に必要な上半身幅の増加（既定0.03）")
+    parser.add_argument("--start-upper-width-min", type=float, default=0.25, help="🙆学習時の上半身幅下限（既定0.25）")
+    parser.add_argument("--start-area-gain", type=float, default=0.03, help="🙆学習時に必要な人物面積の増加率（既定0.03）")
     parser.add_argument("--validate-seconds", type=float, default=8.0)
     parser.add_argument("--background-frames", type=int, default=15)
     parser.add_argument("--min-samples", type=int, default=8)
@@ -967,12 +1241,29 @@ def run_sensor(args: argparse.Namespace) -> int:
     durations = {
         "BACKGROUND": args.background_seconds,
         "CENTER/STANCE": args.stance_seconds,
+        "START/CIRCLE": args.start_seconds,
         "LEFT": args.left_seconds,
         "RIGHT": args.right_seconds,
         "JUMP": args.jump_seconds,
         "VALIDATE": args.validate_seconds,
     }
-    session = CalibrationSession(durations, args.min_samples)
+    session = CalibrationSession(
+        durations,
+        args.min_samples,
+        center_x=args.center_x,
+        center_y=args.center_y,
+        center_tolerance_x=args.center_tolerance_x,
+        center_tolerance_y=args.center_tolerance_y,
+        center_tolerance_bottom=args.center_tolerance_bottom,
+        lateral_deadband=args.lateral_deadband,
+        jump_rise_y_min=args.jump_rise_y_min,
+        jump_rise_bottom_min=args.jump_rise_bottom_min,
+        jump_count=args.jump_count,
+        start_width_gain=args.start_width_gain,
+        start_upper_width_gain=args.start_upper_width_gain,
+        start_upper_width_min=args.start_upper_width_min,
+        start_area_gain=args.start_area_gain,
+    )
     source: SensorSource | None = None
     sender: UdpFrameSender | None = None
     builder = BackgroundBuilder(
@@ -1008,8 +1299,14 @@ def run_sensor(args: argparse.Namespace) -> int:
         deadline = last
         period = 1.0 / max(1.0, args.sensor_fps)
         processed_preview: np.ndarray | None = None
-        print(f"sensor calibration: source=structure rotation={args.rotation} duration={sum(durations.values()):.1f}s send={'yes' if sender else 'no'}")
-        print("keys: q/ESC 中止, r 現在ステージをリセット（--preview時はOpenCV、headless時はTTY）")
+        last_stage = session.stage
+        print(
+            f"sensor calibration: source=structure rotation={args.rotation} "
+            f"jump_count={args.jump_count} center=({args.center_x:.2f},{args.center_y:.2f}) "
+            f"duration={sum(durations.values()) - args.jump_seconds:.1f}s+jump-count send={'yes' if sender else 'no'}",
+            flush=True,
+        )
+        print("keys: q/ESC 中止, r 現在ステージをリセット（--preview時はOpenCV、headless時はTTY）", flush=True)
         while running and session.status == "RUNNING":
             now = time.monotonic()
             dt = min(0.5, max(0.0, now - last))
@@ -1029,10 +1326,21 @@ def run_sensor(args: argparse.Namespace) -> int:
                 builder.model is not None,
                 builder.frame_count,
             )
+            if session.stage != last_stage:
+                print(
+                    f"stage={session.stage} samples="
+                    f"{len(session.samples.get(session.stage, ())) if session.stage in session.samples else 0}",
+                    flush=True,
+                )
+                last_stage = session.stage
+            if session.stage == "JUMP":
+                instruction = _stage_instruction(session.stage, len(session.samples["JUMP"]), session.jump_count)
+            else:
+                instruction = _stage_instruction(session.stage)
             frame_id = frame_ids.next()
             indexed = render_led_frame(
                 session.stage,
-                _stage_instruction(session.stage),
+                instruction,
                 session.progress,
                 detection.candidate_valid,
                 session.stage if session.stage in ("PASS", "RETRY", "FAIL") else None,
@@ -1080,7 +1388,7 @@ def run_sensor(args: argparse.Namespace) -> int:
         sensor_meta = source.metadata(args.rotation)
         payload = make_calibration_payload(session, sensor_meta, args.roi, (), builder.model)
         target = write_calibration_result(args.output, payload)
-        print(f"result: {session.status} valid={payload['valid']} output={target}")
+        print(f"result: {session.status} valid={payload['valid']} output={target}", flush=True)
         return 0 if bool(payload["valid"]) else 1
     except (RuntimeError, ValueError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -1147,13 +1455,26 @@ def main(argv: Iterable[str] | None = None) -> int:
     if (
         args.sensor_width <= 0 or args.sensor_height <= 0 or args.sensor_fps <= 0
         or args.background_frames < 2 or args.min_samples < 1 or args.depth_min_change_mm < 0
+        or args.jump_count < 1
+        or not (0.0 <= args.center_x <= 1.0 and 0.0 <= args.center_y <= 1.0)
+        or args.center_tolerance_x <= 0
+        or args.center_tolerance_y <= 0
+        or args.center_tolerance_bottom <= 0
+        or args.lateral_deadband <= 0
+        or args.jump_rise_y_min <= 0
+        or args.jump_rise_bottom_min <= 0
+        or args.start_width_gain <= 0
+        or args.start_upper_width_gain <= 0
+        or args.start_upper_width_min <= 0
+        or args.start_area_gain <= 0
     ):
-        print("error: sensor/background-frames/min-samples/depth-min-change-mmが不正", file=sys.stderr)
+        print("error: sensor/background-frames/min-samples/center/jump設定が不正", file=sys.stderr)
         return 2
     for name in MAIN_STAGES:
         duration = {
             "BACKGROUND": args.background_seconds,
             "CENTER/STANCE": args.stance_seconds,
+            "START/CIRCLE": args.start_seconds,
             "LEFT": args.left_seconds,
             "RIGHT": args.right_seconds,
             "JUMP": args.jump_seconds,

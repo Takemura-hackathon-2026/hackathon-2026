@@ -152,14 +152,14 @@ ssh oyaki "for i in 1 2 3 4; do ping -c1 -W1 192.168.10.10\$i >/dev/null && echo
 実ユーザー名に置き換える。Pi側でパスワードなしsudoと、`$HOME/rpi-rgb-led-matrix`の配置が必要。
 
 ```bash
-PI_SSH_USER=pi host/oyaki_camera_calibrate.sh pi-deploy
-PI_SSH_USER=pi host/oyaki_camera_calibrate.sh pi-status
+PI_SSH_USER=takemuralab host/oyaki_camera_calibrate.sh pi-deploy
+PI_SSH_USER=takemuralab host/oyaki_camera_calibrate.sh pi-status
 ```
 
 個別に再起動する場合:
 
 ```bash
-PI_SSH_USER=pi host/oyaki_camera_calibrate.sh pi-start
+PI_SSH_USER=takemuralab host/oyaki_camera_calibrate.sh pi-start
 ```
 
 4台へ実際にフレームを送る:

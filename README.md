@@ -9,15 +9,15 @@ Raspberry Pi 4 台の外部同期で駆動する縦型ディスプレー・ゲ�
 （受信 → CRC 確認 → LUT 変換 → HUB75 出力）までを実装済み。
 
 `host/block_breaker.py` は、既定でSTRUCTURE Sensorの深度背景差分による
-`LEFT` / `RIGHT` / `JUMP` 判定、192×384の
-FC6描画、既存UDP経路への4分割送信を主機だけで行う。ゲームは画像キャラクターを倒すボス戦で、
-左右移動でパドルを動かし、ジャンプでボスの口元からボールを発射する。人物映像・人物マスクは
-LEDへ送らない。
+`LEFT` / `RIGHT` / `JUMP` 判定、人物通過後のカウントダウン開始、192×384のFC6描画、既存UDP経路への
+4分割送信を主機だけで行う。ゲームは画像キャラクターを倒すボス戦で、左右移動でパドルを動かし、
+センサー前を通過した人物を安定検知すると3秒カウントダウン後にボスの口元からボールを発射する。人物映像・人物マスクはLEDへ送らない。
+従来の🙆開始は`--start-mode arm-circle`で選択できる。
 
 ジャンプ判定は重心上昇0.05、下端上昇0.04（0〜1正規化）を既定値とする。センサー設置や
 身体の映り方に合わせて、`--jump-rise-y-min` と `--jump-rise-bottom-min` で個別調整できる。
 
-ジャンプだけを確認する場合は、ゲーム更新・左右移動・LED送信を行わない専用CLIを使う。
+ジャンプだけを確認する場合は、ゲーム開始とは分離された、ゲーム更新・左右移動・LED送信を行わない専用CLIを使う。
 背景学習後にジャンプイベントを標準出力へ記録し、`--preview`指定時は深度プレビューとマスクを表示する。
 
 ```bash
@@ -82,7 +82,8 @@ host/oyaki_camera_calibrate.sh standby-stop
 │   ├── block_breaker_selftest.py # センサー不要のゲーム・入力分類器検証
 │   ├── frame_source.py          # C++取得ヘルパーから深度フレームを受信
 │   ├── structure_depth_capture.cpp # OpenNI2深度取得ヘルパー
-│   ├── structure_depth_view.cpp # 深度ビューのFC6/UDP表示
+│   ├── structure_depth_view.cpp # 生深度のFC6/UDP表示（低レベル確認用）
+│   ├── sensor_detection_view.py # ゲームと同じ検知結果のFC6/UDP表示
 │   ├── jump_detector.py         # ジャンプ判定専用CLI
 │   ├── standby.py                # 時刻・主機/Pi温度を表示する192x384縦画面のホスト常時起動
 │   └── test_mode/
@@ -209,14 +210,14 @@ cd host/test_mode && python3 test_mode.py --no-preview --send \
 - HPが0になると`BOSS DOWN`を約1.8秒表示し、その後自動的に初期画面へ戻る
 - ボールを3回落とすと`GAME OVER`になり、約1.8秒後に最初からやり直す
 
-起動時は、まず誰もいない状態で深度背景を約2秒学習する。次に参加者がセンサー正面で静止すると、
-立ち位置を校正する。校正後の操作は次の通り。
+起動時は、まず誰もいない状態で深度背景を約2秒学習する。人物がセンサー前を通過すると、LEDに
+3秒のカウントダウンを表示してゲームを開始する。開始後の操作は次の通り。
 
 | 身体操作 | ゲーム操作 |
 |---|---|
-| 左へ移動 | パドルを左へ移動 |
-| 右へ移動 | パドルを右へ移動 |
-| ジャンプ | サーブ中のボールを発射 |
+| 身体を左へ移動 | パドル中心を左へ同期 |
+| 身体を右へ移動 | パドル中心を右へ同期 |
+| センサー前を通過 | 3秒カウントダウン後にサーブ開始 |
 
 キーボードだけで遊ぶ場合は`--keyboard`で起動する。ゲームのプレビュー画面を選択して、
 `A`/`D`・`H`/`L`・左右矢印でパドルを動かす。`Space`・`W`・`K`・上矢印でボールを発射し、
@@ -245,7 +246,7 @@ python3 host/block_breaker_selftest.py
 
 ## STRUCTURE Sensorキャリブレーション
 
-`host/camera_calibrate.py` はSTRUCTURE Sensorの深度背景を学習し、CENTER/STANCE、LEFT、RIGHT、JUMP、VALIDATEの順に姿勢・移動・ジャンプを約60〜90秒で計測する。回転、ROI、深度変化量、各ステージ時間はCLIで指定できる。回転はROI・背景差分・計測より先に適用され、oyaki標準例は`ccw`とする。LEDへ送るのは既存FC6の192×384インデックス画像だけで、センサー映像やマスクは送らない。
+`host/camera_calibrate.py` はSTRUCTURE Sensorの深度背景を学習し、CENTER/STANCE、START/CIRCLE、LEFT、RIGHT、JUMP、VALIDATEの順に姿勢・移動・ジャンプを計測する。START/CIRCLEでは中央で🙆を保持し、人物幅・上半身幅・面積の増加を学習する。中央の基準は`--center-x/--center-y`、中央ゾーンは`--center-tolerance-*`、左右の境界は`--lateral-deadband`で指定できる。JUMPは秒数ではなく、`--jump-count`（既定3回）の立ち上がりイベントを一度ずつ数える。回転はROI・背景差分・計測より先に適用され、oyakiラッパーの標準は`none`とする。LEDへ送るのは既存FC6の192×384インデックス画像だけで、センサー映像やマスクは送らない。
 
 ローカルでセンサー・ネットワークなしの表示デモを実行する。各ステージ画面と背景/候補の代表PNGを指定先へ保存する。
 
@@ -264,7 +265,7 @@ python3 host/camera_calibrate.py --rotation ccw --send \
   --output camera_calibration.json
 ```
 
-oyakiではOpenNI2対応C++ OpenCVの`CAP_OPENNI2_ASUS`と`CAP_OPENNI_DEPTH_MAP`で`CV_16UC1`のmm値を取得し、`structure_depth_capture`がPythonへ渡す。成功時は`camera_calibration.json`へatomic writeし、品質ゲートに失敗した結果は`camera_calibration.invalid.json`へatomic writeするため、既存のvalid JSONを上書きしない。JSONには`version`、`date`、`valid`、`sensor`、`ROI`、`fixed_light`、`background`、`baseline`、`motion_stats`、`thresholds`、`quality`、`sample_counts`を含み、NaN/Infinityは許可しない。
+oyakiではOpenNI2対応C++ OpenCVの`CAP_OPENNI2_ASUS`と`CAP_OPENNI_DEPTH_MAP`で`CV_16UC1`のmm値を取得し、`structure_depth_capture`がPythonへ渡す。成功時は`camera_calibration.json`へatomic writeし、品質ゲートに失敗した結果は`camera_calibration.invalid.json`へatomic writeするため、既存のvalid JSONを上書きしない。JSONには`version`、`date`、`valid`、`sensor`、`ROI`、`fixed_light`、`background`、`baseline`、`motion_stats`、`thresholds`、`quality`、`sample_counts`を含み、NaN/Infinityは許可しない。🙆開始を使う場合は`thresholds.start`をゲームが読み込む。既定の通過検知開始では🙆の学習は不要。
 
 終了コードは、`0`=valid校正成功、`1`=RETRY/FAILまたは中止、`2`=引数・センサー等の実行エラー。`/tmp`のデモ出力は揮発性なので、必要な診断PNGは別の保存先へコピーする。自己テストは`python3 host/camera_calibrate_selftest.py`でセンサー・ネットワークなしに実行できる。
 
@@ -286,7 +287,9 @@ host/oyaki_camera_calibrate.sh fetch /tmp/camera-calibration-result
 
 ## STRUCTURE Sensor深度ビュー
 
-`host/structure_depth_view.cpp` は、STRUCTURE Sensorの深度マップをFC6の色相ランプへ変換し、既存のUDP送信形式で4台のPiへ送る実機確認用プログラムである。近い部分ほど明るい色、無効深度は黒になる。既定の深度表示範囲は各フレームの2〜98パーセンタイルで、必要なら`--near-mm`／`--far-mm`で固定できる。
+`depth-view-start` が起動するのは`host/sensor_detection_view.py`であり、ブロック崩しと同じ`SensorController`をそのまま通す。背景学習、手前側の深度差分、モルフォロジー、床・左右端の除外、人物形状、深度ゲイン、3フレーム継続判定が共通になる。LEDでは床・左右端を除いた深度を暗く表示し、明灰色がゲーム候補、白がゲーム入力として確定した人物領域を表す。検知候補がない場合も深度コンテキストは表示されるため、全黒にはならない。
+
+低レベル確認用の`host/structure_depth_view.cpp`は残してあり、STRUCTURE Sensorの深度マップをFC6の色相ランプへ変換する。`depth-view-build`はPython検知ビューとこのC++取得・生深度ビューの両方を再ビルドするが、通常の`depth-view-start`ではゲームと判定がずれないようPython検知ビューを起動する。
 
 oyakiへ配備・コンパイルする:
 
@@ -297,7 +300,7 @@ host/oyaki_camera_calibrate.sh depth-view-status
 host/oyaki_camera_calibrate.sh depth-view-stop
 ```
 
-前景で実行する場合は`depth-view-foreground`、再コンパイルだけ行う場合は`depth-view-build`を使う。ビューと取得ヘルパーはOpenCV C++のOpenNI2バックエンド（`CAP_OPENNI2_ASUS`）を使用するため、oyaki側のOpenCVが`WITH_OPENNI2=ON`でビルドされている必要がある。Python venvのOpenCVとは別に、`pkg-config opencv4`で参照されるC++ OpenCVを使う。
+前景で実行する場合は`depth-view-foreground`、再コンパイルだけ行う場合は`depth-view-build`を使う。深度取得ヘルパーはOpenCV C++のOpenNI2バックエンド（`CAP_OPENNI2_ASUS`）を使用するため、oyaki側のOpenCVが`WITH_OPENNI2=ON`でビルドされている必要がある。Python venvのOpenCVとは別に、`pkg-config opencv4`で参照されるC++ OpenCVを使う。
 
 ## Pi 常駐表示クライアント
 

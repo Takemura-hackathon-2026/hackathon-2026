@@ -56,7 +56,7 @@ struct Options {
   double fps = 30.0;
   double seconds = 0.0;
   int chunk_size = 1200;
-  std::string rotation = "ccw";
+  std::string rotation = "none";
   double near_mm = 0.0;
   double far_mm = 0.0;
 };
@@ -69,7 +69,7 @@ void stop_handler(int) { g_running = 0; }
                                "  --fps N              送信FPS（既定30）\n"
                                "  --seconds N          終了までの秒数（既定0=無期限）\n"
                                "  --chunk-size N       UDPチャンクサイズ（256〜1400、既定1200）\n"
-                               "  --rotation MODE      none/cw/ccw/180（既定ccw）\n"
+                               "  --rotation MODE      none/cw/ccw/180（既定none）\n"
                                "  --near-mm N          表示範囲の近端。0=フレームから自動\n"
                                "  --far-mm N           表示範囲の遠端。0=フレームから自動\n"
                                "  --no-send            LEDへ送らずセンサー取得だけ行う\n"
@@ -109,7 +109,7 @@ Options parse_options(int argc, char** argv) {
                 << "  --fps N              送信FPS（既定30）\n"
                 << "  --seconds N          終了までの秒数（既定0=無期限）\n"
                 << "  --chunk-size N       UDPチャンクサイズ（256〜1400、既定1200）\n"
-                << "  --rotation MODE      none/cw/ccw/180（既定ccw）\n"
+                << "  --rotation MODE      none/cw/ccw/180（既定none）\n"
                 << "  --near-mm N          表示範囲の近端。0=フレームから自動\n"
                 << "  --far-mm N           表示範囲の遠端。0=フレームから自動\n"
                 << "  --no-send            LEDへ送らずセンサー取得だけ行う\n";
