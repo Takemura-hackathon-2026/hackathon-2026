@@ -83,6 +83,11 @@ host/oyaki_camera_calibrate.sh standby-stop
 │   ├── fc6.pal / msx16.pal     # 生 RGB パレット（156 byte / 48 byte）
 │   ├── block_breaker.py         # STRUCTURE Sensor操作ブロック崩し・FC6描画・UDP送信
 │   ├── block_breaker_selftest.py # センサー不要のゲーム・入力分類器検証
+│   ├── sensor_agent.py          # センサーPiで判定し、入力状態だけを制御PiへUDP送信
+│   ├── input_transport.py       # センサーPi→制御Piの入力UDPプロトコル
+│   ├── input_transport_selftest.py # 入力UDPのCRC・順序・タイムアウト検証
+│   ├── pi3-sensor.service      # センサーPi用systemdサービス
+│   ├── pi3-control.service     # 制御Pi用systemdサービス
 │   ├── frame_source.py          # C++取得ヘルパーから深度フレームを受信
 │   ├── structure_depth_capture.cpp # OpenNI2深度取得ヘルパー
 │   ├── structure_depth_view.cpp # 生深度のFC6/UDP表示（低レベル確認用）
@@ -266,6 +271,22 @@ python3 host/block_breaker.py --send \
   --pi 192.168.10.103:5000 --pi 192.168.10.104:5000
 ```
 
+センサー処理とゲーム制御を2台へ分離する場合は、センサー側で判定済み入力だけをUDP 5200へ送り、
+制御側でゲーム描画と4台へのフレーム送信を行う。深度画像そのものはLANへ流さない。
+
+```bash
+# センサーPi（例: 192.168.50.33）
+python3 host/sensor_agent.py --destination 192.168.50.32:5200 --control-bind 0.0.0.0:5201 --start-mode still
+
+# 制御Pi（192.168.50.32、表示LAN側は192.168.10.2）
+python3 host/block_breaker.py --input-bind 0.0.0.0:5200 --sensor-control 192.168.50.33:5201 \
+  --start-mode still --send --no-preview --palette msx16 \
+  --pi 192.168.10.101:5000 --pi 192.168.10.102:5000 \
+  --pi 192.168.10.103:5000 --pi 192.168.10.104:5000
+```
+
+MSX16送出時は表示Piを`--led-pwm-bits 6 --led-limit-refresh 235`で動かし、色深度より走査更新を優先する。
+
 深度プレビューと前景マスクは`--debug-depth`で主機だけに表示する。LEDへの送出内容はゲーム画面だけである。
 背景幕や床以外を検出対象から外すには、`--roi x,y,width,height`で深度画像内のROIを指定できる。
 人物の横位置はパドルへ絶対位置で対応付ける。実機で左右が反転する場合は`--mirror`、
@@ -300,7 +321,7 @@ python3 host/camera_calibrate.py --rotation ccw --send \
   --output camera_calibration.json
 ```
 
-oyakiではOpenNI2対応C++ OpenCVの`CAP_OPENNI2_ASUS`と`CAP_OPENNI_DEPTH_MAP`で`CV_16UC1`のmm値を取得し、`structure_depth_capture`がPythonへ渡す。成功時は`camera_calibration.json`へatomic writeし、品質ゲートに失敗した結果は`camera_calibration.invalid.json`へatomic writeするため、既存のvalid JSONを上書きしない。JSONには`version`、`date`、`valid`、`sensor`、`ROI`、`fixed_light`、`background`、`baseline`、`motion_stats`、`thresholds`、`quality`、`sample_counts`を含み、NaN/Infinityは許可しない。🙆開始を使う場合は`thresholds.start`をゲームが読み込む。既定の通過検知開始では🙆の学習は不要。
+`structure_depth_capture`はOpenNI2 APIから`PIXEL_FORMAT_DEPTH_1_MM`を直接取得してPythonへ渡すため、配布版OpenCVのOpenNI2対応有無には依存しない。成功時は`camera_calibration.json`へatomic writeし、品質ゲートに失敗した結果は`camera_calibration.invalid.json`へatomic writeするため、既存のvalid JSONを上書きしない。JSONには`version`、`date`、`valid`、`sensor`、`ROI`、`fixed_light`、`background`、`baseline`、`motion_stats`、`thresholds`、`quality`、`sample_counts`を含み、NaN/Infinityは許可しない。🙆開始を使う場合は`thresholds.start`をゲームが読み込む。既定の通過検知開始では🙆の学習は不要。
 
 終了コードは、`0`=valid校正成功、`1`=RETRY/FAILまたは中止、`2`=引数・センサー等の実行エラー。`/tmp`のデモ出力は揮発性なので、必要な診断PNGは別の保存先へコピーする。自己テストは`python3 host/camera_calibrate_selftest.py`でセンサー・ネットワークなしに実行できる。
 
@@ -335,7 +356,7 @@ host/oyaki_camera_calibrate.sh depth-view-status
 host/oyaki_camera_calibrate.sh depth-view-stop
 ```
 
-前景で実行する場合は`depth-view-foreground`、再コンパイルだけ行う場合は`depth-view-build`を使う。深度取得ヘルパーはOpenCV C++のOpenNI2バックエンド（`CAP_OPENNI2_ASUS`）を使用するため、oyaki側のOpenCVが`WITH_OPENNI2=ON`でビルドされている必要がある。Python venvのOpenCVとは別に、`pkg-config opencv4`で参照されるC++ OpenCVを使う。
+前景で実行する場合は`depth-view-foreground`、再コンパイルだけ行う場合は`depth-view-build`を使う。深度取得ヘルパーは`libopenni2-dev`と`pkg-config libopenni2`を使ってビルドする。深度表示ヘルパー`structure_depth_view`は引き続き`pkg-config opencv4`を使う。
 
 ## Pi 常駐表示クライアント
 

@@ -1,7 +1,7 @@
-// STRUCTURE Sensorの深度フレームをOpenNI2対応OpenCVから標準出力へ流す。
-// Pythonの配布版cv2にOpenNI2がなくても、oyaki側のC++ OpenCVを利用する。
+// STRUCTURE Sensorの深度フレームをOpenNI2から標準出力へ流す。
+// 配布版OpenCVのOpenNI2対応有無に依存せず、OpenNI2 APIを直接利用する。
 
-#include <opencv2/opencv.hpp>
+#include <OpenNI.h>
 
 #include <chrono>
 #include <cstdio>
@@ -118,13 +118,19 @@ void write_u32(std::uint32_t value) {
   }
 }
 
-void write_frame(std::uint32_t frame_id, const cv::Mat& depth) {
-  if (depth.type() != CV_16UC1 || depth.empty()) {
-    throw std::runtime_error("OpenNI2の深度マップがCV_16UC1ではない");
+void check_openni(openni::Status status, const std::string& operation) {
+  if (status == openni::STATUS_OK) return;
+  throw std::runtime_error(operation + ": " + openni::OpenNI::getExtendedError());
+}
+
+void write_frame(std::uint32_t frame_id, const openni::VideoFrameRef& frame) {
+  if (!frame.isValid() || frame.getData() == nullptr || frame.getWidth() <= 0 ||
+      frame.getHeight() <= 0 || frame.getStrideInBytes() < frame.getWidth() * 2) {
+    throw std::runtime_error("OpenNI2の深度フレームが不正");
   }
-  const std::uint32_t width = static_cast<std::uint32_t>(depth.cols);
-  const std::uint32_t height = static_cast<std::uint32_t>(depth.rows);
-  const std::uint64_t payload_size = static_cast<std::uint64_t>(depth.total()) * sizeof(std::uint16_t);
+  const std::uint32_t width = static_cast<std::uint32_t>(frame.getWidth());
+  const std::uint32_t height = static_cast<std::uint32_t>(frame.getHeight());
+  const std::uint64_t payload_size = static_cast<std::uint64_t>(width) * height * sizeof(std::uint16_t);
   if (payload_size > std::numeric_limits<std::uint32_t>::max()) {
     throw std::runtime_error("深度フレームが大きすぎる");
   }
@@ -136,9 +142,10 @@ void write_frame(std::uint32_t frame_id, const cv::Mat& depth) {
   write_u32(width);
   write_u32(height);
   write_u32(static_cast<std::uint32_t>(payload_size));
-  for (int row = 0; row < depth.rows; ++row) {
-    const auto* data = reinterpret_cast<const std::uint8_t*>(depth.ptr<std::uint16_t>(row));
-    const std::size_t row_size = static_cast<std::size_t>(depth.cols) * sizeof(std::uint16_t);
+  const auto* frame_data = static_cast<const std::uint8_t*>(frame.getData());
+  for (int row = 0; row < frame.getHeight(); ++row) {
+    const auto* data = frame_data + static_cast<std::size_t>(row) * frame.getStrideInBytes();
+    const std::size_t row_size = static_cast<std::size_t>(frame.getWidth()) * sizeof(std::uint16_t);
     if (std::fwrite(data, row_size, 1, stdout) != 1) throw std::runtime_error("深度フレームを書けない");
   }
   if (std::fflush(stdout) != 0) throw std::runtime_error("深度フレームをflushできない");
@@ -162,7 +169,35 @@ int main(int argc, char** argv) {
       ::close(saved_stdout);
       throw std::runtime_error("標準出力を切り替えられない");
     }
-    cv::VideoCapture capture(cv::CAP_OPENNI2_ASUS);
+    check_openni(openni::OpenNI::initialize(), "OpenNI2を初期化できない");
+    openni::Device device;
+    check_openni(device.open(openni::ANY_DEVICE), "STRUCTURE Sensorを開けない");
+    openni::VideoStream stream;
+    check_openni(stream.create(device, openni::SENSOR_DEPTH), "深度ストリームを作成できない");
+
+    const openni::SensorInfo* sensor_info = device.getSensorInfo(openni::SENSOR_DEPTH);
+    if (sensor_info == nullptr) throw std::runtime_error("深度センサー情報を取得できない");
+    const auto& modes = sensor_info->getSupportedVideoModes();
+    const int requested_fps = static_cast<int>(options.fps + 0.5);
+    int selected_index = -1;
+    int best_fps_difference = std::numeric_limits<int>::max();
+    for (int index = 0; index < modes.getSize(); ++index) {
+      const openni::VideoMode& mode = modes[index];
+      if (mode.getResolutionX() != options.width || mode.getResolutionY() != options.height ||
+          mode.getPixelFormat() != openni::PIXEL_FORMAT_DEPTH_1_MM) {
+        continue;
+      }
+      const int fps_difference = std::abs(mode.getFps() - requested_fps);
+      if (fps_difference < best_fps_difference) {
+        selected_index = index;
+        best_fps_difference = fps_difference;
+      }
+    }
+    if (selected_index < 0) {
+      throw std::runtime_error("指定解像度でPIXEL_FORMAT_DEPTH_1_MMを利用できない");
+    }
+    check_openni(stream.setVideoMode(modes[selected_index]), "深度ビデオモードを設定できない");
+    check_openni(stream.start(), "深度ストリームを開始できない");
     std::cout.flush();
     std::fflush(stdout);
     if (::dup2(saved_stdout, STDOUT_FILENO) < 0) {
@@ -170,36 +205,27 @@ int main(int argc, char** argv) {
       throw std::runtime_error("標準出力を復元できない");
     }
     ::close(saved_stdout);
-    if (!capture.isOpened()) {
-      throw std::runtime_error("STRUCTURE SensorをOpenNI2で開けない。USB接続とudev権限を確認");
-    }
-    capture.set(cv::CAP_PROP_FRAME_WIDTH, options.width);
-    capture.set(cv::CAP_PROP_FRAME_HEIGHT, options.height);
-
     const auto started = std::chrono::steady_clock::now();
-    const auto period = std::chrono::duration<double>(1.0 / options.fps);
-    auto deadline = started;
     int frame_count = 0;
     while (g_running && (options.frames == 0 || frame_count < options.frames)) {
       if (options.seconds > 0.0 &&
           std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() >= options.seconds) {
         break;
       }
-      if (!capture.grab()) throw std::runtime_error("STRUCTURE Sensorのフレームをgrabできない");
-      cv::Mat depth;
-      if (!capture.retrieve(depth, cv::CAP_OPENNI_DEPTH_MAP)) {
-        throw std::runtime_error("STRUCTURE Sensorの深度マップをretrieveできない");
+      openni::VideoFrameRef frame;
+      check_openni(stream.readFrame(&frame), "STRUCTURE Sensorのフレームを取得できない");
+      if (frame.getVideoMode().getPixelFormat() != openni::PIXEL_FORMAT_DEPTH_1_MM) {
+        throw std::runtime_error("深度フレームの単位がmmではない");
       }
-      write_frame(static_cast<std::uint32_t>(frame_count), depth);
+      write_frame(static_cast<std::uint32_t>(frame_count), frame);
       ++frame_count;
-      deadline += std::chrono::duration_cast<std::chrono::steady_clock::duration>(period);
-      std::this_thread::sleep_until(deadline);
     }
+    stream.stop();
+    stream.destroy();
+    device.close();
+    openni::OpenNI::shutdown();
     std::cerr << "structure_depth_capture: frames=" << frame_count << "\n";
     return 0;
-  } catch (const cv::Exception& error) {
-    std::cerr << "structure_depth_capture: OpenCV error: " << error.what() << "\n";
-    return 2;
   } catch (const std::exception& error) {
     std::cerr << "structure_depth_capture: " << error.what() << "\n";
     return 2;

@@ -138,7 +138,7 @@ cmd_deploy() {
     "$OYAKI_TARGET:$OYAKI_REPO/host/test_mode/"
   ssh_remote "'$OYAKI_REPO/.venv/bin/python' -m py_compile '$OYAKI_REPO/host/frame_source.py' '$OYAKI_REPO/host/sensor_detection_view.py' '$OYAKI_REPO/host/camera_calibrate.py' '$OYAKI_REPO/host/camera_calibrate_selftest.py' '$OYAKI_REPO/host/block_breaker.py' '$OYAKI_REPO/host/block_breaker_selftest.py' '$OYAKI_REPO/host/jump_detector.py' '$OYAKI_REPO/host/standby.py' '$OYAKI_REPO/host/test_mode/test_mode.py'
     g++ -std=c++17 -O2 '$OYAKI_REPO/host/structure_depth_view.cpp' -o '$OYAKI_REPO/host/structure_depth_view' \$(pkg-config --cflags --libs opencv4)
-    g++ -std=c++17 -O2 '$OYAKI_REPO/host/structure_depth_capture.cpp' -o '$OYAKI_REPO/host/structure_depth_capture' \$(pkg-config --cflags --libs opencv4)
+    g++ -std=c++17 -O2 '$OYAKI_REPO/host/structure_depth_capture.cpp' -o '$OYAKI_REPO/host/structure_depth_capture' \$(pkg-config --cflags --libs libopenni2)
     test -x '$OYAKI_REPO/host/structure_depth_view'
     test -x '$OYAKI_REPO/host/structure_depth_capture'"
   printf 'deployed: %s\n' "$OYAKI_REPO/host"
@@ -291,7 +291,7 @@ cmd_depth_view_build() {
     test -f '$OYAKI_REPO/host/sensor_detection_view.py'
     '$OYAKI_REPO/.venv/bin/python' -m py_compile '$OYAKI_REPO/host/sensor_detection_view.py' '$OYAKI_REPO/host/block_breaker.py'
     g++ -std=c++17 -O2 '$OYAKI_REPO/host/structure_depth_view.cpp' -o '$OYAKI_REPO/host/structure_depth_view' \$(pkg-config --cflags --libs opencv4)
-    g++ -std=c++17 -O2 '$OYAKI_REPO/host/structure_depth_capture.cpp' -o '$OYAKI_REPO/host/structure_depth_capture' \$(pkg-config --cflags --libs opencv4)
+    g++ -std=c++17 -O2 '$OYAKI_REPO/host/structure_depth_capture.cpp' -o '$OYAKI_REPO/host/structure_depth_capture' \$(pkg-config --cflags --libs libopenni2)
     test -x '$OYAKI_REPO/host/structure_depth_view'
     test -x '$OYAKI_REPO/host/structure_depth_capture'
     echo 'built: sensor_detection_view.py + $OYAKI_REPO/host/structure_depth_view'"

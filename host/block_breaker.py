@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """STRUCTURE Sensorで操作する192x384 RGB LEDブロック崩し。
 
-主機でセンサー判定、ゲーム更新、FC6パレット番号での描画を完結する。完成フレームは
+主機でセンサー判定、ゲーム更新、FC6/MSX16パレット番号での描画を完結する。完成フレームは
 既存の UdpFrameSender が192x96ずつ4台のPiへ送るため、Pi側へ人物映像・人物マスク・
 ゲームロジックを渡さない。
 """
@@ -26,14 +26,49 @@ HOST = Path(__file__).resolve().parent
 if str(HOST) not in sys.path:
     sys.path.insert(0, str(HOST))
 
-from palettes import FC6, FC6_BLACK, FC6_LIMIT, FC6_WHITE, PaletteMode  # noqa: E402
+from palettes import FC6, FC6_BLACK, FC6_LIMIT, FC6_WHITE, MSX16, MSX16_LIMIT, PaletteMode  # noqa: E402
 from frame_source import StructureSensorSource, depth_preview  # noqa: E402
+from input_transport import InputStateReceiver, SensorControlSender, parse_endpoint  # noqa: E402
 from test_mode import CANVAS_HEIGHT, CANVAS_WIDTH, PI_COUNT, UdpFrameSender, parse_pi  # noqa: E402
 
 
 # 正本 host/palettes.py 内のFC6インデックスだけを使う。
 SKY, SKY_DOT, PADDLE, PADDLE_EDGE, BALL = 0x1C, 0x20, 0x1E, 0x22, FC6_WHITE
 TEXT, DIM = FC6_WHITE, 0x31
+
+
+@dataclass(frozen=True)
+class GameColors:
+    """ゲーム部品の意味を保ったパレット別インデックス。"""
+
+    sky: int
+    sky_dot: int
+    paddle: int
+    paddle_edge: int
+    ball: int
+    text: int
+    dim: int
+    black: int
+    hp_high: int
+    hp_mid: int
+    hp_low: int
+    clear: int
+    game_over: int
+    prompt: int
+    flash: int
+
+
+GAME_COLORS = {
+    PaletteMode.FC6: GameColors(
+        SKY, SKY_DOT, PADDLE, PADDLE_EDGE, BALL, TEXT, DIM, FC6_BLACK,
+        0x16, 0x0E, 0x05, 0x12, 0x06, 0x0E, FC6_WHITE,
+    ),
+    # 近い元色を同じ色へ潰さず、MSX16内で隣接する明暗・色相へ分離する。
+    PaletteMode.MSX16: GameColors(
+        0x04, 0x05, 0x07, 0x05, 0x0F, 0x0F, 0x0E, 0x01,
+        0x02, 0x0A, 0x08, 0x03, 0x08, 0x0A, 0x0F,
+    ),
+}
 
 # cv2.waitKeyEx() の値はOS/バックエンドで異なる。ASCIIに加え、Linux/X11・
 # macOS/Cocoa・Windowsで使われる代表値を受け入れる。
@@ -613,6 +648,7 @@ class SensorController:
         jump_rise_bottom_min: float,
         depth_min_change_mm: float,
         capture: StructureSensorSource | None = None,
+        capture_fps: float = 60.0,
         start_mode: str = "still",
         passby_confirm_frames: int = 4,
         passby_rearm_frames: int = 15,
@@ -626,7 +662,7 @@ class SensorController:
     ) -> None:
         if start_mode not in ("still", "passby", "arm-circle"):
             raise ValueError("開始モードはstill、passby、arm-circleのいずれか")
-        self.capture = capture if capture is not None else StructureSensorSource(width, height, 60.0)
+        self.capture = capture if capture is not None else StructureSensorSource(width, height, capture_fps)
         self.start_mode = start_mode
         self.background_seconds = max(.2, background_seconds)
         self.min_area = max(1, min_area)
@@ -938,6 +974,7 @@ class BlockBreaker:
         sprite, mask = load_boss_sprite()
         size = (round(sprite.shape[1] * self.boss_scale), round(sprite.shape[0] * self.boss_scale))
         self.boss_sprite = cv2.resize(sprite, size, interpolation=cv2.INTER_NEAREST)
+        self.boss_sprite_msx16 = BOSS_FC6_TO_MSX16[self.boss_sprite]
         self.boss_mask = cv2.resize(mask.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST) > 0
         self.boss_height, self.boss_width = self.boss_sprite.shape
         self.boss_x = (CANVAS_WIDTH - self.boss_width) / 2
@@ -1175,54 +1212,57 @@ class BlockBreaker:
         countdown: int | None = None,
         start_mode: str = "arm-circle",
         start_hold_remaining: float | None = None,
+        palette_mode: PaletteMode = PaletteMode.FC6,
     ) -> np.ndarray:
-        frame = np.full((CANVAS_HEIGHT, CANVAS_WIDTH), SKY, np.uint8)
+        colors = GAME_COLORS[palette_mode]
+        frame = np.full((CANVAS_HEIGHT, CANVAS_WIDTH), colors.sky, np.uint8)
         for index in range(30):
-            frame[30 + (index * 71 + 13) % 300, (index * 47 + 19) % CANVAS_WIDTH] = SKY_DOT
+            frame[30 + (index * 71 + 13) % 300, (index * 47 + 19) % CANVAS_WIDTH] = colors.sky_dot
         # 左上はボスHP、右上は残機。HPは現在値に応じて動的に縮む。
         hp_x, hp_y, hp_width, hp_height = 7, 7, 143, 10
-        frame[hp_y:hp_y + hp_height, hp_x:hp_x + hp_width] = TEXT
-        frame[hp_y + 2:hp_y + hp_height - 2, hp_x + 2:hp_x + hp_width - 2] = FC6_BLACK
+        frame[hp_y:hp_y + hp_height, hp_x:hp_x + hp_width] = colors.text
+        frame[hp_y + 2:hp_y + hp_height - 2, hp_x + 2:hp_x + hp_width - 2] = colors.black
         fill = round((hp_width - 4) * self.boss_hp / self.boss_max_hp)
         if fill:
-            hp_color = 0x16 if self.boss_hp > 50 else 0x0E if self.boss_hp > 20 else 0x05
+            hp_color = colors.hp_high if self.boss_hp > 50 else colors.hp_mid if self.boss_hp > 20 else colors.hp_low
             frame[hp_y + 2:hp_y + hp_height - 2, hp_x + 2:hp_x + 2 + fill] = hp_color
         active_play = not self.serving and not self.boss_defeated and not self.game_over_until
         show_lives = self.game_started and not self.boss_defeated and not self.game_over_until
         if show_lives:
             for life in range(self.lives):
-                cv2.circle(frame, (164 + life * 11, 12), 3, int(TEXT), -1, lineType=cv2.LINE_8)
+                cv2.circle(frame, (164 + life * 11, 12), 3, colors.text, -1, lineType=cv2.LINE_8)
             if self.life_loss_feedback_active and 0 <= self.life_loss_slot < 3:
                 phase = int(self.life_loss_blink_elapsed / .12)
                 if phase % 2 == 0:
-                    cv2.circle(frame, (164 + self.life_loss_slot * 11, 12), 3, int(TEXT), 1, lineType=cv2.LINE_8)
-        frame[22:24, :] = DIM
+                    cv2.circle(frame, (164 + self.life_loss_slot * 11, 12), 3, colors.text, 1, lineType=cv2.LINE_8)
+        frame[22:24, :] = colors.dim
 
         boss_x, boss_y = int(self.boss_x), int(self.boss_y)
         boss_region = frame[boss_y:boss_y + self.boss_height, boss_x:boss_x + self.boss_width]
-        boss_region[self.boss_mask] = self.boss_sprite[self.boss_mask]
+        boss_sprite = self.boss_sprite if palette_mode == PaletteMode.FC6 else self.boss_sprite_msx16
+        boss_region[self.boss_mask] = boss_sprite[self.boss_mask]
         if self.boss_transition_remaining > 0.0:
             # 点灯→消灯を3周期。点滅中はボスの位置を固定する。
             phase = int((self.boss_transition_duration - self.boss_transition_remaining) / (self.boss_transition_duration / 6))
             if phase in (0, 2, 4):
-                boss_region[self.boss_mask] = FC6_WHITE
+                boss_region[self.boss_mask] = colors.flash
         elif self.damage_effect_remaining > 0.0:
             # 点灯→消灯→点灯→消灯の4区間で、ボスを2回だけ点滅させる。
             phase = int((self.damage_effect_duration - self.damage_effect_remaining) / (self.damage_effect_duration / 4))
             if phase in (0, 2):
-                boss_region[self.boss_mask] = FC6_WHITE
+                boss_region[self.boss_mask] = colors.flash
         x = int(round(self.paddle_x))
-        frame[int(self.paddle_y):int(self.paddle_y + self.paddle_height), x:x + int(self.paddle_width)] = PADDLE
-        frame[int(self.paddle_y):int(self.paddle_y + 2), x:x + int(self.paddle_width)] = PADDLE_EDGE
+        frame[int(self.paddle_y):int(self.paddle_y + self.paddle_height), x:x + int(self.paddle_width)] = colors.paddle
+        frame[int(self.paddle_y):int(self.paddle_y + 2), x:x + int(self.paddle_width)] = colors.paddle_edge
         if active_play:
-            cv2.circle(frame, (int(round(self.ball.x)), int(round(self.ball.y))), int(self.ball_radius), int(BALL), -1, lineType=cv2.LINE_8)
+            cv2.circle(frame, (int(round(self.ball.x)), int(round(self.ball.y))), int(self.ball_radius), colors.ball, -1, lineType=cv2.LINE_8)
         if self.boss_defeated:
-            self._text(frame, "BOSS DOWN", (39, 228), 0x12, .68)
+            self._text(frame, "BOSS DOWN", (39, 228), colors.clear, .68)
         elif self.game_over_until:
-            self._text(frame, "GAME OVER", (43, 228), 0x06, .72)
+            self._text(frame, "GAME OVER", (43, 228), colors.game_over, .72)
         elif self.serving:
             if countdown is not None and countdown > 0:
-                self._text(frame, f"START IN {countdown}", (50, 232), 0x0E, .58)
+                self._text(frame, f"START IN {countdown}", (50, 232), colors.prompt, .58)
             else:
                 if start_mode == "still":
                     prompt = "STAND STILL TO START"
@@ -1230,16 +1270,16 @@ class BlockBreaker:
                     prompt = "WALK PAST TO START"
                 else:
                     prompt = "ARMS CIRCLE TO LAUNCH"
-                self._text(frame, prompt if sensor_stage == "READY" else "SENSOR CAL", (16, 232), 0x0E, .42)
+                self._text(frame, prompt if sensor_stage == "READY" else "SENSOR CAL", (16, 232), colors.prompt, .42)
             if sensor_stage == "BACKGROUND":
-                self._text(frame, "CLEAR SENSOR", (32, 252), TEXT, .40)
+                self._text(frame, "CLEAR SENSOR", (32, 252), colors.text, .40)
             elif sensor_stage == "STANCE":
-                self._text(frame, "STAND STILL", (37, 252), TEXT, .40)
+                self._text(frame, "STAND STILL", (37, 252), colors.text, .40)
             elif start_mode == "still" and start_hold_remaining is not None:
-                self._text(frame, f"HOLD {math.ceil(start_hold_remaining)}", (62, 252), TEXT, .40)
+                self._text(frame, f"HOLD {math.ceil(start_hold_remaining)}", (62, 252), colors.text, .40)
         if boundaries:
             for y in (96, 192, 288):
-                frame[y:y + 1, :] = DIM
+                frame[y:y + 1, :] = colors.dim
         return frame
 
 
@@ -1265,7 +1305,15 @@ def parse_play_range(value: str) -> tuple[float, float]:
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="STRUCTURE Sensorまたはキーボードで操作する192x384 LEDブロック崩し")
-    result.add_argument("--keyboard", action="store_true", help="センサーを使わず、プレビューをキーボードで操作")
+    input_group = result.add_mutually_exclusive_group()
+    input_group.add_argument("--keyboard", action="store_true", help="センサーを使わず、プレビューをキーボードで操作")
+    input_group.add_argument(
+        "--input-bind",
+        metavar="HOST[:PORT]",
+        help="別ノードのsensor_agentから入力を受信（例: 0.0.0.0:5200）",
+    )
+    result.add_argument("--input-timeout", type=float, default=0.20, help="別ノード入力をニュートラルへ戻す無通信秒数")
+    result.add_argument("--sensor-control", metavar="HOST[:PORT]", help="センサーPiの人物再選択通知先（既定ポート5201）")
     result.add_argument("--sensor-width", type=int, default=640)
     result.add_argument("--sensor-height", type=int, default=480)
     result.add_argument("--sensor-background-seconds", type=float, default=2.0)
@@ -1297,6 +1345,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--start-upper-width-min", type=float, default=None, help="腕輪スタート時の上半身幅下限。未指定時は校正値")
     result.add_argument("--start-area-gain", type=float, default=None, help="腕輪スタート時の人物面積増加率。未指定時は校正値")
     result.add_argument("--fps", type=float, default=60.0)
+    result.add_argument("--palette", choices=("fc6", "msx16"), default="fc6", help="送出パレット（既定FC6）")
     result.add_argument("--frames", type=int, default=0)
     result.add_argument("--seconds", type=float, default=0.0)
     result.add_argument("--send", action="store_true")
@@ -1309,8 +1358,49 @@ def parser() -> argparse.ArgumentParser:
     return result
 
 
-def preview(indexed: np.ndarray) -> np.ndarray:
-    return np.asarray([item[:3] for item in FC6], np.uint8)[indexed][:, :, ::-1]
+def _boss_fc6_to_msx16_lut() -> np.ndarray:
+    """ボス画像を色相と階調が潰れないMSX16色へ写像する。"""
+    source = np.asarray([item[:3] for item in FC6], dtype=np.int32)
+    candidates = np.arange(1, MSX16_LIMIT, dtype=np.uint8)
+    destination = np.asarray([MSX16[int(index)][:3] for index in candidates], dtype=np.int32)
+    difference = source[:, np.newaxis, :] - destination[np.newaxis, :, :]
+    distances = np.einsum("snc,snc->sn", difference, difference)
+    result = candidates[np.argmin(distances, axis=1)]
+    # RGB距離だけでは暗青→緑、灰→茶となり、20色が8色へ潰れる。
+    # 顔画像で使う色は色相を優先し、近い階調にも別のMSX色を割り当てる。
+    overrides = {
+        0x03: 0x0D,  # 淡桃→紫桃
+        0x05: 0x06,  # 暗赤→暗赤
+        0x06: 0x09,  # 珊瑚→明珊瑚
+        0x07: 0x0B,  # 淡桃→淡黄
+        0x08: 0x01,  # 最暗赤→黒
+        0x09: 0x08,  # 茶橙→赤橙
+        0x0A: 0x0A,  # 橙→黄橙
+        0x0B: 0x0B,  # 淡橙→淡黄
+        0x0C: 0x01,  # 暗茶→黒
+        0x0D: 0x06,  # 暗黄→暗赤茶
+        0x0E: 0x0A,  # 黄→黄
+        0x0F: 0x0B,  # 淡黄→淡黄
+        0x13: 0x03,  # 淡緑→淡緑
+        0x18: 0x0C,  # 暗緑→緑
+        0x1C: 0x04,  # 暗青→青
+        0x2B: 0x05,  # 淡紫→淡青紫
+        0x30: 0x01,  # 黒→黒
+        0x31: 0x04,  # 暗灰→暗青灰
+        0x32: 0x0E,  # 明灰→灰
+        0x33: 0x0F,  # 白→白
+    }
+    for fc6_index, msx16_index in overrides.items():
+        result[fc6_index] = msx16_index
+    return result
+
+
+BOSS_FC6_TO_MSX16 = _boss_fc6_to_msx16_lut()
+
+
+def preview(indexed: np.ndarray, mode: PaletteMode = PaletteMode.FC6) -> np.ndarray:
+    palette = FC6 if mode is PaletteMode.FC6 else MSX16
+    return np.asarray([item[:3] for item in palette], np.uint8)[indexed][:, :, ::-1]
 
 
 def load_start_calibration(path: Path | None) -> dict[str, float]:
@@ -1388,14 +1478,30 @@ def main(argv: Iterable[str] | None = None) -> int:
         or args.depth_min_change_mm < 0
         or args.position_deadzone < 0
         or not 0.0 < args.position_gain <= 1.0
+        or args.input_timeout <= 0
         or (args.send and len(args.pi) != PI_COUNT)
     ):
         print("error: --fps/--preview-scale/--jump-rise-* または --pi の指定が不正", file=sys.stderr)
         return 2
     sensor: SensorController | None = None
+    input_receiver: InputStateReceiver | None = None
+    sensor_control_sender: SensorControlSender | None = None
+    sender: UdpFrameSender | None = None
     try:
         keyboard_mode = args.keyboard
-        if not keyboard_mode:
+        remote_input_mode = args.input_bind is not None
+        if remote_input_mode:
+            input_receiver = InputStateReceiver(
+                parse_endpoint(args.input_bind, "0.0.0.0"),
+                timeout_seconds=args.input_timeout,
+            )
+            if args.sensor_control:
+                sensor_control_sender = SensorControlSender(
+                    parse_endpoint(args.sensor_control, "127.0.0.1", default_port=5201)
+                )
+        elif args.sensor_control:
+            raise ValueError("--sensor-controlは--input-bindと同時に指定する")
+        elif not keyboard_mode:
             sensor = SensorController(
                 args.sensor_width,
                 args.sensor_height,
@@ -1418,6 +1524,10 @@ def main(argv: Iterable[str] | None = None) -> int:
             )
         sender = UdpFrameSender([parse_pi(value) for value in args.pi], args.chunk_size) if args.send else None
     except (RuntimeError, ValueError) as exc:
+        if input_receiver is not None:
+            input_receiver.close()
+        if sensor_control_sender is not None:
+            sensor_control_sender.close()
         print(f"error: {exc}（開発用には --keyboard）", file=sys.stderr)
         return 2
     keyboard_state = X11KeyboardState() if not args.no_preview else None
@@ -1440,9 +1550,10 @@ def main(argv: Iterable[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, stop)
     started = last = deadline = time.monotonic()
     period = 1 / args.fps
-    input_label = "keyboard" if keyboard_mode else "structure-depth"
+    output_palette = PaletteMode.FC6 if args.palette == "fc6" else PaletteMode.MSX16
+    input_label = "keyboard" if keyboard_mode else "remote-udp" if remote_input_mode else "structure-depth"
     print(
-        f"block breaker: canvas={CANVAS_WIDTH}x{CANVAS_HEIGHT} palette=FC6 "
+        f"block breaker: canvas={CANVAS_WIDTH}x{CANVAS_HEIGHT} palette={args.palette.upper()} "
         f"input={input_label} send={'yes' if sender else 'no'} "
         f"start_mode={args.start_mode} countdown={args.start_countdown_seconds:.1f}s",
         flush=True,
@@ -1469,8 +1580,29 @@ def main(argv: Iterable[str] | None = None) -> int:
             now = time.monotonic()
             if args.seconds and now - started >= args.seconds:
                 break
-            body = sensor.read(now) if sensor else InputState(calibrated=True)
-            sensor_stage = sensor.stage if sensor else "READY"
+            if sensor is not None:
+                body = sensor.read(now)
+                sensor_stage = sensor.stage
+            elif input_receiver is not None:
+                remote_body, remote_connected = input_receiver.read(now)
+                body = InputState(
+                    lateral=remote_body.lateral,
+                    jump=remote_body.jump,
+                    body_present=remote_body.body_present,
+                    calibrated=remote_body.calibrated,
+                    launch=remote_body.launch,
+                    start_trigger=remote_body.start_trigger,
+                    body_x=remote_body.body_x,
+                    start_hold_remaining=remote_body.start_hold_remaining,
+                    player_id=remote_body.player_id,
+                    people_detected=remote_body.people_detected,
+                    player_changed=remote_body.player_changed,
+                )
+                remote_ready = remote_connected and (args.start_mode in ("still", "passby") or body.calibrated)
+                sensor_stage = "READY" if remote_ready else "REMOTE WAIT"
+            else:
+                body = InputState(calibrated=True)
+                sensor_stage = "READY"
             if sensor_stage != last_sensor_stage:
                 print(f"sensor_stage={sensor_stage}", flush=True)
                 last_sensor_stage = sensor_stage
@@ -1528,6 +1660,10 @@ def main(argv: Iterable[str] | None = None) -> int:
                     sensor.reselect_player()
                     awaiting_player_hold = True
                     print("event=life-lost select=front-player wait=still-hold", flush=True)
+                elif sensor_control_sender is not None:
+                    sensor_control_sender.reselect_player()
+                    awaiting_player_hold = True
+                    print("event=life-lost remote-select=front-player wait=still-hold", flush=True)
                 else:
                     print("event=life-lost wait=manual-launch", flush=True)
             if was_game_started and not game.game_started:
@@ -1535,24 +1671,32 @@ def main(argv: Iterable[str] | None = None) -> int:
                 awaiting_player_hold = False
                 if sensor is not None:
                     sensor.reselect_player()
+                elif sensor_control_sender is not None:
+                    sensor_control_sender.reselect_player()
                 print("event=round-reset select=front-player", flush=True)
             if was_serving and not game.serving:
                 print("event=game-launch", flush=True)
             manual_launch, last = False, now
             countdown_display = int(math.ceil(countdown_remaining)) if countdown_remaining > 0.0 else None
-            indexed = game.render(
+            output_frame = game.render(
                 sensor_stage,
                 args.boundaries,
                 countdown_display,
                 args.start_mode,
                 body.start_hold_remaining,
+                palette_mode=output_palette,
             )
-            if indexed.shape != (CANVAS_HEIGHT, CANVAS_WIDTH) or int(indexed.max()) >= FC6_LIMIT:
-                raise RuntimeError("送出フレームがFC6の192x384条件を満たさない")
+            palette_limit = FC6_LIMIT if output_palette == PaletteMode.FC6 else MSX16_LIMIT
+            if (
+                output_frame.shape != (CANVAS_HEIGHT, CANVAS_WIDTH)
+                or int(output_frame.max()) >= palette_limit
+                or (output_palette == PaletteMode.MSX16 and int(output_frame.min()) == 0)
+            ):
+                raise RuntimeError(f"送出フレームが{output_palette.name}の192x384条件を満たさない")
             if sender:
-                sender.send(frame_id, PaletteMode.FC6, indexed)
+                sender.send(frame_id, output_palette, output_frame)
             if not args.no_preview:
-                display = preview(indexed)
+                display = preview(output_frame, output_palette)
                 if args.preview_scale != 1:
                     display = cv2.resize(display, (CANVAS_WIDTH * args.preview_scale, CANVAS_HEIGHT * args.preview_scale), interpolation=cv2.INTER_NEAREST)
                 cv2.imshow("RGB LED block breaker", display)
@@ -1583,6 +1727,10 @@ def main(argv: Iterable[str] | None = None) -> int:
             sender.close()
         if sensor:
             sensor.close()
+        if input_receiver is not None:
+            input_receiver.close()
+        if sensor_control_sender is not None:
+            sensor_control_sender.close()
         if keyboard_state is not None:
             keyboard_state.close()
         if not args.no_preview:

@@ -20,9 +20,10 @@ from block_breaker import (  # noqa: E402
     PersonTracker,
     SensorController,
     StillStartDetector,
+    GAME_COLORS,
     keyboard_action,
 )
-from palettes import FC6_LIMIT, FC6_WHITE  # noqa: E402
+from palettes import FC6_LIMIT, FC6_WHITE, MSX16_LIMIT, PaletteMode  # noqa: E402
 
 
 class FakeDepthCapture:
@@ -334,6 +335,20 @@ def main() -> int:
     if game.serving or game.ball.vy <= 0:
         errors.append("ボスの口からプレイヤー方向へボールを発射しない")
     initial = BlockBreaker().render("READY")
+    msx_game = BlockBreaker()
+    msx16 = msx_game.render("READY", palette_mode=PaletteMode.MSX16)
+    if msx16.shape != initial.shape or int(msx16.min()) < 1 or int(msx16.max()) >= MSX16_LIMIT:
+        errors.append("ゲームを不透明なMSX16インデックスで直接描画しない")
+    msx_colors = GAME_COLORS[PaletteMode.MSX16]
+    if msx_colors.sky == msx_colors.sky_dot:
+        errors.append("MSX16で背景と星の近い元色を分離しない")
+    if msx_colors.paddle == msx_colors.paddle_edge:
+        errors.append("MSX16でパドル本体と縁の近い元色を分離しない")
+    if msx_colors.text == msx_colors.dim:
+        errors.append("MSX16で白文字と灰線の近い元色を分離しない")
+    boss_msx_colors = np.unique(msx_game.boss_sprite_msx16[msx_game.boss_mask])
+    if len(boss_msx_colors) < 12 or 0 in boss_msx_colors:
+        errors.append(f"MSX16ボス画像の色相・階調を維持しない: {boss_msx_colors.tolist()}")
     if int(initial[12, 164]) == FC6_WHITE:
         errors.append("スタート時に残機の白丸を表示する")
     playing = game.render("READY")
