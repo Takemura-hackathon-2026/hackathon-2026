@@ -14,8 +14,12 @@ from block_breaker import (  # noqa: E402
     ForegroundGate,
     GameInput,
     InputClassifier,
+    PaddleFollower,
     PassbyStartDetector,
+    PersonCandidate,
+    PersonTracker,
     SensorController,
+    StillStartDetector,
     keyboard_action,
 )
 from palettes import FC6_LIMIT, FC6_WHITE  # noqa: E402
@@ -52,6 +56,10 @@ def synthetic_depth(kind: str = "background", phase: int = 0) -> np.ndarray:
         frame[220:235, 300:315] = 3500
     elif kind == "person":
         frame[80:430, 220:420] = 3500
+    elif kind == "two-person":
+        # 左は背景との差分1500mm、右は1000mm。左を手前の人として選ぶ。
+        frame[80:430, 115:245] = 3500
+        frame[80:430, 385:515] = 4000
     elif kind != "background":
         raise ValueError(f"unknown synthetic depth kind: {kind}")
     return np.clip(frame, 1, 65535).astype(np.uint16)
@@ -152,10 +160,30 @@ def main() -> int:
         body_flags = [state.body_present for state in event_states]
         if body_flags[:2] != [False, False] or not body_flags[2]:
             errors.append(f"人物を3フレーム継続後に確定しない: {body_flags}")
+        if any(state.start_trigger for state in event_states):
+            errors.append("既定の静止開始が3秒より早く発火する")
         if sensor.accepted_mask is None or not np.any(sensor.accepted_mask):
             errors.append("人物確定時のaccepted_maskを生成しない")
     except (RuntimeError, ValueError, OSError) as exc:
         errors.append(f"統合判定テスト(人物)が実行できない: {exc}")
+    finally:
+        if sensor is not None:
+            sensor.close()
+
+    sensor = None
+    try:
+        states, sensor = run_sensor_sequence("two-person")
+        stable = [state for state in states[40:] if state.body_present]
+        if not stable:
+            errors.append("複数人から安定した操作対象を選ばない")
+        else:
+            selected = stable[0]
+            if selected.people_detected != 2:
+                errors.append(f"複数人の安定検出数が不正: {selected.people_detected}")
+            if selected.body_x is None or selected.body_x >= .5:
+                errors.append("複数人の開始時に最も手前の人を選ばない")
+    except (RuntimeError, ValueError, OSError) as exc:
+        errors.append(f"統合判定テスト(複数人物)が実行できない: {exc}")
     finally:
         if sensor is not None:
             sensor.close()
@@ -212,6 +240,53 @@ def main() -> int:
     if one_frame_noise.lateral != 0:
         errors.append("1フレームの重心揺れを左右移動として確定する")
 
+    raw_classifier = InputClassifier(samples=3)
+    for step in range(3):
+        raw_classifier.update(stance, 3.0 + step * .05)
+    raw_x = raw_classifier.update(BodyMeasurement(.57, .5, .9, .2, width=.22, height=.52, upper_width=.22), 3.2)
+    if raw_x.body_x != .57:
+        errors.append("パドル追従へ平滑化済みではなく現在の人物中心Xを渡す")
+
+    follower = PaddleFollower(192.0, 42.0, (.15, .85), deadzone=3.0, gain=.85)
+    if follower.target_center(.15) != 21.0 or follower.target_center(.85) != 171.0:
+        errors.append("プレイ範囲の両端をパドルの到達可能な端へ写像しない")
+    if follower.follow(.5, 96.0) != 96.0:
+        errors.append("パドル追従の不感帯内で位置を変える")
+    stepped = follower.follow(.85, 96.0)
+    if not 96.0 < stepped < 171.0:
+        errors.append("パドル追従が不感帯外で高ゲイン追従しない")
+    mirrored = PaddleFollower(192.0, 42.0, (.15, .85), mirror=True)
+    if mirrored.target_center(.15) != 171.0:
+        errors.append("鏡像入力でパドル位置を反転しない")
+
+    def tracked_candidate(x: float, depth_gain: float, y: float = .5, bottom: float = .9) -> PersonCandidate:
+        body = BodyMeasurement(x, y, bottom, .16, width=.20, height=.52, upper_width=.20)
+        contour = np.asarray([[[0, 0]], [[1, 0]], [[1, 1]], [[0, 1]]], dtype=np.int32)
+        return PersonCandidate(body, contour, depth_gain)
+
+    tracker = PersonTracker({"samples": 3, "jump_rise_y_min": .05, "jump_rise_bottom_min": .04})
+    for frame in range(3):
+        active, _changed, people = tracker.update(
+            [tracked_candidate(.70, 900.0), tracked_candidate(.30, 1500.0)],
+            frame * .05,
+        )
+    if active is None or active.body.x != .30 or people != 2:
+        errors.append("複数人の初回ロックで最も手前の人を選ばない")
+    # 奥側の人がジャンプしても、ロック中の操作対象は奪われない。
+    active, _changed, _people = tracker.update(
+        [tracked_candidate(.30, 1500.0), tracked_candidate(.70, 2200.0, y=.42, bottom=.84)],
+        .20,
+    )
+    if active is None or active.body.x != .30:
+        errors.append("ロック中に別の人へ操作対象を切り替える")
+    tracker.release_active()
+    active, changed, _people = tracker.update(
+        [tracked_candidate(.30, 1500.0), tracked_candidate(.70, 2200.0)],
+        .25,
+    )
+    if active is None or active.body.x != .70 or not changed:
+        errors.append("ロック解除後に最も手前の人を選び直さない")
+
     passby = PassbyStartDetector(confirm_frames=4, rearm_frames=3)
     passby_events = [passby.update(False) for _ in range(3)]
     passby_events.extend(passby.update(True) for _ in range(4))
@@ -224,6 +299,22 @@ def main() -> int:
     rearm_events = [passby.update(True) for _ in range(4)]
     if rearm_events != [False, False, False, True]:
         errors.append("再通過後に開始イベントを再検知しない")
+
+    still = StillStartDetector(hold_seconds=3.0, position_tolerance=.035)
+    still_events = [
+        still.update(BodyMeasurement(.50, .5, .9, .2), 0.0)[0],
+        still.update(BodyMeasurement(.52, .5, .9, .2), 2.9)[0],
+        # 許容幅を超えて動いたため、ここから3秒を数え直す。
+        still.update(BodyMeasurement(.56, .5, .9, .2), 2.95)[0],
+        still.update(BodyMeasurement(.56, .5, .9, .2), 5.9)[0],
+        still.update(BodyMeasurement(.56, .5, .9, .2), 6.0)[0],
+    ]
+    if still_events != [False, False, False, False, True]:
+        errors.append(f"3秒静止開始の発火時刻が不正: {still_events}")
+    if still.update(BodyMeasurement(.56, .5, .9, .2), 6.1)[0]:
+        errors.append("静止開始を同じ人物で連続発火する")
+    if still.update(None, 6.2) != (False, None):
+        errors.append("人物が消えた時に静止開始をリセットしない")
     for key, expected in ((ord("a"), "left"), (83, "right"), (ord(" "), "launch"), (ord("r"), "reset")):
         if keyboard_action(key) != expected:
             errors.append(f"キーボード操作の変換が不正: {key} -> {keyboard_action(key)}")
@@ -249,6 +340,12 @@ def main() -> int:
     if int(playing[12, 164]) != FC6_WHITE:
         errors.append("プレイ中に残機の白丸を表示しない")
     game._lose_ball(.3)
+    if not game.consume_life_loss_event():
+        errors.append("残機が残るミスを次球開始イベントとして通知しない")
+    if game.consume_life_loss_event():
+        errors.append("残機減少イベントを複数フレーム通知する")
+    if not game.serving or game.lives != 2:
+        errors.append("残機減少後に次球の待機状態へ戻らない")
     after_loss = game.render("READY")
     if int(after_loss[12, 164]) != FC6_WHITE or int(after_loss[12, 189]) != FC6_WHITE:
         errors.append("ミス後に残機と減った位置の点滅輪郭を表示しない")
