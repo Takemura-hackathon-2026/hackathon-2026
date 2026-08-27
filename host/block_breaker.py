@@ -23,9 +23,8 @@ import cv2
 import numpy as np
 
 HOST = Path(__file__).resolve().parent
-for directory in (HOST, HOST / "test_mode"):
-    if str(directory) not in sys.path:
-        sys.path.insert(0, str(directory))
+if str(HOST) not in sys.path:
+    sys.path.insert(0, str(HOST))
 
 from palettes import FC6, FC6_BLACK, FC6_LIMIT, FC6_WHITE, PaletteMode  # noqa: E402
 from frame_source import StructureSensorSource, depth_preview  # noqa: E402
@@ -89,8 +88,12 @@ class InputState:
     body_present: bool = False
     calibrated: bool = False
     launch: bool = False  # 腕で輪を作った1フレームの開始イベント（互換用）
-    start_trigger: bool = False  # 通過検知または腕輪でカウントダウンを開始するイベント
-    body_x: float | None = None  # 平滑化済み人物中心X（0〜1）。バー同期用
+    start_trigger: bool = False  # 開始条件を満たし、カウントダウンを開始するイベント
+    body_x: float | None = None  # 人物中心X（ROI内で0〜1）。バー追従用
+    start_hold_remaining: float | None = None  # 静止開始までの残り秒数。人物未検出時はNone。
+    player_id: int | None = None  # 現在バーを操作している追跡対象
+    people_detected: int = 0  # 今フレームで安定検出した人数
+    player_changed: bool = False  # ジャンプまたは離脱で操作対象が交代したフレーム
 
 
 class InputClassifier:
@@ -261,7 +264,9 @@ class InputClassifier:
             body_present=True,
             calibrated=True,
             launch=launch,
-            body_x=filtered_x,
+            # パドル追従は、遅れの出る移動平均ではなく検出フレームの重心を使う。
+            # filtered_x は従来どおり左右・開始ジェスチャーの安定判定にだけ使う。
+            body_x=body.x,
         )
 
 
@@ -298,8 +303,55 @@ class PassbyStartDetector:
         return False
 
 
+class StillStartDetector:
+    """同じ人物が一定位置に留まった時間を、開始イベントへ変換する。"""
+
+    def __init__(self, hold_seconds: float = 3.0, position_tolerance: float = .035) -> None:
+        if not math.isfinite(hold_seconds) or hold_seconds <= 0.0:
+            raise ValueError("静止開始時間は0より大きい必要があります")
+        if not math.isfinite(position_tolerance) or not 0.0 <= position_tolerance < 1.0:
+            raise ValueError("静止開始の位置許容幅は0以上1未満にしてください")
+        self.hold_seconds = float(hold_seconds)
+        self.position_tolerance = float(position_tolerance)
+        self.anchor_x: float | None = None
+        self.started_at: float | None = None
+        self.latched = False
+
+    def reset(self) -> None:
+        self.anchor_x = None
+        self.started_at = None
+        self.latched = False
+
+    def update(self, body: BodyMeasurement | None, now: float) -> tuple[bool, float | None]:
+        """静止を確定した1フレームだけTrue、保持中は残り秒数を返す。"""
+        if body is None:
+            self.reset()
+            return False, None
+        if self.anchor_x is None or self.started_at is None:
+            self.anchor_x, self.started_at = body.x, now
+            return False, self.hold_seconds
+        if abs(body.x - self.anchor_x) > self.position_tolerance:
+            # パドルを動かすほど横へ移動したら、今の位置を新たな静止開始点にする。
+            self.anchor_x, self.started_at, self.latched = body.x, now, False
+            return False, self.hold_seconds
+        remaining = max(0.0, self.hold_seconds - (now - self.started_at))
+        if not self.latched and remaining <= 0.0:
+            self.latched = True
+            return True, 0.0
+        return False, remaining
+
+
+@dataclass(frozen=True)
+class PersonCandidate:
+    """1フレームの人物候補。contour はデバッグ描画と確定マスク用。"""
+
+    body: BodyMeasurement
+    contour: np.ndarray
+    depth_gain: float  # 背景との差分mm。大きいほどセンサー手前。
+
+
 class ForegroundGate:
-    """深度差分から、床・背景変化ではない人物候補だけを通す。"""
+    """深度差分から、床・背景変化ではない人物候補を全員ぶん抽出する。"""
 
     # 実機フレームの下端約16%は床面。人物の上半身を残し、床帯だけを候補から外す。
     FLOOR_CUTOFF_RATIO = 0.84
@@ -328,12 +380,13 @@ class ForegroundGate:
         self.last_size = None
         self.persistence = 0
 
-    def detect(
+    def detect_all(
         self,
         mask: np.ndarray,
         nearer: np.ndarray,
         threshold: float,
-    ) -> tuple[BodyMeasurement | None, np.ndarray | None, np.ndarray]:
+    ) -> tuple[list[PersonCandidate], np.ndarray]:
+        """分離して見える人物候補をすべて返す。追跡の継続判定はPersonTrackerが行う。"""
         binary = np.asarray(mask, dtype=np.uint8).copy()
         depth_gain = np.asarray(nearer, dtype=np.float32)
         if binary.ndim != 2 or depth_gain.shape != binary.shape:
@@ -348,8 +401,8 @@ class ForegroundGate:
         contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         total = float(width * height)
         min_area = max(float(self.min_area), total * self.MIN_AREA_RATIO)
-        chosen: tuple[np.ndarray, tuple[int, int, int, int], float, float, float] | None = None
-        for contour in sorted(contours, key=cv2.contourArea, reverse=True):
+        candidates: list[PersonCandidate] = []
+        for contour in contours:
             area = float(cv2.contourArea(contour))
             x, y, box_width, box_height = cv2.boundingRect(contour)
             area_ratio = area / total
@@ -372,51 +425,178 @@ class ForegroundGate:
             center_y = float(moments["m01"] / moments["m00"] / height)
             if not (0.04 <= center_x <= 0.96 and 0.04 <= center_y <= 0.96):
                 continue
-            values = depth_gain[y:y + box_height, x:x + box_width][
-                binary[y:y + box_height, x:x + box_width] > 0
-            ]
+            component = np.zeros_like(binary)
+            cv2.drawContours(component, [contour], -1, 255, -1)
+            values = depth_gain[component > 0]
             if values.size == 0:
                 continue
             median_gain = float(np.median(values))
             if median_gain < max(self.MIN_DEPTH_GAIN_MM, float(threshold) * 0.75):
                 continue
-            chosen = (contour, (x, y, box_width, box_height), center_x, center_y, area_ratio)
-            break
+            local_component = component[y:y + box_height, x:x + box_width] > 0
+            upper_height = max(1, int(round(box_height * 0.72)))
+            row_spans: list[int] = []
+            for row in local_component[:upper_height]:
+                columns = np.flatnonzero(row)
+                if columns.size:
+                    row_spans.append(int(columns[-1] - columns[0] + 1))
+            upper_width = max(row_spans, default=0) / width
+            candidates.append(
+                PersonCandidate(
+                    BodyMeasurement(
+                        center_x,
+                        center_y,
+                        float(y + box_height) / height,
+                        area_ratio,
+                        box_width / width,
+                        box_height / height,
+                        upper_width,
+                    ),
+                    contour,
+                    median_gain,
+                )
+            )
+        return sorted(candidates, key=lambda candidate: candidate.body.x), binary
 
-        if chosen is None:
+    def detect(
+        self,
+        mask: np.ndarray,
+        nearer: np.ndarray,
+        threshold: float,
+    ) -> tuple[BodyMeasurement | None, np.ndarray | None, np.ndarray]:
+        """単一候補向けの互換API。新規処理はdetect_all()とPersonTrackerを使う。"""
+        candidates, binary = self.detect_all(mask, nearer, threshold)
+        if not candidates:
             self.reset()
             return None, None, binary
-
-        contour, bbox, center_x, center_y, area_ratio = chosen
-        _, _, box_width, box_height = bbox
-        size = (box_width / width, box_height / height)
+        chosen = max(candidates, key=lambda candidate: candidate.body.area)
+        body = chosen.body
+        size = (body.width, body.height)
         if self.last_center is not None and self.last_size is not None:
-            center_step = math.hypot(center_x - self.last_center[0], center_y - self.last_center[1])
+            center_step = math.hypot(body.x - self.last_center[0], body.y - self.last_center[1])
             size_step = max(abs(size[0] - self.last_size[0]), abs(size[1] - self.last_size[1]))
-            self.persistence = self.persistence + 1 if center_step <= self.MAX_CENTER_STEP and size_step <= 0.35 else 1
+            self.persistence = self.persistence + 1 if center_step <= self.MAX_CENTER_STEP and size_step <= .35 else 1
         else:
             self.persistence = 1
-        self.last_center = (center_x, center_y)
-        self.last_size = size
-        x, y, box_width, box_height = bbox
-        component = binary[y:y + box_height, x:x + box_width] > 0
-        upper_height = max(1, int(round(box_height * 0.72)))
-        row_spans: list[int] = []
-        for row in component[:upper_height]:
-            columns = np.flatnonzero(row)
-            if columns.size:
-                row_spans.append(int(columns[-1] - columns[0] + 1))
-        upper_width = max(row_spans, default=0) / width
-        body = BodyMeasurement(
-            center_x,
-            center_y,
-            float(y + box_height) / height,
-            area_ratio,
-            box_width / width,
-            box_height / height,
-            upper_width,
+        self.last_center, self.last_size = (body.x, body.y), size
+        return (body if self.persistence >= self.MIN_PERSISTENCE else None), chosen.contour, binary
+
+
+@dataclass
+class PersonTrack:
+    """候補領域と個別の入力判定器を結び付けた、継続中の1人。"""
+
+    track_id: int
+    body: BodyMeasurement
+    contour: np.ndarray
+    depth_gain: float
+    classifier: InputClassifier
+    state: InputState
+    first_seen: float
+    last_seen: float
+    seen_frames: int = 1
+    visible: bool = True
+
+
+class PersonTracker:
+    """複数人物を近傍対応付けし、手前の一人をロックして追従する。"""
+
+    MATCH_DISTANCE = .18
+    MAX_MISSING_SECONDS = .70
+
+    def __init__(self, classifier_options: dict[str, float | int]) -> None:
+        self.classifier_options = dict(classifier_options)
+        self.tracks: dict[int, PersonTrack] = {}
+        self.active_id: int | None = None
+        self.next_track_id = 1
+
+    def reset(self) -> None:
+        self.tracks.clear()
+        self.active_id = None
+        self.next_track_id = 1
+
+    def release_active(self) -> None:
+        """次球開始時に、手前の人を選び直せるよう現在のロックを解除する。"""
+        self.active_id = None
+
+    @staticmethod
+    def _match_cost(track: PersonTrack, candidate: PersonCandidate) -> float:
+        body = candidate.body
+        center = math.hypot(body.x - track.body.x, body.y - track.body.y)
+        size_change = max(abs(body.width - track.body.width), abs(body.height - track.body.height))
+        # 交差時も、位置の近さを優先しつつ大きさの急変には小さな罰則を掛ける。
+        return center + size_change * .25
+
+    def _new_track(self, candidate: PersonCandidate, now: float) -> PersonTrack:
+        classifier = InputClassifier(**self.classifier_options)
+        state = classifier.update(candidate.body, now)
+        track = PersonTrack(
+            self.next_track_id,
+            candidate.body,
+            candidate.contour,
+            candidate.depth_gain,
+            classifier,
+            state,
+            now,
+            now,
         )
-        return (body if self.persistence >= self.MIN_PERSISTENCE else None), contour, binary
+        self.tracks[track.track_id] = track
+        self.next_track_id += 1
+        return track
+
+    def update(self, candidates: list[PersonCandidate], now: float) -> tuple[PersonTrack | None, bool, int]:
+        """現在の操作対象、対象交代フラグ、安定検出人数を返す。"""
+        for track in self.tracks.values():
+            track.visible = False
+        pairs: list[tuple[float, int, int]] = []
+        for track_id, track in self.tracks.items():
+            for candidate_index, candidate in enumerate(candidates):
+                cost = self._match_cost(track, candidate)
+                if cost <= self.MATCH_DISTANCE:
+                    pairs.append((cost, track_id, candidate_index))
+        matched_tracks: set[int] = set()
+        matched_candidates: set[int] = set()
+        for _cost, track_id, candidate_index in sorted(pairs):
+            if track_id in matched_tracks or candidate_index in matched_candidates:
+                continue
+            track = self.tracks[track_id]
+            candidate = candidates[candidate_index]
+            track.body, track.contour, track.depth_gain = candidate.body, candidate.contour, candidate.depth_gain
+            track.last_seen, track.seen_frames, track.visible = now, track.seen_frames + 1, True
+            track.state = track.classifier.update(candidate.body, now)
+            matched_tracks.add(track_id)
+            matched_candidates.add(candidate_index)
+        for candidate_index, candidate in enumerate(candidates):
+            if candidate_index not in matched_candidates:
+                self._new_track(candidate, now)
+        self.tracks = {
+            track_id: track
+            for track_id, track in self.tracks.items()
+            if now - track.last_seen <= self.MAX_MISSING_SECONDS
+        }
+        stable_visible = [
+            track
+            for track in self.tracks.values()
+            if track.visible and track.seen_frames >= ForegroundGate.MIN_PERSISTENCE
+        ]
+        previous_active = self.active_id
+        active = self.tracks.get(self.active_id) if self.active_id is not None else None
+        if active is None or not active.visible:
+            if active is not None and now - active.last_seen <= self.MAX_MISSING_SECONDS:
+            # 一瞬の隠れで、近くの別人へ操作権を奪われないようロックを維持する。
+                return None, False, len(stable_visible)
+            if stable_visible:
+                # 開始時・ロック対象の離脱後は、背景との差分が最も大きい（最も手前の）人を選ぶ。
+                self.active_id = max(
+                    stable_visible,
+                    key=lambda track: (track.depth_gain, -track.track_id),
+                ).track_id
+                active = self.tracks[self.active_id]
+            else:
+                self.active_id = None
+                active = None
+        changed = active is not None and self.active_id != previous_active
+        return active, changed, len(stable_visible)
 
 
 class SensorController:
@@ -433,17 +613,19 @@ class SensorController:
         jump_rise_bottom_min: float,
         depth_min_change_mm: float,
         capture: StructureSensorSource | None = None,
-        start_mode: str = "passby",
+        start_mode: str = "still",
         passby_confirm_frames: int = 4,
         passby_rearm_frames: int = 15,
+        still_seconds: float = 3.0,
+        still_position_tolerance: float = .035,
         start_center_tolerance: float = 0.18,
         start_width_gain: float = 0.06,
         start_upper_width_gain: float = 0.04,
         start_upper_width_min: float = 0.30,
         start_area_gain: float = 0.05,
     ) -> None:
-        if start_mode not in ("passby", "arm-circle"):
-            raise ValueError("開始モードはpassbyまたはarm-circle")
+        if start_mode not in ("still", "passby", "arm-circle"):
+            raise ValueError("開始モードはstill、passby、arm-circleのいずれか")
         self.capture = capture if capture is not None else StructureSensorSource(width, height, 60.0)
         self.start_mode = start_mode
         self.background_seconds = max(.2, background_seconds)
@@ -455,16 +637,19 @@ class SensorController:
         self.depth_background: np.ndarray | None = None
         self.depth_noise_p95 = 0.0
         self.foreground_gate = ForegroundGate(self.min_area)
-        self.classifier = InputClassifier(
-            jump_rise_y_min=jump_rise_y_min,
-            jump_rise_bottom_min=jump_rise_bottom_min,
-            start_center_tolerance=start_center_tolerance,
-            start_width_gain=start_width_gain,
-            start_upper_width_gain=start_upper_width_gain,
-            start_upper_width_min=start_upper_width_min,
-            start_area_gain=start_area_gain,
+        self.person_tracker = PersonTracker(
+            {
+                "jump_rise_y_min": jump_rise_y_min,
+                "jump_rise_bottom_min": jump_rise_bottom_min,
+                "start_center_tolerance": start_center_tolerance,
+                "start_width_gain": start_width_gain,
+                "start_upper_width_gain": start_upper_width_gain,
+                "start_upper_width_min": start_upper_width_min,
+                "start_area_gain": start_area_gain,
+            }
         )
         self.passby_detector = PassbyStartDetector(passby_confirm_frames, passby_rearm_frames)
+        self.still_detector = StillStartDetector(still_seconds, still_position_tolerance)
         self.debug: np.ndarray | None = None
         self.mask: np.ndarray | None = None
         # ForegroundGateで形状・継続判定まで通った、ゲーム入力と同一の確定領域。
@@ -475,12 +660,19 @@ class SensorController:
     def stage(self) -> str:
         if self.started is None or time.monotonic() - self.started < self.background_seconds:
             return "BACKGROUND"
-        if self.start_mode == "passby":
+        if self.start_mode in ("still", "passby"):
             return "READY"
-        return "READY" if self.classifier.calibrated else "STANCE"
+        active = self.person_tracker.tracks.get(self.person_tracker.active_id)
+        return "READY" if active is not None and active.state.calibrated else "STANCE"
 
     def close(self) -> None:
         self.capture.close()
+
+    def reselect_player(self) -> None:
+        """残機減少後に操作対象を選び直し、次の人の静止開始を待つ。"""
+        self.person_tracker.release_active()
+        self.passby_detector.reset()
+        self.still_detector.reset()
 
     def read(self, now: float) -> InputState:
         source = self.capture.read()
@@ -511,10 +703,9 @@ class SensorController:
             self.depth_noise_p95 = float(np.percentile(noise_values, 95.0)) if noise_values.size else 0.0
             self.depth_frames.clear()
             self.foreground_gate.reset()
+        candidates: list[PersonCandidate] = []
         if background_phase or self.depth_background is None:
             mask = np.zeros(image.shape, dtype=np.uint8)
-            body = None
-            contour = None
         else:
             depth = np.asarray(image, dtype=np.float32)
             background = self.depth_background
@@ -525,34 +716,66 @@ class SensorController:
             mask = ((valid & (nearer >= threshold)).astype(np.uint8) * 255)
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
-            body, contour, mask = self.foreground_gate.detect(mask, nearer, threshold)
+            candidates, mask = self.foreground_gate.detect_all(mask, nearer, threshold)
+        if background_phase:
+            self.person_tracker.reset()
+            self.passby_detector.reset()
+            self.still_detector.reset()
+            active, player_changed, people_detected = None, False, 0
+        else:
+            active, player_changed, people_detected = self.person_tracker.update(candidates, now)
+        body = active.body if active is not None else None
+        contour = active.contour if active is not None else None
+        state = active.state if active is not None else InputState()
         accepted_mask = np.zeros_like(mask)
         if body is not None and contour is not None:
             cv2.drawContours(accepted_mask, [contour], -1, 255, -1)
         debug = depth_preview(image)
+        for candidate in candidates:
+            cv2.drawContours(debug, [candidate.contour], -1, (255, 170, 0), 1)
         if body is not None and contour is not None:
             cv2.drawContours(debug, [contour], -1, (0, 255, 0), 1)
+            cv2.putText(
+                debug,
+                f"P{active.track_id}/{people_detected}",
+                (max(0, int(body.x * width) - 20), max(30, int(body.y * height) - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                .42,
+                (0, 255, 0),
+                1,
+                cv2.LINE_AA,
+            )
         cv2.putText(debug, self.stage, (6, 18), cv2.FONT_HERSHEY_SIMPLEX, .55, (0, 230, 230), 1, cv2.LINE_AA)
         self.debug, self.mask, self.accepted_mask = debug, mask, accepted_mask
         if background_phase:
-            self.passby_detector.reset()
             return InputState()
-        state = self.classifier.update(body, now)
+        if player_changed:
+            self.passby_detector.reset()
+            self.still_detector.reset()
         if self.start_mode == "passby":
+            self.still_detector.reset()
             start_trigger = self.passby_detector.update(body is not None)
+            start_hold_remaining = None
+        elif self.start_mode == "still":
+            self.passby_detector.reset()
+            start_trigger, start_hold_remaining = self.still_detector.update(body, now)
         else:
             self.passby_detector.reset()
+            self.still_detector.reset()
             start_trigger = state.launch
-        if not start_trigger:
-            return state
+            start_hold_remaining = None
         return InputState(
             lateral=state.lateral,
             jump=state.jump,
             body_present=state.body_present,
             calibrated=state.calibrated,
             launch=state.launch,
-            start_trigger=True,
+            start_trigger=start_trigger,
             body_x=state.body_x,
+            start_hold_remaining=start_hold_remaining,
+            player_id=active.track_id if active is not None else None,
+            people_detected=people_detected,
+            player_changed=player_changed,
         )
 
     def show_debug(self) -> None:
@@ -575,6 +798,55 @@ class GameInput:
     lateral: int = 0
     launch: bool = False
     paddle_center_x: float | None = None
+
+
+@dataclass(frozen=True)
+class PaddleFollower:
+    """人物の横位置を、バーの到達可能な中心座標へ写像する。"""
+
+    canvas_width: float
+    paddle_width: float
+    play_range: tuple[float, float] = (.15, .85)
+    deadzone: float = 3.0
+    gain: float = .85
+    mirror: bool = False
+
+    def __post_init__(self) -> None:
+        low, high = self.play_range
+        if (
+            not math.isfinite(self.canvas_width)
+            or not math.isfinite(self.paddle_width)
+            or self.canvas_width <= self.paddle_width
+            or not math.isfinite(low)
+            or not math.isfinite(high)
+            or not 0.0 <= low < high <= 1.0
+            or not math.isfinite(self.deadzone)
+            or self.deadzone < 0.0
+            or not math.isfinite(self.gain)
+            or not 0.0 < self.gain <= 1.0
+        ):
+            raise ValueError("パドル追従の範囲・不感帯・ゲインが不正")
+
+    def target_center(self, body_x: float) -> float:
+        """ROI内の人物中心を、バーが端まで届く中心座標へ変換する。"""
+        if not math.isfinite(float(body_x)):
+            raise ValueError("人物中心Xが不正")
+        normalized = 1.0 - float(body_x) if self.mirror else float(body_x)
+        low, high = self.play_range
+        progress = min(1.0, max(0.0, (normalized - low) / (high - low)))
+        left_center = self.paddle_width / 2.0
+        right_center = self.canvas_width - left_center
+        return left_center + (right_center - left_center) * progress
+
+    def follow(self, body_x: float, current_center: float) -> float:
+        """不感帯の外だけを高ゲインで追い、静止時の小さな揺れを止める。"""
+        if not math.isfinite(float(current_center)):
+            raise ValueError("現在のパドル中心Xが不正")
+        target = self.target_center(body_x)
+        delta = target - float(current_center)
+        if abs(delta) <= self.deadzone:
+            return float(current_center)
+        return float(current_center) + math.copysign((abs(delta) - self.deadzone) * self.gain, delta)
 
 
 def keyboard_action(key: int) -> str | None:
@@ -684,6 +956,7 @@ class BlockBreaker:
         self.life_loss_feedback_active = False
         self.life_loss_blink_elapsed = 0.0
         self.life_loss_slot = -1
+        self.life_loss_event = False
         self.boss_transition_remaining = 0.0
         self.boss_move_active = False
         self.boss_move_vx = self.boss_move_speed
@@ -701,6 +974,7 @@ class BlockBreaker:
             self.life_loss_feedback_active = False
             self.life_loss_blink_elapsed = 0.0
             self.life_loss_slot = -1
+            self.life_loss_event = False
             self.boss_x = (CANVAS_WIDTH - self.boss_width) / 2
             self.boss_transition_remaining = 0.0
             self.boss_move_active = False
@@ -801,6 +1075,8 @@ class BlockBreaker:
 
     def _lose_ball(self, now: float) -> None:
         self.lives -= 1
+        # main() が次球用カウントダウンを始めるための一度きりのイベント。
+        self.life_loss_event = self.lives > 0
         if self.lives <= 0:
             self.game_over_until = now + 1.8
             self.life_loss_feedback_active = False
@@ -814,6 +1090,12 @@ class BlockBreaker:
         self.boss_collision_armed = False
         self.ball.vx = self.ball.vy = 0.0
         self._place_ball_at_mouth()
+
+    def consume_life_loss_event(self) -> bool:
+        """残機が残るミスを一度だけ取得する。ゲームオーバーではFalse。"""
+        event = self.life_loss_event
+        self.life_loss_event = False
+        return event
 
     def step(self, dt: float, controls: GameInput, now: float) -> None:
         dt = min(.04, max(0.0, dt))
@@ -892,6 +1174,7 @@ class BlockBreaker:
         boundaries: bool = False,
         countdown: int | None = None,
         start_mode: str = "arm-circle",
+        start_hold_remaining: float | None = None,
     ) -> np.ndarray:
         frame = np.full((CANVAS_HEIGHT, CANVAS_WIDTH), SKY, np.uint8)
         for index in range(30):
@@ -941,12 +1224,19 @@ class BlockBreaker:
             if countdown is not None and countdown > 0:
                 self._text(frame, f"START IN {countdown}", (50, 232), 0x0E, .58)
             else:
-                prompt = "WALK PAST TO START" if start_mode == "passby" else "ARMS CIRCLE TO LAUNCH"
+                if start_mode == "still":
+                    prompt = "STAND STILL TO START"
+                elif start_mode == "passby":
+                    prompt = "WALK PAST TO START"
+                else:
+                    prompt = "ARMS CIRCLE TO LAUNCH"
                 self._text(frame, prompt if sensor_stage == "READY" else "SENSOR CAL", (16, 232), 0x0E, .42)
             if sensor_stage == "BACKGROUND":
                 self._text(frame, "CLEAR SENSOR", (32, 252), TEXT, .40)
             elif sensor_stage == "STANCE":
                 self._text(frame, "STAND STILL", (37, 252), TEXT, .40)
+            elif start_mode == "still" and start_hold_remaining is not None:
+                self._text(frame, f"HOLD {math.ceil(start_hold_remaining)}", (62, 252), TEXT, .40)
         if boundaries:
             for y in (96, 192, 288):
                 frame[y:y + 1, :] = DIM
@@ -963,6 +1253,16 @@ def parse_roi(value: str) -> tuple[int, int, int, int]:
     return parts  # type: ignore[return-value]
 
 
+def parse_play_range(value: str) -> tuple[float, float]:
+    try:
+        low, high = (float(part) for part in value.split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("プレイ範囲は LOW,HIGH の数値") from exc
+    if not all(math.isfinite(part) for part in (low, high)) or not 0.0 <= low < high <= 1.0:
+        raise argparse.ArgumentTypeError("プレイ範囲は 0 <= LOW < HIGH <= 1")
+    return low, high
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="STRUCTURE Sensorまたはキーボードで操作する192x384 LEDブロック崩し")
     result.add_argument("--keyboard", action="store_true", help="センサーを使わず、プレビューをキーボードで操作")
@@ -972,8 +1272,20 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--min-foreground-area", type=int, default=420)
     result.add_argument("--depth-min-change-mm", type=float, default=0.0, help="深度の手前側変化量。0は背景ノイズから自動決定")
     result.add_argument("--roi", type=parse_roi, default=None, help="検出ROI x,y,width,height")
-    result.add_argument("--start-mode", choices=("passby", "arm-circle"), default="passby", help="開始条件（既定: 通過検知）")
-    result.add_argument("--start-countdown-seconds", type=float, default=3.0, help="通過検知から開始までの秒数（既定3）")
+    result.add_argument("--mirror", action="store_true", help="カメラの左右を反転してパドルへ対応付ける")
+    result.add_argument(
+        "--play-range",
+        type=parse_play_range,
+        default=(.15, .85),
+        metavar="LOW,HIGH",
+        help="人物位置がバーの左右端に対応するROI内範囲（既定: 0.15,0.85）",
+    )
+    result.add_argument("--position-deadzone", type=float, default=3.0, help="バー追従を止める誤差（LED px、既定3）")
+    result.add_argument("--position-gain", type=float, default=.85, help="不感帯外の追従ゲイン（0超1以下、既定0.85）")
+    result.add_argument("--start-mode", choices=("still", "passby", "arm-circle"), default="still", help="開始条件（既定: 3秒静止）")
+    result.add_argument("--start-countdown-seconds", type=float, default=3.0, help="開始検知からゲーム開始までの秒数（既定3）")
+    result.add_argument("--start-still-seconds", type=float, default=3.0, help="静止開始を確定する保持時間（既定3秒）")
+    result.add_argument("--start-still-tolerance", type=float, default=.035, help="静止とみなす人物中心Xの許容幅（ROI比、既定0.035）")
     result.add_argument("--passby-confirm-frames", type=int, default=4, help="通過検知を確定する連続フレーム数")
     result.add_argument("--passby-rearm-frames", type=int, default=15, help="再通過を受け付けるまでの無検知フレーム数")
     result.add_argument("--jump-rise-y-min", type=float, default=0.05, help="ジャンプ判定の重心上昇量（既定0.05）")
@@ -1069,9 +1381,13 @@ def main(argv: Iterable[str] | None = None) -> int:
         or start_upper_width_min <= 0
         or start_area_gain <= 0
         or args.start_countdown_seconds <= 0
+        or args.start_still_seconds <= 0
+        or not 0.0 <= args.start_still_tolerance < 1.0
         or args.passby_confirm_frames < 2
         or args.passby_rearm_frames < 2
         or args.depth_min_change_mm < 0
+        or args.position_deadzone < 0
+        or not 0.0 < args.position_gain <= 1.0
         or (args.send and len(args.pi) != PI_COUNT)
     ):
         print("error: --fps/--preview-scale/--jump-rise-* または --pi の指定が不正", file=sys.stderr)
@@ -1092,6 +1408,8 @@ def main(argv: Iterable[str] | None = None) -> int:
                 start_mode=args.start_mode,
                 passby_confirm_frames=args.passby_confirm_frames,
                 passby_rearm_frames=args.passby_rearm_frames,
+                still_seconds=args.start_still_seconds,
+                still_position_tolerance=args.start_still_tolerance,
                 start_center_tolerance=start_center_tolerance,
                 start_width_gain=start_width_gain,
                 start_upper_width_gain=start_upper_width_gain,
@@ -1104,8 +1422,17 @@ def main(argv: Iterable[str] | None = None) -> int:
         return 2
     keyboard_state = X11KeyboardState() if not args.no_preview else None
     game, running, frame_id = BlockBreaker(), True, 0
+    follower = PaddleFollower(
+        CANVAS_WIDTH,
+        game.paddle_width,
+        args.play_range,
+        args.position_deadzone,
+        args.position_gain,
+        args.mirror,
+    )
     manual_lateral, manual_until, manual_launch = 0, 0.0, False
     countdown_remaining = 0.0
+    awaiting_player_hold = False
     def stop(_signum: int, _frame: object) -> None:
         nonlocal running
         running = False
@@ -1124,12 +1451,19 @@ def main(argv: Iterable[str] | None = None) -> int:
         print(f"start calibration=learned path={calibration_path}", flush=True)
     elif args.start_mode == "arm-circle":
         print("start calibration=defaults", flush=True)
-    else:
+    elif args.start_mode == "passby":
         print("start calibration=not-used mode=passby", flush=True)
+    else:
+        print(
+            f"start calibration=not-used mode=still hold={args.start_still_seconds:.1f}s "
+            f"tolerance={args.start_still_tolerance:.3f}",
+            flush=True,
+        )
     if not args.no_preview:
         print("keys: A/D or LEFT/RIGHT = paddle, SPACE/W/UP = launch, R = reset, Q/ESC = quit", flush=True)
     last_sensor_stage: str | None = None
     last_lateral: int | None = None
+    last_player_id: int | None = None
     try:
         while running and (args.frames <= 0 or frame_id < args.frames):
             now = time.monotonic()
@@ -1140,10 +1474,22 @@ def main(argv: Iterable[str] | None = None) -> int:
             if sensor_stage != last_sensor_stage:
                 print(f"sensor_stage={sensor_stage}", flush=True)
                 last_sensor_stage = sensor_stage
+            if body.player_changed or (body.player_id is not None and body.player_id != last_player_id):
+                print(
+                    f"control=player:{body.player_id} people={body.people_detected} lock=front",
+                    flush=True,
+                )
+            last_player_id = body.player_id
             if body.launch and args.start_mode == "arm-circle":
                 print("event=arm-circle-launch", flush=True)
-            if body.start_trigger and game.serving and not game.game_started and countdown_remaining <= 0.0:
+            if (
+                body.start_trigger
+                and game.serving
+                and (not game.game_started or awaiting_player_hold)
+                and countdown_remaining <= 0.0
+            ):
                 countdown_remaining = args.start_countdown_seconds
+                awaiting_player_hold = False
                 print(
                     f"event={args.start_mode}-start-detected countdown={args.start_countdown_seconds:.1f}s",
                     flush=True,
@@ -1155,11 +1501,10 @@ def main(argv: Iterable[str] | None = None) -> int:
             if manual_lateral and now >= manual_until:
                 manual_lateral = 0
             lateral = x11_lateral or manual_lateral or (body.lateral if body.calibrated else 0)
-            paddle_center_x = (
-                body.body_x * CANVAS_WIDTH
-                if not keyboard_mode and body.body_present and body.body_x is not None
-                else None
-            )
+            paddle_center_x = None
+            if not keyboard_mode and body.body_present and body.body_x is not None:
+                current_center = game.paddle_x + game.paddle_width / 2.0
+                paddle_center_x = follower.follow(body.body_x, current_center)
             dt = min(.05, max(0.0, now - last))
             countdown_launch = False
             if countdown_remaining > 0.0:
@@ -1167,7 +1512,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 if countdown_remaining == 0.0:
                     countdown_launch = True
                     print("event=game-launch-countdown", flush=True)
-            was_serving = game.serving
+            was_serving, was_game_started = game.serving, game.game_started
             game.step(
                 dt,
                 GameInput(
@@ -1177,11 +1522,31 @@ def main(argv: Iterable[str] | None = None) -> int:
                 ),
                 now,
             )
+            if game.consume_life_loss_event():
+                countdown_remaining = 0.0
+                if sensor is not None:
+                    sensor.reselect_player()
+                    awaiting_player_hold = True
+                    print("event=life-lost select=front-player wait=still-hold", flush=True)
+                else:
+                    print("event=life-lost wait=manual-launch", flush=True)
+            if was_game_started and not game.game_started:
+                countdown_remaining = 0.0
+                awaiting_player_hold = False
+                if sensor is not None:
+                    sensor.reselect_player()
+                print("event=round-reset select=front-player", flush=True)
             if was_serving and not game.serving:
                 print("event=game-launch", flush=True)
             manual_launch, last = False, now
             countdown_display = int(math.ceil(countdown_remaining)) if countdown_remaining > 0.0 else None
-            indexed = game.render(sensor_stage, args.boundaries, countdown_display, args.start_mode)
+            indexed = game.render(
+                sensor_stage,
+                args.boundaries,
+                countdown_display,
+                args.start_mode,
+                body.start_hold_remaining,
+            )
             if indexed.shape != (CANVAS_HEIGHT, CANVAS_WIDTH) or int(indexed.max()) >= FC6_LIMIT:
                 raise RuntimeError("送出フレームがFC6の192x384条件を満たさない")
             if sender:
