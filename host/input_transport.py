@@ -252,6 +252,10 @@ class InputStateReceiver:
 
     def read(self, now: float | None = None) -> tuple[RemoteInputState, bool]:
         current_time = time.monotonic() if now is None else now
+        # センサーPiのプロセス再起動ではsequenceが0へ戻る。無通信タイムアウト後も
+        # 旧latestを残すと、新プロセスの全入力を古いsequenceとして拒否し続ける。
+        if self.latest is not None and current_time - self.last_arrival > self.timeout_seconds:
+            self.latest = None
         while True:
             try:
                 packet, _source = self.socket.recvfrom(256)

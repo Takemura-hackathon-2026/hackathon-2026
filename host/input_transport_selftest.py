@@ -100,6 +100,10 @@ def main() -> int:
         stale, connected = receiver.read()
         if connected or stale != RemoteInputState():
             errors.append("タイムアウト時にニュートラルへ戻らない")
+        sender.send(RemoteInputState(body_present=True, calibrated=True, body_x=.5), 0)
+        restarted, connected = wait_for_input(receiver)
+        if not connected or not restarted.body_present or restarted.body_x != .5:
+            errors.append("センサー再起動後のsequenceリセットを受理しない")
     finally:
         sender.close()
         receiver.close()
