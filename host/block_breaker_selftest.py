@@ -9,6 +9,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from block_breaker import (  # noqa: E402
+    BLOCK_COLORS,
     BodyMeasurement,
     BlockBreaker,
     ForegroundGate,
@@ -319,7 +320,7 @@ def main() -> int:
     for key, expected in ((ord("a"), "left"), (83, "right"), (ord(" "), "launch"), (ord("r"), "reset")):
         if keyboard_action(key) != expected:
             errors.append(f"キーボード操作の変換が不正: {key} -> {keyboard_action(key)}")
-    game = BlockBreaker()
+    game = BlockBreaker(start_phase="boss")
     if game.boss_width <= 80 or game.boss_height <= 80:
         errors.append("ボス画像を拡大しない")
     if game.boss_y - 26 < game.ball_radius * 2:
@@ -334,8 +335,8 @@ def main() -> int:
     game.step(0, GameInput(launch=True), .2)
     if game.serving or game.ball.vy <= 0:
         errors.append("ボスの口からプレイヤー方向へボールを発射しない")
-    initial = BlockBreaker().render("READY")
-    msx_game = BlockBreaker()
+    initial = BlockBreaker(start_phase="boss").render("READY")
+    msx_game = BlockBreaker(start_phase="boss")
     msx16 = msx_game.render("READY", palette_mode=PaletteMode.MSX16)
     if msx16.shape != initial.shape or int(msx16.min()) < 1 or int(msx16.max()) >= MSX16_LIMIT:
         errors.append("ゲームを不透明なMSX16インデックスで直接描画しない")
@@ -444,6 +445,77 @@ def main() -> int:
             errors.append("FC6の192x384フレームを維持しない")
             break
         game.step(1 / 60, GameInput(-1 if step % 60 < 30 else 1), .4 + step / 60)
+
+    # 通常面（developのブロック崩し）→ ボス戦の流れ。
+    classic = BlockBreaker()
+    if classic.phase != "classic" or len(classic.blocks) != 48:
+        errors.append(f"開始時に通常面のブロックを並べない: phase={classic.phase} blocks={len(classic.blocks)}")
+    if abs(classic.ball.x - (classic.paddle_x + classic.paddle_width / 2)) > 1e-6:
+        errors.append("通常面の待機球をパドル上に置かない")
+    classic_frame = classic.render("READY")
+    if int(classic_frame.max()) >= FC6_LIMIT:
+        errors.append("通常面がFC6の範囲を超える")
+    if not np.any(classic_frame == BLOCK_COLORS[1]):
+        errors.append("通常面にブロックを描画しない")
+    classic_msx16 = BlockBreaker().render("READY", palette_mode=PaletteMode.MSX16)
+    if int(classic_msx16.min()) < 1 or int(classic_msx16.max()) >= MSX16_LIMIT:
+        errors.append("通常面を不透明なMSX16インデックスで描画しない")
+    classic.step(0, GameInput(launch=True), .1)
+    if classic.serving or classic.ball.vy >= 0:
+        errors.append("通常面でパドルから上向きにボールを発射しない")
+    hits = 0
+    for step in range(600):
+        before = len(classic.blocks)
+        classic.step(1 / 60, GameInput(paddle_center_x=classic.ball.x), .2 + step / 60)
+        hits += before - len(classic.blocks)
+        if classic.stage_clear_remaining > 0.0 or classic.phase != "classic":
+            break
+    if hits <= 0:
+        errors.append("通常面でブロックを壊せない")
+    if classic.score != 10 * hits:
+        errors.append(f"通常面のスコアがdevelopの加点と合わない: {classic.score} != {10 * hits}")
+
+    # 全消し後にSTAGE CLEARを挟んでボス戦へ移り、開始待ちを1度だけ通知する。
+    classic = BlockBreaker()
+    classic.blocks = classic.blocks[:1]
+    classic.step(0, GameInput(launch=True), .1)
+    classic.ball.x, classic.ball.y = classic.blocks[0].x + 1, classic.blocks[0].y + 6
+    classic.step(1 / 60, GameInput(), .2)
+    if classic.blocks or classic.stage_clear_remaining <= 0.0:
+        errors.append("最後のブロックを壊してもSTAGE CLEARへ入らない")
+    if not np.any(classic.render("READY") == GAME_COLORS[PaletteMode.FC6].clear):
+        errors.append("STAGE CLEARを表示しない")
+    for step in range(60):
+        classic.step(.04, GameInput(), .3 + step * .04)
+        if classic.phase == "boss":
+            break
+    if classic.phase != "boss":
+        errors.append("STAGE CLEAR後にボス戦へ移らない")
+    if classic.boss_hp != classic.boss_max_hp or not classic.serving:
+        errors.append("ボス戦を満タンHPの待機状態で始めない")
+    if abs(classic.ball.x - (classic.boss_x + classic.boss_width * .53)) > 1e-6:
+        errors.append("ボス戦の待機球をボスの口元へ置かない")
+    if not classic.consume_stage_start_request():
+        errors.append("ボス戦移行を開始待ちイベントとして通知しない")
+    if classic.consume_stage_start_request():
+        errors.append("ボス戦移行イベントを複数フレーム通知する")
+    # ボス撃破後は通常面から遊び直す。
+    classic.boss_hp = 0
+    classic.boss_defeated = True
+    classic.clear_remaining = classic.clear_delay
+    for step in range(80):
+        classic.step(.04, GameInput(), 2.0 + step * .04)
+        if classic.phase == "classic":
+            break
+    if classic.phase != "classic" or len(classic.blocks) != 48 or classic.lives != 3 or classic.score != 0:
+        errors.append("ボス撃破後に通常面へ戻らない")
+    # 通常面のミスも次球開始イベントとして通知する。
+    classic.step(0, GameInput(launch=True), 5.0)
+    classic._lose_ball(5.1)
+    if not classic.consume_life_loss_event() or classic.lives != 2:
+        errors.append("通常面のミスを次球開始イベントとして通知しない")
+    if abs(classic.ball.x - (classic.paddle_x + classic.paddle_width / 2)) > 1e-6:
+        errors.append("通常面のミス後に球をパドル上へ戻さない")
     for error in errors:
         print(f"ERROR: {error}")
     print(f"{len(errors)} errors")

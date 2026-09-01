@@ -141,7 +141,8 @@ class ExtraStageGame:
             self.transition_hide_scene = hide_scene
 
     def _start_boss_entrance(self) -> None:
-        self.boss = self.m.BlockBreaker()
+        # 通常面はこのラッパー側が持つため、既存ゲームからはボス戦だけを使う。
+        self.boss = self.m.BlockBreaker(start_phase="boss")
         if self.cheat_wide_paddle:
             self.boss.paddle_width = float(self.m.CANVAS_WIDTH)
             self.boss.paddle_x = 0.0

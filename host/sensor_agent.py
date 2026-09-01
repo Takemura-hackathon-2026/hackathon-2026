@@ -29,6 +29,12 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--sensor-width", type=int, default=640)
     result.add_argument("--sensor-height", type=int, default=480)
     result.add_argument("--sensor-fps", type=float, default=30.0)
+    result.add_argument(
+        "--capture-decimate",
+        type=int,
+        default=1,
+        help="深度をN画素おきに間引いて取得（既定1。2で転送量1/4。ヘルパーの再ビルドが必要）",
+    )
     result.add_argument("--sensor-background-seconds", type=float, default=2.0)
     result.add_argument("--min-foreground-area", type=int, default=420)
     result.add_argument("--depth-min-change-mm", type=float, default=0.0)
@@ -63,6 +69,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         or args.jump_rise_bottom_min <= 0
         or args.seconds < 0
         or args.frames < 0
+        or not 1 <= args.capture_decimate <= 16
     ):
         print("error: センサー、判定、実行時間の引数が不正", file=sys.stderr)
         return 2
@@ -95,6 +102,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             start_upper_width_gain=learned.get("upper_width_gain_min", DEFAULT_START_SETTINGS["upper_width_gain_min"]),
             start_upper_width_min=learned.get("upper_width_min", DEFAULT_START_SETTINGS["upper_width_min"]),
             start_area_gain=learned.get("area_gain_min", DEFAULT_START_SETTINGS["area_gain_min"]),
+            debug_preview=False,
+            capture_decimate=args.capture_decimate,
         )
         sender = InputStateSender(destination)
         control_receiver = SensorControlReceiver(control_bind)
@@ -120,9 +129,16 @@ def main(argv: Iterable[str] | None = None) -> int:
     sequence = 0
     last_stage: str | None = None
     last_report = started
+    # 1周が取得周期を超えると取得側にフレームが溜まり、その分だけ入力が遅れる。
+    # 実際に捨てた滞留フレーム数（stale_dropped）が0でなければ処理落ちしている。
+    loop_seconds_max = 0.0
+    loop_frames = 0
+    last_dropped = 0
+    last_loop = started
     print(
         f"sensor agent: destination={destination[0]}:{destination[1]} "
-        f"sensor={args.sensor_width}x{args.sensor_height}@{args.sensor_fps:g} start_mode={args.start_mode}",
+        f"sensor={args.sensor_width}x{args.sensor_height}@{args.sensor_fps:g} "
+        f"decimate={sensor.capture_decimate} start_mode={args.start_mode}",
         flush=True,
     )
     try:
@@ -135,17 +151,27 @@ def main(argv: Iterable[str] | None = None) -> int:
                 print("event=remote-reselect-player", flush=True)
             state = sensor.read(now)
             sender.send(state, sequence)
+            loop_seconds_max = max(loop_seconds_max, now - last_loop)
+            loop_frames += 1
+            last_loop = now
             if sensor.stage != last_stage:
                 print(f"sensor_stage={sensor.stage}", flush=True)
                 last_stage = sensor.stage
             if now - last_report >= 5.0:
+                dropped = int(getattr(sensor.capture, "dropped", 0))
                 print(
                     f"health sent={sender.sent} stage={sensor.stage} "
                     f"body={int(state.body_present)} lateral={state.lateral} "
-                    f"player={state.player_id} people={state.people_detected}",
+                    f"player={state.player_id} people={state.people_detected} "
+                    f"stale_dropped={dropped - last_dropped} "
+                    f"loop_fps={loop_frames / max(now - last_report, 1e-9):.1f} "
+                    f"loop_max={loop_seconds_max * 1000:.0f}ms",
                     flush=True,
                 )
                 last_report = now
+                last_dropped = dropped
+                loop_frames = 0
+                loop_seconds_max = 0.0
             sequence = (sequence + 1) & 0xFFFFFFFF
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)

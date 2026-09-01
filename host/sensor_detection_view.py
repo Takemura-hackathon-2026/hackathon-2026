@@ -136,6 +136,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             args.jump_rise_y_min,
             args.jump_rise_bottom_min,
             args.depth_min_change_mm,
+            debug_preview=False,
         )
         destinations = args.pi if args.pi else list(DEFAULT_PI)
         if args.send:

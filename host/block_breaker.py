@@ -35,6 +35,10 @@ from test_mode import CANVAS_HEIGHT, CANVAS_WIDTH, PI_COUNT, UdpFrameSender, par
 # 正本 host/palettes.py 内のFC6インデックスだけを使う。
 SKY, SKY_DOT, PADDLE, PADDLE_EDGE, BALL = 0x1C, 0x20, 0x1E, 0x22, FC6_WHITE
 TEXT, DIM = FC6_WHITE, 0x31
+# 通常面のブロック色。developのブロック崩しと同じFC6インデックス列。
+BLOCK_COLORS = (0x00, 0x05, 0x0A, 0x0E, 0x12, 0x16, 0x1E, 0x22, 0x29, 0x2D)
+# MSX16は16色しかないため、隣接する色相・明暗へ手で割り当てる（0=透過は使わない）。
+BLOCK_COLORS_MSX16 = (0x02, 0x06, 0x08, 0x0A, 0x03, 0x0C, 0x07, 0x05, 0x0D, 0x0B)
 
 
 @dataclass(frozen=True)
@@ -56,17 +60,18 @@ class GameColors:
     game_over: int
     prompt: int
     flash: int
+    blocks: tuple[int, ...]
 
 
 GAME_COLORS = {
     PaletteMode.FC6: GameColors(
         SKY, SKY_DOT, PADDLE, PADDLE_EDGE, BALL, TEXT, DIM, FC6_BLACK,
-        0x16, 0x0E, 0x05, 0x12, 0x06, 0x0E, FC6_WHITE,
+        0x16, 0x0E, 0x05, 0x12, 0x06, 0x0E, FC6_WHITE, BLOCK_COLORS,
     ),
     # 近い元色を同じ色へ潰さず、MSX16内で隣接する明暗・色相へ分離する。
     PaletteMode.MSX16: GameColors(
         0x04, 0x05, 0x07, 0x05, 0x0F, 0x0F, 0x0E, 0x01,
-        0x02, 0x0A, 0x08, 0x03, 0x08, 0x0A, 0x0F,
+        0x02, 0x0A, 0x08, 0x03, 0x08, 0x0A, 0x0F, BLOCK_COLORS_MSX16,
     ),
 }
 
@@ -385,6 +390,11 @@ class PersonCandidate:
     depth_gain: float  # 背景との差分mm。大きいほどセンサー手前。
 
 
+# 前景マスクの整形カーネル。毎フレーム作り直さない。
+OPEN_KERNEL = np.ones((3, 3), np.uint8)
+CLOSE_KERNEL = np.ones((7, 7), np.uint8)
+
+
 class ForegroundGate:
     """深度差分から、床・背景変化ではない人物候補を全員ぶん抽出する。"""
 
@@ -460,22 +470,24 @@ class ForegroundGate:
             center_y = float(moments["m01"] / moments["m00"] / height)
             if not (0.04 <= center_x <= 0.96 and 0.04 <= center_y <= 0.96):
                 continue
-            component = np.zeros_like(binary)
-            cv2.drawContours(component, [contour], -1, 255, -1)
-            values = depth_gain[component > 0]
+            # 候補の外接矩形だけで塗る。全画面を毎回ゼロ埋めするとPi3では無視できない。
+            component = np.zeros((box_height, box_width), dtype=np.uint8)
+            cv2.drawContours(component, [contour], -1, 255, -1, offset=(-x, -y))
+            local_component = component > 0
+            values = depth_gain[y:y + box_height, x:x + box_width][local_component]
             if values.size == 0:
                 continue
             median_gain = float(np.median(values))
             if median_gain < max(self.MIN_DEPTH_GAIN_MM, float(threshold) * 0.75):
                 continue
-            local_component = component[y:y + box_height, x:x + box_width] > 0
             upper_height = max(1, int(round(box_height * 0.72)))
-            row_spans: list[int] = []
-            for row in local_component[:upper_height]:
-                columns = np.flatnonzero(row)
-                if columns.size:
-                    row_spans.append(int(columns[-1] - columns[0] + 1))
-            upper_width = max(row_spans, default=0) / width
+            upper = local_component[:upper_height]
+            # 行ごとの最左〜最右の幅。Pythonループだと1フレームに数十回のflatnonzeroになる。
+            occupied = upper.any(axis=1)
+            first = upper.argmax(axis=1)
+            last = upper.shape[1] - 1 - upper[:, ::-1].argmax(axis=1)
+            spans = np.where(occupied, last - first + 1, 0)
+            upper_width = float(spans.max(initial=0)) / width
             candidates.append(
                 PersonCandidate(
                     BodyMeasurement(
@@ -659,10 +671,21 @@ class SensorController:
         start_upper_width_gain: float = 0.04,
         start_upper_width_min: float = 0.30,
         start_area_gain: float = 0.05,
+        debug_preview: bool = True,
+        capture_decimate: int = 1,
     ) -> None:
         if start_mode not in ("still", "passby", "arm-circle"):
             raise ValueError("開始モードはstill、passby、arm-circleのいずれか")
-        self.capture = capture if capture is not None else StructureSensorSource(width, height, capture_fps)
+        # ROIは取得解像度の座標で指定されるため、間引くと意味が変わる。両立させない。
+        self.capture_decimate = 1 if roi is not None else max(1, int(capture_decimate))
+        self.capture = (
+            capture
+            if capture is not None
+            else StructureSensorSource(width, height, capture_fps, decimate=self.capture_decimate)
+        )
+        # 表示しない経路（sensor_agent）でプレビューを描くと、1フレームの処理が
+        # 取得周期を超えて入力遅延になる。描画は見る側だけが有効にする。
+        self.debug_preview = bool(debug_preview)
         self.start_mode = start_mode
         self.background_seconds = max(.2, background_seconds)
         self.min_area = max(1, min_area)
@@ -750,8 +773,8 @@ class SensorController:
             nearer = background - depth
             threshold = max(60.0, self.depth_noise_p95 * 3.0, self.depth_min_change_mm)
             mask = ((valid & (nearer >= threshold)).astype(np.uint8) * 255)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, OPEN_KERNEL)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, CLOSE_KERNEL)
             candidates, mask = self.foreground_gate.detect_all(mask, nearer, threshold)
         if background_phase:
             self.person_tracker.reset()
@@ -766,22 +789,24 @@ class SensorController:
         accepted_mask = np.zeros_like(mask)
         if body is not None and contour is not None:
             cv2.drawContours(accepted_mask, [contour], -1, 255, -1)
-        debug = depth_preview(image)
-        for candidate in candidates:
-            cv2.drawContours(debug, [candidate.contour], -1, (255, 170, 0), 1)
-        if body is not None and contour is not None:
-            cv2.drawContours(debug, [contour], -1, (0, 255, 0), 1)
-            cv2.putText(
-                debug,
-                f"P{active.track_id}/{people_detected}",
-                (max(0, int(body.x * width) - 20), max(30, int(body.y * height) - 8)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                .42,
-                (0, 255, 0),
-                1,
-                cv2.LINE_AA,
-            )
-        cv2.putText(debug, self.stage, (6, 18), cv2.FONT_HERSHEY_SIMPLEX, .55, (0, 230, 230), 1, cv2.LINE_AA)
+        debug: np.ndarray | None = None
+        if self.debug_preview:
+            debug = depth_preview(image)
+            for candidate in candidates:
+                cv2.drawContours(debug, [candidate.contour], -1, (255, 170, 0), 1)
+            if body is not None and contour is not None:
+                cv2.drawContours(debug, [contour], -1, (0, 255, 0), 1)
+                cv2.putText(
+                    debug,
+                    f"P{active.track_id}/{people_detected}",
+                    (max(0, int(body.x * width) - 20), max(30, int(body.y * height) - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    .42,
+                    (0, 255, 0),
+                    1,
+                    cv2.LINE_AA,
+                )
+            cv2.putText(debug, self.stage, (6, 18), cv2.FONT_HERSHEY_SIMPLEX, .55, (0, 230, 230), 1, cv2.LINE_AA)
         self.debug, self.mask, self.accepted_mask = debug, mask, accepted_mask
         if background_phase:
             return InputState()
@@ -819,6 +844,15 @@ class SensorController:
             cv2.imshow("block breaker depth", self.debug)
         if self.mask is not None:
             cv2.imshow("block breaker foreground mask", self.mask)
+
+
+@dataclass
+class Block:
+    x: float
+    y: float
+    width: float
+    height: float
+    color: int
 
 
 @dataclass
@@ -969,8 +1003,12 @@ class BlockBreaker:
     boss_transition_duration = .48  # 3回の点滅（点灯・消灯を3周期）
     boss_move_speed = 52.0
     clear_delay = 1.8
+    stage_clear_delay = 1.8
 
-    def __init__(self) -> None:
+    def __init__(self, start_phase: str = "classic") -> None:
+        if start_phase not in ("classic", "boss"):
+            raise ValueError("開始フェーズはclassicかboss")
+        self.start_phase = start_phase
         sprite, mask = load_boss_sprite()
         size = (round(sprite.shape[1] * self.boss_scale), round(sprite.shape[0] * self.boss_scale))
         self.boss_sprite = cv2.resize(sprite, size, interpolation=cv2.INTER_NEAREST)
@@ -999,6 +1037,13 @@ class BlockBreaker:
         self.boss_move_vx = self.boss_move_speed
         self.clear_remaining = 0.0
         self.game_over_until = 0.0
+        # 通常面（ブロック崩し）→ ボス戦の2フェーズ。正本はdevelopのブロック崩し。
+        self.phase = start_phase
+        self.level = 1
+        self.score = 0
+        self.blocks: list[Block] = []
+        self.stage_clear_remaining = 0.0
+        self.stage_start_request = False
         self.reset(full=True)
 
     def reset(self, full: bool = False) -> None:
@@ -1018,10 +1063,78 @@ class BlockBreaker:
             self.boss_move_vx = self.boss_move_speed
             self.clear_remaining = 0.0
             self.game_over_until = 0.0
+            self.phase = self.start_phase
+            self.level = 1
+            self.score = 0
+            self.stage_clear_remaining = 0.0
+            self.stage_start_request = False
+            self.blocks = self._make_blocks() if self.phase == "classic" else []
         self.paddle_x = (CANVAS_WIDTH - self.paddle_width) / 2
         self.serving = True
         self.boss_collision_armed = False
+        if self.phase == "classic":
+            self._place_ball_on_paddle()
+        else:
+            self._place_ball_at_mouth()
+
+    def _make_blocks(self) -> list[Block]:
+        """developのブロック配置をそのまま使う。"""
+        columns, rows, margin, gap = 8, min(10, 5 + self.level), 8, 2
+        width = (CANVAS_WIDTH - margin * 2 - gap * (columns - 1)) / columns
+        return [
+            Block(
+                margin + column * (width + gap),
+                48 + row * 14,
+                width,
+                12,
+                BLOCK_COLORS[(row + column + self.level - 1) % len(BLOCK_COLORS)],
+            )
+            for row in range(rows)
+            for column in range(columns)
+        ]
+
+    def _place_ball_on_paddle(self) -> None:
+        self.ball = Ball(self.paddle_x + self.paddle_width / 2, self.paddle_y - self.ball_radius - 1)
+
+    def _hit_block(self, block: Block) -> bool:
+        """developのブロック当たり判定。近点との距離で面を選んで反射する。"""
+        ball = self.ball
+        near_x = min(max(ball.x, block.x), block.x + block.width)
+        near_y = min(max(ball.y, block.y), block.y + block.height)
+        dx, dy = ball.x - near_x, ball.y - near_y
+        if dx * dx + dy * dy > self.ball_radius ** 2:
+            return False
+        if abs(dx) > abs(dy):
+            ball.vx = -ball.vx
+        else:
+            ball.vy = -ball.vy
+        return True
+
+    def _enter_boss_stage(self) -> None:
+        """通常面クリア後、ボス戦を初期状態から始める。"""
+        self.phase = "boss"
+        self.blocks = []
+        self.stage_clear_remaining = 0.0
+        self.boss_hp = self.boss_max_hp
+        self.boss_defeated = False
+        self.boss_x = (CANVAS_WIDTH - self.boss_width) / 2
+        self.boss_transition_remaining = 0.0
+        self.boss_move_active = False
+        self.boss_move_vx = self.boss_move_speed
+        self.damage_effect_remaining = 0.0
+        self.clear_remaining = 0.0
+        self.serving = True
+        self.boss_collision_armed = False
+        self.ball.vx = self.ball.vy = 0.0
         self._place_ball_at_mouth()
+        # 新しい面の1球目も、通常のミス後と同じく開始待ちにする。
+        self.stage_start_request = True
+
+    def consume_stage_start_request(self) -> bool:
+        """ボス戦へ移った直後の開始待ちを一度だけ取得する。"""
+        request = self.stage_start_request
+        self.stage_start_request = False
+        return request
 
     def _place_ball_at_mouth(self) -> None:
         self.ball = Ball(
@@ -1035,6 +1148,11 @@ class BlockBreaker:
         self.life_loss_feedback_active = False
         self.life_loss_blink_elapsed = 0.0
         self.life_loss_slot = -1
+        if self.phase == "classic":
+            # developの発射角と速度。
+            speed = self.initial_speed + (self.level - 1) * 13
+            self.ball.vx, self.ball.vy = speed * .52, -speed * .86
+            return
         # ボスの口元からプレイヤー側へ飛び出す角度。
         self.ball.vx, self.ball.vy = self.initial_speed * .80, self.initial_speed * .60
 
@@ -1126,7 +1244,10 @@ class BlockBreaker:
         self.serving = True
         self.boss_collision_armed = False
         self.ball.vx = self.ball.vy = 0.0
-        self._place_ball_at_mouth()
+        if self.phase == "classic":
+            self._place_ball_on_paddle()
+        else:
+            self._place_ball_at_mouth()
 
     def consume_life_loss_event(self) -> bool:
         """残機が残るミスを一度だけ取得する。ゲームオーバーではFalse。"""
@@ -1134,8 +1255,82 @@ class BlockBreaker:
         self.life_loss_event = False
         return event
 
+    def _move_paddle(self, dt: float, controls: GameInput) -> None:
+        if controls.paddle_center_x is not None and math.isfinite(float(controls.paddle_center_x)):
+            self.paddle_x = min(
+                max(0.0, float(controls.paddle_center_x) - self.paddle_width / 2),
+                CANVAS_WIDTH - self.paddle_width,
+            )
+        else:
+            self.paddle_x = min(
+                max(0.0, self.paddle_x + max(-1, min(1, controls.lateral)) * self.paddle_speed * dt),
+                CANVAS_WIDTH - self.paddle_width,
+            )
+
+    def _bounce_edges(self, ball: Ball) -> None:
+        """左右の壁・天井・パドルの反射。通常面とボス戦で共通。"""
+        if ball.x - self.ball_radius < 0 or ball.x + self.ball_radius >= CANVAS_WIDTH:
+            ball.x = min(max(self.ball_radius, ball.x), CANVAS_WIDTH - self.ball_radius - 1)
+            ball.vx = -ball.vx
+        if ball.y - self.ball_radius < 26:
+            ball.y, ball.vy = 26 + self.ball_radius, abs(ball.vy)
+        if (
+            ball.vy > 0
+            and ball.y + self.ball_radius >= self.paddle_y
+            and ball.y - self.ball_radius <= self.paddle_y + self.paddle_height
+            and self.paddle_x - self.ball_radius <= ball.x <= self.paddle_x + self.paddle_width + self.ball_radius
+        ):
+            ball.y = self.paddle_y - self.ball_radius - 1
+            hit = (ball.x - (self.paddle_x + self.paddle_width / 2)) / (self.paddle_width / 2)
+            speed = min(300, math.hypot(ball.vx, ball.vy) * 1.015)
+            ball.vx = speed * hit * .92
+            ball.vy = -max(80, math.sqrt(max(1, speed * speed - ball.vx * ball.vx)))
+
+    def _step_classic(self, dt: float, controls: GameInput, now: float) -> None:
+        """developのブロック崩し1面。全消しでボス戦へ移る。"""
+        if self.life_loss_feedback_active:
+            self.life_loss_blink_elapsed += dt
+        if self.stage_clear_remaining > 0.0:
+            self.stage_clear_remaining = max(0.0, self.stage_clear_remaining - dt)
+            if self.stage_clear_remaining == 0.0:
+                self._enter_boss_stage()
+            return
+        if self.game_over_until:
+            if now >= self.game_over_until:
+                self.game_over_until = 0.0
+                self.reset(full=True)
+            return
+        self._move_paddle(dt, controls)
+        if self.serving:
+            self._place_ball_on_paddle()
+            if controls.launch:
+                self._launch()
+            return
+        steps = max(1, min(8, math.ceil(math.hypot(self.ball.vx * dt, self.ball.vy * dt) / 2)))
+        for _ in range(steps):
+            ball = self.ball
+            ball.x += ball.vx * dt / steps
+            ball.y += ball.vy * dt / steps
+            self._bounce_edges(ball)
+            for index, block in enumerate(self.blocks):
+                if self._hit_block(block):
+                    del self.blocks[index]
+                    self.score += 10 * self.level
+                    break
+            if not self.blocks:
+                self.serving = True
+                ball.vx = ball.vy = 0.0
+                self.stage_clear_remaining = self.stage_clear_delay
+                return
+            if ball.y - self.ball_radius > CANVAS_HEIGHT:
+                self._lose_ball(now)
+                return
+
     def step(self, dt: float, controls: GameInput, now: float) -> None:
         dt = min(.04, max(0.0, dt))
+        if self.phase == "classic":
+            self._step_classic(dt, controls, now)
+            return
         self.damage_effect_remaining = max(0.0, self.damage_effect_remaining - dt)
         if self.life_loss_feedback_active:
             self.life_loss_blink_elapsed += dt
@@ -1162,16 +1357,7 @@ class BlockBreaker:
             return
         if self.boss_defeated:
             return
-        if controls.paddle_center_x is not None and math.isfinite(float(controls.paddle_center_x)):
-            self.paddle_x = min(
-                max(0.0, float(controls.paddle_center_x) - self.paddle_width / 2),
-                CANVAS_WIDTH - self.paddle_width,
-            )
-        else:
-            self.paddle_x = min(
-                max(0.0, self.paddle_x + max(-1, min(1, controls.lateral)) * self.paddle_speed * dt),
-                CANVAS_WIDTH - self.paddle_width,
-            )
+        self._move_paddle(dt, controls)
         if self.serving:
             self._place_ball_at_mouth()
             if controls.launch:
@@ -1182,17 +1368,7 @@ class BlockBreaker:
             ball = self.ball
             ball.x += ball.vx * dt / steps
             ball.y += ball.vy * dt / steps
-            if ball.x - self.ball_radius < 0 or ball.x + self.ball_radius >= CANVAS_WIDTH:
-                ball.x = min(max(self.ball_radius, ball.x), CANVAS_WIDTH - self.ball_radius - 1)
-                ball.vx = -ball.vx
-            if ball.y - self.ball_radius < 26:
-                ball.y, ball.vy = 26 + self.ball_radius, abs(ball.vy)
-            if ball.vy > 0 and ball.y + self.ball_radius >= self.paddle_y and ball.y - self.ball_radius <= self.paddle_y + self.paddle_height and self.paddle_x - self.ball_radius <= ball.x <= self.paddle_x + self.paddle_width + self.ball_radius:
-                ball.y = self.paddle_y - self.ball_radius - 1
-                hit = (ball.x - (self.paddle_x + self.paddle_width / 2)) / (self.paddle_width / 2)
-                speed = min(300, math.hypot(ball.vx, ball.vy) * 1.015)
-                ball.vx = speed * hit * .92
-                ball.vy = -max(80, math.sqrt(max(1, speed * speed - ball.vx * ball.vx)))
+            self._bounce_edges(ball)
             if self._hit_boss():
                 return
             if ball.y - self.ball_radius > CANVAS_HEIGHT:
@@ -1218,14 +1394,18 @@ class BlockBreaker:
         frame = np.full((CANVAS_HEIGHT, CANVAS_WIDTH), colors.sky, np.uint8)
         for index in range(30):
             frame[30 + (index * 71 + 13) % 300, (index * 47 + 19) % CANVAS_WIDTH] = colors.sky_dot
-        # 左上はボスHP、右上は残機。HPは現在値に応じて動的に縮む。
-        hp_x, hp_y, hp_width, hp_height = 7, 7, 143, 10
-        frame[hp_y:hp_y + hp_height, hp_x:hp_x + hp_width] = colors.text
-        frame[hp_y + 2:hp_y + hp_height - 2, hp_x + 2:hp_x + hp_width - 2] = colors.black
-        fill = round((hp_width - 4) * self.boss_hp / self.boss_max_hp)
-        if fill:
-            hp_color = colors.hp_high if self.boss_hp > 50 else colors.hp_mid if self.boss_hp > 20 else colors.hp_low
-            frame[hp_y + 2:hp_y + hp_height - 2, hp_x + 2:hp_x + 2 + fill] = hp_color
+        if self.phase == "classic":
+            # 通常面の左上はdevelopと同じスコア表示。
+            self._text(frame, f"SCORE {self.score:05d}", (6, 17), colors.text, .38)
+        else:
+            # ボス戦の左上はボスHP。現在値に応じて動的に縮む。
+            hp_x, hp_y, hp_width, hp_height = 7, 7, 143, 10
+            frame[hp_y:hp_y + hp_height, hp_x:hp_x + hp_width] = colors.text
+            frame[hp_y + 2:hp_y + hp_height - 2, hp_x + 2:hp_x + hp_width - 2] = colors.black
+            fill = round((hp_width - 4) * self.boss_hp / self.boss_max_hp)
+            if fill:
+                hp_color = colors.hp_high if self.boss_hp > 50 else colors.hp_mid if self.boss_hp > 20 else colors.hp_low
+                frame[hp_y + 2:hp_y + hp_height - 2, hp_x + 2:hp_x + 2 + fill] = hp_color
         active_play = not self.serving and not self.boss_defeated and not self.game_over_until
         show_lives = self.game_started and not self.boss_defeated and not self.game_over_until
         if show_lives:
@@ -1237,16 +1417,23 @@ class BlockBreaker:
                     cv2.circle(frame, (164 + self.life_loss_slot * 11, 12), 3, colors.text, 1, lineType=cv2.LINE_8)
         frame[22:24, :] = colors.dim
 
+        if self.phase == "classic":
+            for block in self.blocks:
+                x0, y0 = int(round(block.x)), int(round(block.y))
+                x1, y1 = int(round(block.x + block.width)), int(round(block.y + block.height))
+                frame[y0:y1, x0:x1] = colors.blocks[BLOCK_COLORS.index(block.color)]
+                frame[y0:y0 + 2, x0:x1] = colors.text
         boss_x, boss_y = int(self.boss_x), int(self.boss_y)
         boss_region = frame[boss_y:boss_y + self.boss_height, boss_x:boss_x + self.boss_width]
         boss_sprite = self.boss_sprite if palette_mode == PaletteMode.FC6 else self.boss_sprite_msx16
-        boss_region[self.boss_mask] = boss_sprite[self.boss_mask]
-        if self.boss_transition_remaining > 0.0:
+        if self.phase != "classic":
+            boss_region[self.boss_mask] = boss_sprite[self.boss_mask]
+        if self.phase != "classic" and self.boss_transition_remaining > 0.0:
             # 点灯→消灯を3周期。点滅中はボスの位置を固定する。
             phase = int((self.boss_transition_duration - self.boss_transition_remaining) / (self.boss_transition_duration / 6))
             if phase in (0, 2, 4):
                 boss_region[self.boss_mask] = colors.flash
-        elif self.damage_effect_remaining > 0.0:
+        elif self.phase != "classic" and self.damage_effect_remaining > 0.0:
             # 点灯→消灯→点灯→消灯の4区間で、ボスを2回だけ点滅させる。
             phase = int((self.damage_effect_duration - self.damage_effect_remaining) / (self.damage_effect_duration / 4))
             if phase in (0, 2):
@@ -1254,9 +1441,12 @@ class BlockBreaker:
         x = int(round(self.paddle_x))
         frame[int(self.paddle_y):int(self.paddle_y + self.paddle_height), x:x + int(self.paddle_width)] = colors.paddle
         frame[int(self.paddle_y):int(self.paddle_y + 2), x:x + int(self.paddle_width)] = colors.paddle_edge
-        if active_play:
+        # 通常面は待機中もパドル上のボールを見せる（developと同じ）。
+        if active_play or (self.phase == "classic" and self.stage_clear_remaining <= 0.0 and not self.game_over_until):
             cv2.circle(frame, (int(round(self.ball.x)), int(round(self.ball.y))), int(self.ball_radius), colors.ball, -1, lineType=cv2.LINE_8)
-        if self.boss_defeated:
+        if self.stage_clear_remaining > 0.0:
+            self._text(frame, "STAGE CLEAR", (30, 228), colors.clear, .62)
+        elif self.boss_defeated:
             self._text(frame, "BOSS DOWN", (39, 228), colors.clear, .68)
         elif self.game_over_until:
             self._text(frame, "GAME OVER", (43, 228), colors.game_over, .72)
@@ -1317,6 +1507,12 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--sensor-width", type=int, default=640)
     result.add_argument("--sensor-height", type=int, default=480)
     result.add_argument("--sensor-background-seconds", type=float, default=2.0)
+    result.add_argument(
+        "--capture-decimate",
+        type=int,
+        default=1,
+        help="深度をN画素おきに間引いて取得（既定1。ROI指定時は無効。ヘルパーの再ビルドが必要）",
+    )
     result.add_argument("--min-foreground-area", type=int, default=420)
     result.add_argument("--depth-min-change-mm", type=float, default=0.0, help="深度の手前側変化量。0は背景ノイズから自動決定")
     result.add_argument("--roi", type=parse_roi, default=None, help="検出ROI x,y,width,height")
@@ -1479,6 +1675,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         or args.position_deadzone < 0
         or not 0.0 < args.position_gain <= 1.0
         or args.input_timeout <= 0
+        or not 1 <= args.capture_decimate <= 16
         or (args.send and len(args.pi) != PI_COUNT)
     ):
         print("error: --fps/--preview-scale/--jump-rise-* または --pi の指定が不正", file=sys.stderr)
@@ -1521,6 +1718,8 @@ def main(argv: Iterable[str] | None = None) -> int:
                 start_upper_width_gain=start_upper_width_gain,
                 start_upper_width_min=start_upper_width_min,
                 start_area_gain=start_area_gain,
+                debug_preview=not args.no_preview and args.debug_depth,
+                capture_decimate=args.capture_decimate,
             )
         sender = UdpFrameSender([parse_pi(value) for value in args.pi], args.chunk_size) if args.send else None
     except (RuntimeError, ValueError) as exc:
@@ -1654,6 +1853,18 @@ def main(argv: Iterable[str] | None = None) -> int:
                 ),
                 now,
             )
+            if game.consume_stage_start_request():
+                # 通常面クリア後のボス戦1球目も、ミス後と同じ開始待ちに揃える。
+                countdown_remaining = 0.0
+                awaiting_player_hold = True
+                if sensor is not None:
+                    sensor.reselect_player()
+                    print("event=stage-clear next=boss select=front-player wait=still-hold", flush=True)
+                elif sensor_control_sender is not None:
+                    sensor_control_sender.reselect_player()
+                    print("event=stage-clear next=boss remote-select=front-player wait=still-hold", flush=True)
+                else:
+                    print("event=stage-clear next=boss wait=manual-launch", flush=True)
             if game.consume_life_loss_event():
                 countdown_remaining = 0.0
                 if sensor is not None:
