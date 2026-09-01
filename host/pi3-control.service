@@ -7,7 +7,7 @@ After=network-online.target
 Type=simple
 User=takemuralab
 WorkingDirectory=/home/takemuralab/hackathon-2026
-ExecStart=/home/takemuralab/hackathon-2026/.venv/bin/python host/block_breaker.py --input-bind 0.0.0.0:5200 --input-timeout 0.50 --sensor-control 192.168.50.33:5201 --start-mode still --send --no-preview --fps 30 --palette msx16 --pi 192.168.10.101:5000 --pi 192.168.10.102:5000 --pi 192.168.10.103:5000 --pi 192.168.10.104:5000
+ExecStart=/home/takemuralab/hackathon-2026/.venv/bin/python host/block_breaker.py --input-bind 0.0.0.0:5200 --input-timeout 0.50 --sensor-control 192.168.50.33:5201 --start-mode still --play-range 0.15,0.85 --position-gain 0.9 --send --no-preview --fps 60 --palette msx16 --pi 192.168.10.101:5000 --pi 192.168.10.104:5000 --pi 192.168.10.102:5000
 Restart=on-failure
 RestartSec=2
 

@@ -3,7 +3,7 @@
 
 FC6 52 色 / MSX16 16 色を 192x384 の論理画面へ並べ、主機プレビューと
 LED 実機表示のインデックス一致を目視確認するための静止パターンを出す。
-インデックスは左上から行優先で並び、Pi 境界（Y=96/192/288）に区切り線を引く。
+インデックスは左上から行優先で並び、Pi 境界（Y=128/256）に区切り線を引く。
 """
 from __future__ import annotations
 
@@ -100,7 +100,7 @@ def main() -> int:
     sender = None
     if args.send:
         if len(args.pi) != PI_COUNT:
-            print("error: --send には --pi をちょうど 4 個指定する", file=sys.stderr)
+            print(f"error: --send には --pi をちょうど {PI_COUNT} 個指定する", file=sys.stderr)
             return 2
         sender = UdpFrameSender([parse_pi(item) for item in args.pi], args.chunk_size)
 

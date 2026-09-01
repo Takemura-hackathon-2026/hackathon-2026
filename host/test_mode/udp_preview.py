@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Development-only UDP receiver that reconstructs four Pi slices on one PC."""
+"""Development-only UDP receiver that reconstructs three Pi slices on one PC."""
 from __future__ import annotations
 
 import argparse
@@ -19,7 +19,7 @@ if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 from palettes import FC6, MSX16, PaletteMode  # noqa: E402
 
-WIDTH, HEIGHT, PI_HEIGHT = 192, 384, 96
+WIDTH, HEIGHT, PI_COUNT, PI_HEIGHT = 192, 384, 3, 128
 MAGIC = 0x524C4544
 HEADER = struct.Struct("!IIBBHHHI")
 
@@ -54,7 +54,7 @@ def main() -> int:
                 payload = packet[HEADER.size:]
                 if (
                     magic == MAGIC
-                    and 0 <= target < 4
+                    and 0 <= target < PI_COUNT
                     and mode in (0, 1)
                     and len(payload) == size
                     and zlib.crc32(payload) & 0xFFFFFFFF == crc
@@ -77,8 +77,8 @@ def main() -> int:
                     meta.pop(key, None)
                     chunks.pop(key, None)
 
-            # Only display a frame when all four slices have exactly the same frame_id/mode.
-            if len(slices) == 4:
+            # Only display a frame when all three slices have exactly the same frame_id/mode.
+            if len(slices) == PI_COUNT:
                 frame_ids = {item[0] for item in slices.values()}
                 modes = {item[1] for item in slices.values()}
                 if len(frame_ids) == 1 and len(modes) == 1:
@@ -87,7 +87,7 @@ def main() -> int:
                     if frame_id > latest_complete:
                         indexed = np.vstack([
                             np.frombuffer(slices[i][2], dtype=np.uint8).reshape(PI_HEIGHT, WIDTH)
-                            for i in range(4)
+                            for i in range(PI_COUNT)
                         ])
                         palette = FC6 if mode == int(PaletteMode.FC6) else MSX16
                         lut = np.asarray([entry[:3] for entry in palette], dtype=np.uint8)
@@ -98,7 +98,7 @@ def main() -> int:
                                 (WIDTH * args.scale, HEIGHT * args.scale),
                                 interpolation=cv2.INTER_NEAREST,
                             )
-                            cv2.imshow("UDP four-Pi preview", image)
+                            cv2.imshow("UDP three-Pi preview", image)
                             latest_complete = frame_id
 
             key = cv2.waitKey(1) & 0xFF

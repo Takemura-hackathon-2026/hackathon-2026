@@ -1228,7 +1228,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--background-frames", type=int, default=15)
     parser.add_argument("--min-samples", type=int, default=8)
     parser.add_argument("--output", type=Path, default=Path("camera_calibration.json"))
-    parser.add_argument("--send", action="store_true", help="既存UdpFrameSenderで4台へ送る")
+    parser.add_argument("--send", action="store_true", help=f"既存UdpFrameSenderで{PI_COUNT}台へ送る")
     parser.add_argument("--pi", action="append", default=None, metavar="HOST[:PORT]")
     parser.add_argument("--chunk-size", type=int, default=1200)
     parser.add_argument("--preview", action="store_true", help="OpenCVプレビューを表示")
@@ -1285,10 +1285,10 @@ def run_sensor(args: argparse.Namespace) -> int:
         source = SensorSource(args.sensor_width, args.sensor_height, args.sensor_fps)
         if args.send:
             values = args.pi if args.pi is not None else [
-                "192.168.10.101:5000", "192.168.10.102:5000", "192.168.10.103:5000", "192.168.10.104:5000"
+                "192.168.10.101:5000", "192.168.10.104:5000", "192.168.10.102:5000"
             ]
             if len(values) != PI_COUNT:
-                raise ValueError("--send時の--piはちょうど4個")
+                raise ValueError(f"--send時の--piはちょうど{PI_COUNT}個")
             sender = UdpFrameSender([parse_pi(value) for value in values], args.chunk_size)
         for signum in (signal.SIGINT, signal.SIGTERM):
             old_handlers[signum] = signal.getsignal(signum)

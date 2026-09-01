@@ -3,7 +3,7 @@
 
 実行すると 0 errors で終了することを完了条件とする。
   - 送出インデックスが選択パレットの範囲内か（FC6: 0x00-0x33 / MSX16: 0x01-0x0F）
-  - 192x384 が 192x96 の 4 スライスへ正しく分割されるか
+  - 192x384 が 192x128 の 3 スライスへ正しく分割されるか
   - UDP ヘッダー + CRC32 が往復で一致するか
   - 巡回表が開始番号から最終番号までの連番か
   - 反射移動が論理画面外へ出ないか
@@ -137,7 +137,7 @@ def check_slices(errors: list[str]) -> None:
             errors.append(f"target {target_id}: スライス長 {len(payload)}")
         rebuilt.append(np.frombuffer(payload, dtype=np.uint8).reshape(PI_HEIGHT, CANVAS_WIDTH))
     if not np.array_equal(np.vstack(rebuilt), frame):
-        errors.append("4 スライス再結合が元フレームと一致しない")
+        errors.append("3 スライス再結合が元フレームと一致しない")
 
 
 def check_header_roundtrip(errors: list[str]) -> None:

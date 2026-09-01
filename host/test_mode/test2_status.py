@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """TEST2: 主機と各 Pi の状況を文字で交互に表示する。
 
-192x384 の論理画面へ 1 ページずつ状態を描き、主機 → PI1 → PI2 → PI3 → PI4 →
-主機 … と切り替えながら 4 台へ送る。文字はパレット登録色のみで描画する。
+192x384 の論理画面へ 1 ページずつ状態を描き、主機 → PI1 → PI2 → PI3 →
+主機 … と切り替えながら 3 台へ送る。文字はパレット登録色のみで描画する。
 
 各 Pi の情報は `pi_client` が UDP 5101 へ 1 秒ごとに送る死活報告から得る。
 報告が途絶えた Pi は NO SIGNAL として表示する。
@@ -268,7 +268,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     sender: UdpFrameSender | None = None
     if args.send:
         if len(destinations) != PI_COUNT:
-            print("error: --send には --pi をちょうど 4 個指定する", file=sys.stderr)
+            print(f"error: --send には --pi をちょうど {PI_COUNT} 個指定する", file=sys.stderr)
             return 2
         sender = UdpFrameSender(destinations, args.chunk_size, profiler)
 
@@ -293,7 +293,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     fps_window_start = next_deadline
     fps_window_frames = 0
     send_fps = 0.0
-    page_count = 1 + PI_COUNT  # HOST + PI1..PI4
+    page_count = 1 + PI_COUNT  # HOST + PI1..PI3
 
     print(
         f"TEST2: palette={palette_mode.name} page={args.page_seconds:g}s "

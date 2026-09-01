@@ -1,16 +1,16 @@
 # RGB LED マトリックス縦型インタラクティブゲーム（hackathon-2026）
 
 32×32 RGB LED パネル 72 枚（6列×12段、論理解像度 192×384）を、Ubuntu 主機の集中処理と
-Raspberry Pi 4 台の外部同期で駆動する縦型ディスプレー・ゲームのリポジトリ。
+Raspberry Pi 3 台の外部同期で駆動する縦型ディスプレー・ゲームのリポジトリ。
 
 現在の内容は表示経路の検証に加え、**主機側のブロック崩し試作**を含む。計画書 §13 の実装開始条件のうち
-1〜3（DVD テストモード、FC6 全色パターン、MSX16 全色パターン）とその 4 分割 UDP 送信、
+1〜3（DVD テストモード、FC6 全色パターン、MSX16 全色パターン）とその 3 分割 UDP 送信、
 加えて主機側テストモード 4 種（TEST1〜4）と Pi 常駐表示クライアントの同期段階 A
 （受信 → CRC 確認 → LUT 変換 → HUB75 出力）までを実装済み。
 
 `host/block_breaker.py` は、既定でSTRUCTURE Sensorの深度背景差分による
 `LEFT` / `RIGHT` / `JUMP` 判定、待機中を含む人物位置へのパドル追従、192×384のFC6描画、既存UDP経路への
-4分割送信を主機だけで行う。ゲームは通常面のブロック崩しと、それをクリアした後の
+3分割送信を主機だけで行う。ゲームは通常面のブロック崩しと、それをクリアした後の
 画像キャラクターを倒すボス戦の2段構成で、センサーに映る人物にバーが追従する。
 待機画面では、追従対象の人物が横位置をほぼ変えず3秒間静止すると、さらに3秒のカウントダウン後に
 ボールを発射する（通常面はパドル上から、ボス戦はボスの口元から）。複数人が映る開始時は、最もセンサー手前の人を操作対象としてロックし、
@@ -46,8 +46,8 @@ cd host/test_mode && python3 test_mode.py --render-mode mask --color-style solid
 
 ## ホスト常時起動の待機表示
 
-`host/standby.py` は、現在時刻と主機温度、Pi1〜Pi4の温度を192×384の縦画面へ表示し、
-4台のPiへ繰り返し送信する。`--mode palette`ではFC6全52色を左上から8×8のタイルへ
+`host/standby.py` は、現在時刻と主機温度、Pi1〜Pi3の温度を192×384の縦画面へ表示し、
+3台のPiへ繰り返し送信する。`--mode palette`ではFC6全52色を左上から8×8のタイルへ
 並べた市松状グラデーション、`--mode logo`では`host/test_mode/single-eye-catch_2800x1040.png`
 のロゴ領域を表示する。
 
@@ -96,13 +96,13 @@ host/oyaki_camera_calibrate.sh standby-stop
 │   ├── jump_detector.py         # ジャンプ判定専用CLI
 │   ├── standby.py                # 時刻・主機/Pi温度を表示する192x384縦画面のホスト常時起動
 │   └── test_mode/
-│       ├── test_mode.py        # TEST1: WebP を DVD ロゴ風に反射移動・量子化・4分割 UDP 送信
+│       ├── test_mode.py        # TEST1: WebP を DVD ロゴ風に反射移動・量子化・3分割 UDP 送信
 │       ├── single-eye-catch_2800x1040.png # 常時起動時の既定ロゴ素材
 │       ├── test2_status.py     # TEST2: 主機と各 Pi の状態を文字で交互表示（死活受信付き）
-│       ├── test3_quad.py       # TEST3: 4帯それぞれへ同じ画像を出す個体確認モード
-│       ├── test4_super.py      # TEST4(SUPERTESTMODE): 斜めN字配置の仮想画面 576×192
+│       ├── test3_quad.py       # TEST3: 3帯それぞれへ同じ画像を出す個体確認モード
+│       ├── test4_super.py      # TEST4: 旧4台特殊配置のローカル確認（現行構成では送信不可）
 │       ├── palette_check.py    # 全色テストパターン
-│       ├── udp_preview.py      # 1台PCで4領域を再結合する開発用プレビュー
+│       ├── udp_preview.py      # 1台PCで3領域を再結合する開発用プレビュー
 │       ├── selftest.py         # 機械的検証（0 errors が完了条件）
 │       ├── test.webp           # 動作確認用素材（64×64）
 │       └── color_bar.webp      # TEST3 の既定素材（カラーバー）
@@ -146,15 +146,15 @@ sudo apt install python3-numpy python3-opencv
 
 ## テストモード
 
-主機側に 4 種類のテストモードがある。いずれも `--send --pi ...`（4 個）で 4 台の Pi へ送信でき、
+主機側に 4 種類のテストモードがある。現行の送信モードは `--send --pi ...`（3 個）で 3 台の Pi へ送信でき、
 省略するとローカルプレビューのみになる。
 
 | モード | スクリプト | 内容 | 主な確認対象 |
 |---|---|---|---|
-| TEST1 | `test_mode.py` | WebP を 192×384 内で DVD ロゴ風に反射移動 | パレット量子化・4分割・伝送経路 |
-| TEST2 | `test2_status.py` | 主機 → PI1 → … → PI4 とページを切り替えて状態を文字表示 | 各 Pi の死活・FPS・欠損（UDP 5101 の報告） |
-| TEST3 | `test3_quad.py` | 192×96 の 4 帯すべてへ同じ画像を描く | 1 台ごとの色再現・向き・欠け |
-| TEST4 | `test4_super.py` | 斜めN字配置の仮想画面 576×192 で反射移動 | 縦一列でない物理配置の割り当て |
+| TEST1 | `test_mode.py` | WebP を 192×384 内で DVD ロゴ風に反射移動 | パレット量子化・3分割・伝送経路 |
+| TEST2 | `test2_status.py` | 主機 → PI1 → … → PI3 とページを切り替えて状態を文字表示 | 各 Pi の死活・FPS・欠損（UDP 5101 の報告） |
+| TEST3 | `test3_quad.py` | 192×128 の 3 帯すべてへ同じ画像を描く | 1 台ごとの色再現・向き・欠け |
+| TEST4 | `test4_super.py` | 旧4台特殊配置の仮想画面でローカル確認（送信不可） | 非標準配置の割り当て検証 |
 
 TEST1（DVD テストモード）:
 
@@ -166,11 +166,11 @@ TEST2（状態表示。各 Pi の死活報告を UDP 5101 で受ける）:
 
 ```bash
 cd host/test_mode && python3 test2_status.py --send \
-  --pi 192.168.10.101:5000 --pi 192.168.10.102:5000 \
-  --pi 192.168.10.103:5000 --pi 192.168.10.104:5000
+  --pi 192.168.10.101:5000 --pi 192.168.10.104:5000 \
+  --pi 192.168.10.102:5000
 ```
 
-TEST3（4 帯へ同じ画像。既定素材は `color_bar.webp`）:
+TEST3（3 帯へ同じ画像。既定素材は `color_bar.webp`）:
 
 ```bash
 cd host/test_mode && python3 test3_quad.py --palette fc6
@@ -196,7 +196,7 @@ cd host/test_mode && python3 udp_preview.py --port 5000
 
 ```bash
 cd host/test_mode && python3 test_mode.py --no-preview --send \
-  --pi 127.0.0.1:5000 --pi 127.0.0.1:5000 --pi 127.0.0.1:5000 --pi 127.0.0.1:5000
+  --pi 127.0.0.1:5000 --pi 127.0.0.1:5000 --pi 127.0.0.1:5000
 ```
 
 詳細は [host/test_mode/README.md](host/test_mode/README.md)。
@@ -204,7 +204,7 @@ cd host/test_mode && python3 test_mode.py --no-preview --send \
 ## STRUCTURE Sensor操作ブロック崩し
 
 通常ゲーム表示はFC6（52色）で固定する。主機が192×384の完成済みパレットインデックス配列を
-描き、既存の`UdpFrameSender`が上から192×96ずつ4台へ送る。Pi側のコードとUDP形式は変更しない。
+描き、既存の`UdpFrameSender`が上から192×128ずつ3台へ送る。Pi側は実機の配線（chain=8、parallel=3、パネル反転）に合わせて出力し、UDP形式は変更しない。
 
 現在のゲームは、developブランチのブロック崩しを通常面とし、クリア後に
 `host/assets/takemuraface_fc6.png`をボスとして表示するボス戦へ進む2段構成。
@@ -276,27 +276,29 @@ python3 host/extra_stage_block_breaker.py
 python3 host/extra_stage_block_breaker.py --headless --frames 5
 ```
 
-STRUCTURE SensorとPi 4台を使う場合:
+STRUCTURE SensorとPi 3台を使う場合:
 
 ```bash
 python3 host/block_breaker.py --send \
-  --pi 192.168.10.101:5000 --pi 192.168.10.102:5000 \
-  --pi 192.168.10.103:5000 --pi 192.168.10.104:5000
+  --pi 192.168.10.101:5000 --pi 192.168.10.104:5000 \
+  --pi 192.168.10.102:5000
 ```
 
 センサー処理とゲーム制御を2台へ分離する場合は、センサー側で判定済み入力だけをUDP 5200へ送り、
-制御側でゲーム描画と4台へのフレーム送信を行う。深度画像そのものはLANへ流さない。
+制御側でゲーム描画と3台へのフレーム送信を行う。深度画像そのものはLANへ流さない。
 
 ```bash
-# センサーPi（例: 192.168.50.33）
-python3 host/sensor_agent.py --destination 192.168.50.32:5200 --control-bind 0.0.0.0:5201 --start-mode still
+# センサーPi（例: 192.168.50.33、サービスもdecimate=2）
+python3 host/sensor_agent.py --destination 192.168.50.32:5200 --control-bind 0.0.0.0:5201 --start-mode still --capture-decimate 2
 
 # 制御Pi（192.168.50.32、表示LAN側は192.168.10.2）
 python3 host/block_breaker.py --input-bind 0.0.0.0:5200 --sensor-control 192.168.50.33:5201 \
   --start-mode still --send --no-preview --palette msx16 \
-  --pi 192.168.10.101:5000 --pi 192.168.10.102:5000 \
-  --pi 192.168.10.103:5000 --pi 192.168.10.104:5000
+  --pi 192.168.10.101:5000 --pi 192.168.10.104:5000 \
+  --pi 192.168.10.102:5000
 ```
+
+`--capture-decimate 2` は深度フレームを320×240へ間引いて転送量を1/4にする。センサーPiのsystemdサービスではこの設定を常用する。
 
 MSX16送出時は表示Piを`--led-pwm-bits 6 --led-limit-refresh 235`で動かし、色深度より走査更新を優先する。
 
@@ -304,8 +306,9 @@ MSX16送出時は表示Piを`--led-pwm-bits 6 --led-limit-refresh 235`で動か�
 背景幕や床以外を検出対象から外すには、`--roi x,y,width,height`で深度画像内のROIを指定できる。
 人物の横位置はパドルへ絶対位置で対応付ける。実機で左右が反転する場合は`--mirror`、
 追従範囲は`--play-range LOW,HIGH`（既定`0.15,0.85`）、静止時の揺れは
-`--position-deadzone`（既定3 LED px）で調整する。`--position-gain`（既定0.85）は
-不感帯の外での追従速度であり、1に近づけるほど素早く追従する。
+`--position-deadzone`（既定3 LED px）で調整する。`--position-gain`（既定0.9）は
+不感帯の外での指数平滑ゲインであり、1に近づけるほど素早く、1未満では滑らかに追従する。
+`body_x=0.5`をカメラ中心・バー中心として扱い、センサー左右15%をノイズ除外域とする。閾値内はバーの到達可能な全幅へ等間隔に線形写像し、人物中心が追従範囲外に出た場合は対応するバー端を目標値にしてゲインで滑らかに収束させる。
 開始待機では、人物が3秒間ほぼ同じ横位置に留まるとカウントダウンを始める。保持時間は
 `--start-still-seconds`（既定3秒）、位置の許容幅は`--start-still-tolerance`（既定0.035、ROI比）で調整できる。
 
@@ -325,12 +328,12 @@ python3 host/camera_calibrate.py --demo --demo-output /tmp/camera-calibrate-demo
 
 STRUCTURE Sensorでは固定照明マスクを使わず、背景深度より手前に変化した画素を候補にする。`--depth-min-change-mm 0`（既定）は背景フレームのノイズから閾値を自動決定する。
 
-oyaki上でSTRUCTURE Sensorと4台のPiへ接続するコマンド例:
+oyaki上でSTRUCTURE Sensorと3台のPiへ接続するコマンド例:
 
 ```bash
 python3 host/camera_calibrate.py --rotation ccw --send \
-  --pi 192.168.10.101:5000 --pi 192.168.10.102:5000 \
-  --pi 192.168.10.103:5000 --pi 192.168.10.104:5000 \
+  --pi 192.168.10.101:5000 --pi 192.168.10.104:5000 \
+  --pi 192.168.10.102:5000 \
   --output camera_calibration.json
 ```
 
@@ -338,7 +341,7 @@ python3 host/camera_calibrate.py --rotation ccw --send \
 
 終了コードは、`0`=valid校正成功、`1`=RETRY/FAILまたは中止、`2`=引数・センサー等の実行エラー。`/tmp`のデモ出力は揮発性なので、必要な診断PNGは別の保存先へコピーする。自己テストは`python3 host/camera_calibrate_selftest.py`でセンサー・ネットワークなしに実行できる。
 
-Macからは`host/oyaki_camera_calibrate.sh`でSSH操作できる。SSH鍵とHANDOFF記載のIPv6ゾーン指定を使い、秘密はスクリプトへ埋め込まない。`start`はPiクライアントを起動せず、既に4台が待受している前提で校正だけをバックグラウンド実行する。
+Macからは`host/oyaki_camera_calibrate.sh`でSSH操作できる。SSH鍵とHANDOFF記載のIPv6ゾーン指定を使い、秘密はスクリプトへ埋め込まない。`start`はPiクライアントを起動せず、既に3台が待受している前提で校正だけをバックグラウンド実行する。
 
 ```bash
 host/oyaki_camera_calibrate.sh check
@@ -373,14 +376,14 @@ host/oyaki_camera_calibrate.sh depth-view-stop
 
 ## Pi 常駐表示クライアント
 
-`pi-client/` は Raspberry Pi 上で動く C++ の表示専用プロセス。UDP 5000 で 192×96 の
+`pi-client/` は Raspberry Pi 上で動く C++ の表示専用プロセス。UDP 5000 で 192×128 の
 パレットインデックス配列を受け、CRC32 とパレット範囲を確認してから固定 LUT で RGB へ
 変換し、HUB75 へ出力する。1 秒ごとに UDP 5101 へ死活報告（`PIHEALTH ...`）を返し、
 TEST2 がそれを受けて表示する。
 
 ビルドには [rpi-rgb-led-matrix](https://github.com/hzeller/rpi-rgb-led-matrix) が必要で、
 このライブラリは各Pi上の`pi_client`へリンクして使う。起動時に自動起動するsystemd設定と、
-主機から4台へ転送・ビルド・有効化する手順は [pi-client/README.md](pi-client/README.md) にまとめてある。
+主機から3台へ転送・ビルド・有効化する手順は [pi-client/README.md](pi-client/README.md) にまとめてある。
 
 ```bash
 cd pi-client && make RGB_LIB_DISTRIBUTION=$HOME/rpi-rgb-led-matrix
@@ -399,7 +402,7 @@ cd host/test_mode && python3 selftest.py
 ```
 
 `0 errors` を完了条件とする。selftest が見るのは主機側の送出経路（パレット範囲、量子化距離、
-4 分割の再結合一致、UDP ヘッダー＋CRC32 の往復、反射移動の画面内保持）で、TEST2〜4 と
+3 分割の再結合一致、UDP ヘッダー＋CRC32 の往復、反射移動の画面内保持）で、TEST2〜4 と
 `pi-client` は対象外。実機（LED パネル・Pi・M5）での確認も未実施。
 
 ## ネットワーク
@@ -408,13 +411,13 @@ cd host/test_mode && python3 selftest.py
 
 | セグメント | 用途 | ネットワーク |
 |---|---|---|
-| A | フレーム配信（親機 `enp2s0` — スイッチ — Pi×4） | `192.168.10.0/24`、Piは `.101`〜`.104`（`target_id` = 第4オクテット − 101） |
+| A | フレーム配信（親機 `enp2s0` — スイッチ — Pi×3） | `192.168.10.0/24`、Piは `.101` / `.104` / `.102`（物理上から `target_id` 0 / 1 / 2） |
 | B | 開発機直結（親機 `enp3s0` — Mac `en7`） | `192.168.20.0/24` |
 
 ## 次のステップ（計画書 §9.1 の優先順位）
 
-1. 実機での表示確認（`pi-client` のビルドと 4 台での TEST1〜4）
-2. 4 台の論理フレーム同期（READY 返送・UDP 5100 のバリア、`frame_id` 一致）
+1. 実機での表示確認（`pi-client` のビルドと 3 台での TEST1〜3）
+2. 3 台の論理フレーム同期（READY 返送・UDP 5100 のバリア、`frame_id` 一致）
 3. M5StickC Plus の物理同期パルスと GPIO 同期待機、走査位相の評価
 4. 実機でのブロック崩し・センサー入力の校正（左右・ジャンプの精度と遅延）
 5. 会場照明下での誤検出対策とゲーム難易度調整

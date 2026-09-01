@@ -31,8 +31,8 @@ namespace {
 
 constexpr int kCanvasWidth = 192;
 constexpr int kCanvasHeight = 384;
-constexpr int kPiCount = 4;
-constexpr int kPiHeight = 96;
+constexpr int kPiCount = 3;
+constexpr int kPiHeight = 128;
 constexpr std::uint32_t kMagic = 0x524C4544;  // RLED
 constexpr std::uint8_t kPaletteModeFc6 = 0;
 constexpr int kFc6RampSize = 48;  // 0x00〜0x2F。0x30〜0x33は黒〜白の固定色。
@@ -47,9 +47,8 @@ struct Destination {
 struct Options {
   std::vector<std::string> pi_values{
       "192.168.10.101:5000",
-      "192.168.10.102:5000",
-      "192.168.10.103:5000",
       "192.168.10.104:5000",
+      "192.168.10.102:5000",
   };
   bool custom_pi = false;
   bool send = true;
@@ -65,7 +64,7 @@ void stop_handler(int) { g_running = 0; }
 
 [[noreturn]] void usage_error(const std::string& message) {
   throw std::invalid_argument(message + "\n使い方: structure_depth_view [options]\n"
-                               "  --pi HOST:PORT       4台分指定（省略時は192.168.10.101〜104:5000）\n"
+                               "  --pi HOST:PORT       3台分指定（省略時は192.168.10.101/.104/.102:5000）\n"
                                "  --fps N              送信FPS（既定30）\n"
                                "  --seconds N          終了までの秒数（既定0=無期限）\n"
                                "  --chunk-size N       UDPチャンクサイズ（256〜1400、既定1200）\n"
@@ -105,7 +104,7 @@ Options parse_options(int argc, char** argv) {
     };
     if (argument == "--help" || argument == "-h") {
       std::cout << "STRUCTURE Sensor深度ビュー（FC6/UDP）\n"
-                << "  --pi HOST:PORT       4台分指定（省略時は192.168.10.101〜104:5000）\n"
+                << "  --pi HOST:PORT       3台分指定（省略時は192.168.10.101/.104/.102:5000）\n"
                 << "  --fps N              送信FPS（既定30）\n"
                 << "  --seconds N          終了までの秒数（既定0=無期限）\n"
                 << "  --chunk-size N       UDPチャンクサイズ（256〜1400、既定1200）\n"
@@ -139,7 +138,7 @@ Options parse_options(int argc, char** argv) {
       usage_error("不明な引数: " + argument);
     }
   }
-  if (options.pi_values.size() != kPiCount) usage_error("--piは4個指定してください");
+  if (options.pi_values.size() != kPiCount) usage_error("--piは3個指定してください");
   if (!(options.fps > 0.0) || options.fps > 120.0) usage_error("--fpsは0より大きく120以下");
   if (options.seconds < 0.0) usage_error("--secondsは0以上");
   if (options.chunk_size < 256 || options.chunk_size > 1400) usage_error("--chunk-sizeは256〜1400");

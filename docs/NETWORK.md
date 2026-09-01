@@ -6,7 +6,7 @@
 
 | 記号 | 用途 | 経路 | ネットワーク | 備考 |
 |---|---|---|---|---|
-| A | フレーム配信 | 親機 `enp2s0` — 1GbEスイッチ — Pi ×4 | `192.168.10.0/24` | 専用有線。ここに他機器を接続しない |
+| A | フレーム配信 | 親機 `enp2s0` — 1GbEスイッチ — Pi ×3 | `192.168.10.0/24` | 専用有線。ここに他機器を接続しない |
 | B | 開発機直結 | 親機 `enp3s0` — Mac `en7`（USB-Ethernet） | `192.168.20.0/24` | SSH・転送・インターネット共有 |
 
 セグメントAは60fpsのフレーム配信専用とし、ブロードキャストを出す機器やWi-Fiブリッジを混ぜない。
@@ -17,16 +17,17 @@
 
 | 機器 | ホスト名 | IP | `target_id` | 担当行（論理画面 192×384） |
 |---|---|---|---:|---|
-| 親機（Ubuntu） | `th1` | `192.168.10.1` | — | 全体を描画・4分割 |
-| Raspberry Pi 1 | `pi1` | `192.168.10.101` | `0` | Y = 0–95（最上段） |
-| Raspberry Pi 2 | `pi2` | `192.168.10.102` | `1` | Y = 96–191 |
-| Raspberry Pi 3 | `pi3` | `192.168.10.103` | `2` | Y = 192–287 |
-| Raspberry Pi 4 | `pi4` | `192.168.10.104` | `3` | Y = 288–383（最下段） |
+| 親機（Ubuntu） | `th1` | `192.168.10.1` | — | 全体を描画・3分割 |
+| Raspberry Pi 1 | `pi1` | `192.168.10.101` | `0` | Y = 0–127（最上段） |
+| Raspberry Pi 4 | `pi4` | `192.168.10.104` | `1` | Y = 128–255 |
+| Raspberry Pi 2 | `pi2` | `192.168.10.102` | `2` | Y = 256–383（最下段） |
 | 保守用PC等 | — | `192.168.10.200`–`254` | — | 常設しない |
+
+`192.168.10.103`（旧`pi3`）は焼損のため、現在の構成から除外している。
 
 規約:
 
-- **`target_id` = 第4オクテット − 101**。物理的な段の上から順に採番し、配線を入れ替えたらIPも入れ替える。
+- **`target_id` は物理的な段の上から順に採番**する。現在は`.101`→`0`、`.104`→`1`、`.102`→`2`で、IPの数値差から機械的には算出しない。
   `pi_client` 側は `--target-id` で明示し、自機宛以外のチャンクは捨てる。
 - 上表の「担当行」は縦一列（192×384）に積んだ通常配置の場合。TEST4（SUPERTESTMODE）のように
   縦一列でない物理配置では、`target_id` と IP の対応はそのままに、割り当てる領域だけを
@@ -78,7 +79,7 @@ sudo nmcli con up led-net
 
 ### Raspberry Pi 各機（Raspberry Pi OS Bookworm 以降、NetworkManager）
 
-`pi1` の例。`.101` の部分を各機で `.102` / `.103` / `.104` に変える。
+`pi1` の例。各機のIP・`target_id`は上表に合わせて設定する。
 
 ```bash
 sudo nmcli con add type ethernet ifname eth0 con-name led-net \
@@ -139,16 +140,16 @@ ping -c 3 192.168.10.101
 ```
 
 ```bash
-ssh oyaki "for i in 1 2 3 4; do ping -c1 -W1 192.168.10.10\$i >/dev/null && echo pi\$i OK || echo pi\$i NG; done"
+ssh oyaki "for ip in 192.168.10.101 192.168.10.104 192.168.10.102; do ping -c1 -W1 \$ip >/dev/null && echo \$ip OK || echo \$ip NG; done"
 ```
 
-各Pi側で表示クライアントを手動インストールする場合（`target_id` は自機のIP末尾 − 101）:
+各Pi側で表示クライアントを手動インストールする場合（`target_id` は上表の値）:
 
 ```bash
 ./install.sh 0
 ```
 
-通常は主機から4台へ転送・Pi上ビルド・systemd自動起動を一括で設定する。`PI_SSH_USER`はPi側の
+通常は主機から3台へ転送・Pi上ビルド・systemd自動起動を一括で設定する。`PI_SSH_USER`はPi側の
 実ユーザー名に置き換える。Pi側でパスワードなしsudoと、`$HOME/rpi-rgb-led-matrix`の配置が必要。
 
 ```bash
@@ -162,20 +163,20 @@ PI_SSH_USER=takemuralab host/oyaki_camera_calibrate.sh pi-status
 PI_SSH_USER=takemuralab host/oyaki_camera_calibrate.sh pi-start
 ```
 
-4台へ実際にフレームを送る:
+3台へ実際にフレームを送る:
 
 ```bash
 cd host/test_mode && python3 test_mode.py --image test.webp --palette fc6 --send \
-  --pi 192.168.10.101:5000 --pi 192.168.10.102:5000 \
-  --pi 192.168.10.103:5000 --pi 192.168.10.104:5000
+  --pi 192.168.10.101:5000 --pi 192.168.10.104:5000 \
+  --pi 192.168.10.102:5000
 ```
 
 各Piの死活・FPS・欠損数を主機側で見る（TEST2。UDP 5101 の報告を受けて文字で表示する）:
 
 ```bash
 cd host/test_mode && python3 test2_status.py --send \
-  --pi 192.168.10.101:5000 --pi 192.168.10.102:5000 \
-  --pi 192.168.10.103:5000 --pi 192.168.10.104:5000
+  --pi 192.168.10.101:5000 --pi 192.168.10.104:5000 \
+  --pi 192.168.10.102:5000
 ```
 
 `NO SIGNAL` は一度も報告が届いていない状態、`LOST` は3秒以上途絶えた状態を指す。

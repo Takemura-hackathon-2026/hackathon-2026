@@ -2,7 +2,7 @@
 """STRUCTURE Sensorで操作する192x384 RGB LEDブロック崩し。
 
 主機でセンサー判定、ゲーム更新、FC6/MSX16パレット番号での描画を完結する。完成フレームは
-既存の UdpFrameSender が192x96ずつ4台のPiへ送るため、Pi側へ人物映像・人物マスク・
+既存の UdpFrameSender が192x128ずつ3台のPiへ送るため、Pi側へ人物映像・人物マスク・
 ゲームロジックを渡さない。
 """
 from __future__ import annotations
@@ -29,7 +29,7 @@ if str(HOST) not in sys.path:
 from palettes import FC6, FC6_BLACK, FC6_LIMIT, FC6_WHITE, MSX16, MSX16_LIMIT, PaletteMode  # noqa: E402
 from frame_source import StructureSensorSource, depth_preview  # noqa: E402
 from input_transport import InputStateReceiver, SensorControlSender, parse_endpoint  # noqa: E402
-from test_mode import CANVAS_HEIGHT, CANVAS_WIDTH, PI_COUNT, UdpFrameSender, parse_pi  # noqa: E402
+from test_mode import CANVAS_HEIGHT, CANVAS_WIDTH, PI_COUNT, PI_HEIGHT, UdpFrameSender, parse_pi  # noqa: E402
 
 
 # 正本 host/palettes.py 内のFC6インデックスだけを使う。
@@ -470,6 +470,7 @@ class ForegroundGate:
             center_y = float(moments["m01"] / moments["m00"] / height)
             if not (0.04 <= center_x <= 0.96 and 0.04 <= center_y <= 0.96):
                 continue
+            # body_x=.5 をカメラ中心として扱い、左右の有効領域内の実測重心を使う。
             # 候補の外接矩形だけで塗る。全画面を毎回ゼロ埋めするとPi3では無視できない。
             component = np.zeros((box_height, box_width), dtype=np.uint8)
             cv2.drawContours(component, [contour], -1, 255, -1, offset=(-x, -y))
@@ -878,7 +879,7 @@ class PaddleFollower:
     paddle_width: float
     play_range: tuple[float, float] = (.15, .85)
     deadzone: float = 3.0
-    gain: float = .85
+    gain: float = .9
     mirror: bool = False
 
     def __post_init__(self) -> None:
@@ -898,11 +899,13 @@ class PaddleFollower:
             raise ValueError("パドル追従の範囲・不感帯・ゲインが不正")
 
     def target_center(self, body_x: float) -> float:
-        """ROI内の人物中心を、バーが端まで届く中心座標へ変換する。"""
+        """人物中心をバーの中心座標へ変換し、範囲外はバー端へクランプする。"""
         if not math.isfinite(float(body_x)):
             raise ValueError("人物中心Xが不正")
         normalized = 1.0 - float(body_x) if self.mirror else float(body_x)
         low, high = self.play_range
+        # 有効範囲の全幅をバーの到達可能な中心全幅へ線形に割り当てる。
+        # そのため low / 中央 / high は等間隔のバー位置になる。
         progress = min(1.0, max(0.0, (normalized - low) / (high - low)))
         left_center = self.paddle_width / 2.0
         right_center = self.canvas_width - left_center
@@ -915,8 +918,18 @@ class PaddleFollower:
         target = self.target_center(body_x)
         delta = target - float(current_center)
         if abs(delta) <= self.deadzone:
-            return float(current_center)
-        return float(current_center) + math.copysign((abs(delta) - self.deadzone) * self.gain, delta)
+            # 端点以外は不感帯で停止して静止時の揺れを抑える。
+            left_center = self.paddle_width / 2.0
+            right_center = self.canvas_width - left_center
+            if left_center < target < right_center:
+                return float(current_center)
+            # 範囲外を含む端点入力は、端へ向けて平滑に収束させる。
+        if self.gain >= 1.0:
+            # 必要なら gain=1.0 で絶対位置を直接反映できる。
+            return target
+        # 不感帯ぶんを差し引かず、差分全体を指数平滑する。
+        # 旧式の「差分−不感帯」は一定の追従遅れを作るため使わない。
+        return float(current_center) + delta * self.gain
 
 
 def keyboard_action(key: int) -> str | None:
@@ -1468,7 +1481,7 @@ class BlockBreaker:
             elif start_mode == "still" and start_hold_remaining is not None:
                 self._text(frame, f"HOLD {math.ceil(start_hold_remaining)}", (62, 252), colors.text, .40)
         if boundaries:
-            for y in (96, 192, 288):
+            for y in range(PI_HEIGHT, CANVAS_HEIGHT, PI_HEIGHT):
                 frame[y:y + 1, :] = colors.dim
         return frame
 
@@ -1520,12 +1533,12 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "--play-range",
         type=parse_play_range,
-        default=(.15, .85),
+        default=(0.0, 1.0),
         metavar="LOW,HIGH",
-        help="人物位置がバーの左右端に対応するROI内範囲（既定: 0.15,0.85）",
+        help="人物位置がバーの左右端に対応するROI内範囲（既定: 0.0,1.0）",
     )
     result.add_argument("--position-deadzone", type=float, default=3.0, help="バー追従を止める誤差（LED px、既定3）")
-    result.add_argument("--position-gain", type=float, default=.85, help="不感帯外の追従ゲイン（0超1以下、既定0.85）")
+    result.add_argument("--position-gain", type=float, default=.9, help="不感帯外の追従ゲイン（0超1以下、既定0.9）")
     result.add_argument("--start-mode", choices=("still", "passby", "arm-circle"), default="still", help="開始条件（既定: 3秒静止）")
     result.add_argument("--start-countdown-seconds", type=float, default=3.0, help="開始検知からゲーム開始までの秒数（既定3）")
     result.add_argument("--start-still-seconds", type=float, default=3.0, help="静止開始を確定する保持時間（既定3秒）")

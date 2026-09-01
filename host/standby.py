@@ -230,7 +230,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--frames", type=int, default=0, help="指定フレーム数で終了。0は無制限")
     parser.add_argument("--seconds", type=float, default=0.0, help="指定秒数で終了。0は無制限")
     parser.add_argument("--health-port", type=int, default=HEALTH_PORT, help="Pi温度報告のUDPポート")
-    parser.add_argument("--send", action="store_true", help="4台のPiへUDP送信する")
+    parser.add_argument("--send", action="store_true", help=f"{PI_COUNT}台のPiへUDP送信する")
     parser.add_argument("--pi", action="append", default=[], metavar="HOST[:PORT]")
     parser.add_argument("--chunk-size", type=int, default=1200)
     parser.add_argument("--preview", action="store_true", help="OpenCVプレビューを表示する")

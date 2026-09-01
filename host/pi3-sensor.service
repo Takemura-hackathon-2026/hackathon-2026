@@ -7,7 +7,7 @@ After=network-online.target
 Type=simple
 User=takemuralab
 WorkingDirectory=/home/takemuralab/hackathon-2026
-ExecStart=/home/takemuralab/hackathon-2026/.venv/bin/python host/sensor_agent.py --destination 192.168.50.32:5200 --control-bind 0.0.0.0:5201 --start-mode still
+ExecStart=/home/takemuralab/hackathon-2026/.venv/bin/python host/sensor_agent.py --destination 192.168.50.32:5200 --control-bind 0.0.0.0:5201 --start-mode still --capture-decimate 2
 Restart=on-failure
 RestartSec=2
 

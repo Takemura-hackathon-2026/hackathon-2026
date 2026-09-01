@@ -3,7 +3,7 @@
 
 ローカルの `test.webp` を読み込み、192x384 の論理画面内を DVD スクリーンセーバー
 のように反射移動させる。色は FC6 / MSX16 の登録済みインデックスだけを使い、
-ローカルプレビューと、192x96 の 4 スライスの UDP 送信を行う。
+ローカルプレビューと、192x128 の 3 スライスの UDP 送信を行う。
 
 計画書 §4.7 の WBMP テストモードを WebP 素材へ置き換えたもの。
 AI・カメラ・画像圧縮・Pi 側描画は使用しない。
@@ -48,8 +48,8 @@ from profiler import (  # noqa: E402
 
 CANVAS_WIDTH = 192
 CANVAS_HEIGHT = 384
-PI_COUNT = 4
-PI_HEIGHT = 96
+PI_COUNT = 3
+PI_HEIGHT = 128
 MAGIC = 0x524C4544  # ASCII: RLED
 HEADER = struct.Struct("!IIBBHHHI")
 
@@ -469,7 +469,7 @@ class UdpFrameSender:
         self.socket.close()
 
     def send(self, frame_id: int, palette_mode: PaletteMode, indexed: np.ndarray) -> None:
-        """192x384 の全画面を上から 96 行ずつ 4 分割して送る。"""
+        """192x384 の全画面を上から 128 行ずつ 3 分割して送る。"""
         if indexed.shape != (CANVAS_HEIGHT, CANVAS_WIDTH):
             raise ValueError(f"想定外のフレーム形状: {indexed.shape}")
         slices = [
@@ -484,7 +484,7 @@ class UdpFrameSender:
         palette_mode: PaletteMode,
         slices: Sequence[np.ndarray],
     ) -> None:
-        """target_id 順に並べた 192x96 のスライスをそのまま送る。
+        """target_id 順に並べた 192x128 のスライスをそのまま送る。
 
         論理画面の並びが縦一列でない特殊配置でも、割り当てだけを差し替えて
         同じ伝送経路を使えるようにする。
@@ -565,13 +565,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--preview-scale", type=int, default=2)
     parser.add_argument("--no-preview", action="store_true")
     parser.add_argument("--frames", type=int, default=0, help="N フレームで終了。0 は無制限")
-    parser.add_argument("--send", action="store_true", help="192x96 の 4 スライスを UDP 送信する")
+    parser.add_argument("--send", action="store_true", help="192x128 の 3 スライスを UDP 送信する")
     parser.add_argument(
         "--pi",
         action="append",
         default=[],
         metavar="HOST[:PORT]",
-        help="Pi の宛先。--send 時はちょうど 4 回指定する",
+        help=f"Pi の宛先。--send 時はちょうど {PI_COUNT} 回指定する",
     )
     parser.add_argument("--chunk-size", type=int, default=1200)
     parser.add_argument("--gif", type=Path, default=None, help="シミュレーションを GIF 保存して終了")
@@ -649,7 +649,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     sender: UdpFrameSender | None = None
     if args.send:
         if len(args.pi) != PI_COUNT:
-            print("error: --send には --pi HOST[:PORT] をちょうど 4 個指定する", file=sys.stderr)
+            print(f"error: --send には --pi HOST[:PORT] をちょうど {PI_COUNT} 個指定する", file=sys.stderr)
             return 2
         try:
             sender = UdpFrameSender(

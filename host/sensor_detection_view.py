@@ -23,9 +23,8 @@ from test_mode import CANVAS_HEIGHT, CANVAS_WIDTH, PI_COUNT, UdpFrameSender, par
 
 DEFAULT_PI = (
     "192.168.10.101:5000",
-    "192.168.10.102:5000",
-    "192.168.10.103:5000",
     "192.168.10.104:5000",
+    "192.168.10.102:5000",
 )
 
 
@@ -92,7 +91,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fps", type=float, default=60.0)
     parser.add_argument("--frames", type=int, default=0)
     parser.add_argument("--seconds", type=float, default=0.0)
-    parser.add_argument("--send", action="store_true", help="4台のPiへ送信")
+    parser.add_argument("--send", action="store_true", help="3台のPiへ送信")
     parser.add_argument("--pi", action="append", default=[], metavar="HOST[:PORT]")
     parser.add_argument("--chunk-size", type=int, default=1200)
     return parser

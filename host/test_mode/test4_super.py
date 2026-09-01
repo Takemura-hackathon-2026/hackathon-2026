@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """SUPERTESTMODE: 斜めN字配置の特殊ディスプレーで test.webp を反射移動させる。
 
-4 つの 192x96 ブロックが縦一列ではなく、隣り合うブロックの角 64dot だけで
+4 つの 192x128 ブロックが縦一列ではなく、隣り合うブロックの角 64dot だけで
 繋がるジグザグ配置になっている構成に対応する。
 
 配置の根拠（実機の接続）:
@@ -12,17 +12,19 @@
 ここから各ブロックの原点は次のようになる（y は下向き、単位 pixel）。
 
     Pi3 (target 2) ... ( 128,   0)      Pi4 (target 3) ... ( 384,   0)
-    Pi1 (target 0) ... (   0,  96)      Pi2 (target 1) ... ( 256,  96)
+    Pi1 (target 0) ... (   0, 128)      Pi2 (target 1) ... ( 256, 128)
 
     +--------+--------+--------+--------+--------+--------+
-    |        |   Pi3      |        |   Pi4      |         |   y=0..95
+    |        |   Pi3      |        |   Pi4      |         |   y=0..127
     +--------+--------+--------+--------+--------+--------+
-    |   Pi1      |        |   Pi2      |        |         |   y=96..191
+    |   Pi1      |        |   Pi2      |        |         |   y=128..255
     +--------+--------+--------+--------+--------+--------+
     x=0     128      256      384      448     576
 
-仮想画面は 576x192。パネルが存在しない領域へ図形が入ると、その間だけ見えなく
+仮想画面は 576x256。パネルが存在しない領域へ図形が入ると、その間だけ見えなく
 なる。反射は仮想画面の外周で行う。
+
+現行の3台構成には含まれない旧配置であり、`--send`は無効化している。
 
 配置は LAYOUT で定義しており、実機の並びが違えばここだけ直せばよい。
 """
@@ -92,8 +94,9 @@ LAYOUT: tuple[Block, ...] = (
     Block(target_id=3, name="PI4", x=384, y=0),
 )
 
+SUPER_PI_COUNT = len(LAYOUT)
 VIRTUAL_WIDTH = max(block.x for block in LAYOUT) + BLOCK_WIDTH   # 576
-VIRTUAL_HEIGHT = max(block.y for block in LAYOUT) + BLOCK_HEIGHT  # 192
+VIRTUAL_HEIGHT = max(block.y for block in LAYOUT) + BLOCK_HEIGHT  # 256
 
 LABEL_COLOR = {PaletteMode.FC6: FC6_WHITE, PaletteMode.MSX16: 0x0F}
 LINK_COLOR = {PaletteMode.FC6: 0x15, PaletteMode.MSX16: 0x02}  # 緑
@@ -157,7 +160,7 @@ class SuperRenderer:
             self.phase_offset = (self.phase_offset + collisions) % len(self.colors)
 
     def render(self, label: bool, show_links: bool) -> np.ndarray:
-        """仮想画面（576x192）を描く。パネルが無い領域も背景で埋める。"""
+        """仮想画面（576x256）を描く。パネルが無い領域も背景で埋める。"""
         frame = np.full(
             (VIRTUAL_HEIGHT, VIRTUAL_WIDTH), self.background, dtype=np.uint8
         )
@@ -195,8 +198,8 @@ class SuperRenderer:
         return frame
 
     def slices(self, frame: np.ndarray) -> list[np.ndarray]:
-        """target_id 順に 192x96 のスライスを切り出す。"""
-        pieces: list[np.ndarray | None] = [None] * PI_COUNT
+        """legacy 4台配置のtarget_id順に192x128のスライスを切り出す。"""
+        pieces: list[np.ndarray | None] = [None] * SUPER_PI_COUNT
         for block in LAYOUT:
             pieces[block.target_id] = frame[
                 block.y:block.y + BLOCK_HEIGHT, block.x:block.x + BLOCK_WIDTH
@@ -288,12 +291,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     profiler = Profiler(enabled=args.profile, label="TEST4")
     sender: UdpFrameSender | None = None
     if args.send:
-        if len(args.pi) != PI_COUNT:
-            print("error: --send には --pi をちょうど 4 個指定する", file=sys.stderr)
-            return 2
-        sender = UdpFrameSender(
-            [parse_pi(item) for item in args.pi], args.chunk_size, profiler
+        print(
+            "error: TEST4の旧4台特殊配置は現行3台構成では送信できません。"
+            "--saveまたはローカルプレビューを使用してください",
+            file=sys.stderr,
         )
+        return 2
 
     running = True
 

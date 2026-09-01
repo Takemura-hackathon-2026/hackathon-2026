@@ -61,9 +61,8 @@ calibration_args=(
   --rotation none
   --send
   --pi 192.168.10.101:5000
-  --pi 192.168.10.102:5000
-  --pi 192.168.10.103:5000
   --pi 192.168.10.104:5000
+  --pi 192.168.10.102:5000
   --output "$REMOTE_OUTPUT"
 )
 
@@ -71,25 +70,22 @@ standby_args=(
   --mode status
   --send
   --pi 192.168.10.101:5000
-  --pi 192.168.10.102:5000
-  --pi 192.168.10.103:5000
   --pi 192.168.10.104:5000
+  --pi 192.168.10.102:5000
 )
 
 sensor_detection_view_args=(
   --background-seconds 2.0
   --send
   --pi 192.168.10.101:5000
-  --pi 192.168.10.102:5000
-  --pi 192.168.10.103:5000
   --pi 192.168.10.104:5000
+  --pi 192.168.10.102:5000
 )
 
 pi_specs=(
   192.168.10.101:0
-  192.168.10.102:1
-  192.168.10.103:2
-  192.168.10.104:3
+  192.168.10.104:1
+  192.168.10.102:2
 )
 
 remote_command() {
@@ -116,7 +112,7 @@ cmd_check() {
     test -f '$OYAKI_REPO/host/standby.py'
     test -f '$OYAKI_REPO/host/test_mode/single-eye-catch_2800x1040.png'
     printf 'sensor_processes='; pgrep -af camera_calibrate.py || true
-    for ip in 192.168.10.101 192.168.10.102 192.168.10.103 192.168.10.104; do
+    for ip in 192.168.10.101 192.168.10.104 192.168.10.102; do
       if ping -c 1 -W 1 \"\$ip\" >/dev/null 2>&1; then printf 'pi=%s reachable\\n' \"\$ip\"; else printf 'pi=%s unreachable\\n' \"\$ip\"; fi
     done"
 }
@@ -229,7 +225,7 @@ cmd_display_test() {
   case "$seconds" in
     ''|*[!0-9]*) printf '秒数は整数で指定してください\n' >&2; return 2 ;;
   esac
-  ssh_remote "cd '$OYAKI_REPO' && timeout --signal=TERM --kill-after=3 $((seconds + 5)) '$OYAKI_REPO/.venv/bin/python' host/standby.py --health-port 5102 --send --pi 192.168.10.101:5000 --pi 192.168.10.102:5000 --pi 192.168.10.103:5000 --pi 192.168.10.104:5000 --seconds $seconds"
+  ssh_remote "cd '$OYAKI_REPO' && timeout --signal=TERM --kill-after=3 $((seconds + 5)) '$OYAKI_REPO/.venv/bin/python' host/standby.py --health-port 5102 --send --pi 192.168.10.101:5000 --pi 192.168.10.104:5000 --pi 192.168.10.102:5000 --seconds $seconds"
 }
 
 cmd_standby_start() {

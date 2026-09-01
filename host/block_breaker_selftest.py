@@ -2,6 +2,7 @@
 """合成深度フレームを含むブロック崩し・入力分類器検証。"""
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
@@ -108,6 +109,24 @@ def main() -> int:
     body, _, _ = gate.detect(person_mask, person_gain, 400.0)
     if body is None:
         errors.append("縦長の人物候補を確定しない")
+
+    right_edge_gate = ForegroundGate(min_area=420)
+    right_edge_mask = np.zeros(shape, dtype=np.uint8)
+    right_edge_mask[28:165, 145:240] = 255
+    right_edge_body = None
+    for _ in range(3):
+        right_edge_body, _, _ = right_edge_gate.detect(right_edge_mask, person_gain, 400.0)
+    if right_edge_body is None or not .70 < right_edge_body.x < .80:
+        errors.append("センサー右側の有効領域内の人物を検出しない")
+
+    left_edge_gate = ForegroundGate(min_area=420)
+    left_edge_mask = np.zeros(shape, dtype=np.uint8)
+    left_edge_mask[28:165, 0:95] = 255
+    left_edge_body = None
+    for _ in range(3):
+        left_edge_body, _, _ = left_edge_gate.detect(left_edge_mask, person_gain, 400.0)
+    if left_edge_body is None or not .25 < left_edge_body.x < .30:
+        errors.append("センサー左側の有効領域内の人物を検出しない")
 
     arm_gate = ForegroundGate(min_area=420)
     arm_mask = np.zeros(shape, dtype=np.uint8)
@@ -250,13 +269,31 @@ def main() -> int:
         errors.append("パドル追従へ平滑化済みではなく現在の人物中心Xを渡す")
 
     follower = PaddleFollower(192.0, 42.0, (.15, .85), deadzone=3.0, gain=.85)
-    if follower.target_center(.15) != 21.0 or follower.target_center(.85) != 171.0:
+    if follower.target_center(.15) != 21.0 or follower.target_center(.5) != 96.0 or follower.target_center(.85) != 171.0:
         errors.append("プレイ範囲の両端をパドルの到達可能な端へ写像しない")
+    if not math.isclose(follower.target_center(.325), 58.5) or not math.isclose(follower.target_center(.675), 133.5):
+        errors.append("左右閾値内のバー移動幅を等間隔に写像しない")
+    if follower.target_center(.10) != 21.0 or follower.target_center(.90) != 171.0:
+        errors.append("プレイ範囲外の人物中心をバー端へ写像しない")
     if follower.follow(.5, 96.0) != 96.0:
         errors.append("パドル追従の不感帯内で位置を変える")
+    left_edge_step = follower.follow(.10, 96.0)
+    right_edge_step = follower.follow(.90, 96.0)
+    if not 21.0 < left_edge_step < 96.0 or not 96.0 < right_edge_step < 171.0:
+        errors.append("プレイ範囲外の入力を左右端へ平滑に追従させない")
+    if not 21.0 < follower.follow(.15, 23.0) < 23.0 or not 169.0 < follower.follow(.85, 169.0) < 171.0:
+        errors.append("左右端入力を不感帯内で即時スナップする")
     stepped = follower.follow(.85, 96.0)
     if not 96.0 < stepped < 171.0:
         errors.append("パドル追従が不感帯外で高ゲイン追従しない")
+    fast_follower = PaddleFollower(192.0, 42.0, (.15, .85), deadzone=3.0, gain=1.0)
+    if fast_follower.follow(.85, 96.0) != 171.0:
+        errors.append("高速パドル追従が目標位置へ直接反映されない")
+    smooth_follower = PaddleFollower(192.0, 42.0, (.15, .85), deadzone=3.0, gain=.9)
+    smooth_first = smooth_follower.follow(.85, 96.0)
+    smooth_second = smooth_follower.follow(.85, smooth_first)
+    if smooth_first != 163.5 or smooth_second != 170.25:
+        errors.append("パドル追従が差分全体を滑らかに平滑化しない")
     mirrored = PaddleFollower(192.0, 42.0, (.15, .85), mirror=True)
     if mirrored.target_center(.15) != 171.0:
         errors.append("鏡像入力でパドル位置を反転しない")

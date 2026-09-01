@@ -1,6 +1,6 @@
 # Pi 常駐表示クライアント
 
-Raspberry Pi 上で動く表示専用プロセス。主機から届く 192×96 のパレットインデックス配列を
+Raspberry Pi 上で動く表示専用プロセス。主機から届く 192×128 のパレットインデックス配列を
 受信し、固定 LUT で RGB へ変換して HUB75 へ出力するだけの処理に限定する。
 
 ```text
@@ -55,7 +55,7 @@ systemctl is-enabled pi-client@0.service
 systemctl status pi-client@0.service
 ```
 
-主機から4台へ転送・Pi上ビルド・systemd有効化まで行う場合は、oyakiからPiへSSHできるユーザーを
+主機から3台へ転送・Pi上ビルド・systemd有効化まで行う場合は、oyakiからPiへSSHできるユーザーを
 指定する。`pi-deploy`はPi上の`$HOME/rpi-rgb-led-matrix`を既定のライブラリ位置として使い、
 `PI_RGB_LIB_DISTRIBUTION`で変更できる。Pi側でパスワードなしsudoが使える必要がある。
 
@@ -65,12 +65,12 @@ PI_SSH_USER=takemuralab host/oyaki_camera_calibrate.sh pi-status
 PI_SSH_USER=takemuralab host/oyaki_camera_calibrate.sh pi-start
 ```
 
-PiのIPと`target_id`は`192.168.10.101`→`0`、`.102`→`1`、`.103`→`2`、`.104`→`3`で固定する。
+実機のIPと`target_id`は、物理的な上から順に`192.168.10.101`→`0`、`.104`→`1`、`.102`→`2`で固定する。
 主機の待機画面は別途`standby-start`で起動する。
 
 | オプション | 既定 | 内容 |
 |---|---|---|
-| `--target-id N` | （必須） | 担当領域の番号 `0`〜`3`。他機宛のチャンクは捨てる |
+| `--target-id N` | （必須） | 担当領域の番号 `0`〜`2`。他機宛のチャンクは捨てる |
 | `--port N` | `5000` | フレームチャンクの待受ポート |
 | `--health-port N` | `5101` | 死活報告の送信先ポート |
 | `--rotate180` | 無効 | パネルを上下逆に取り付けた個体向けに点対称へ写す |
@@ -78,7 +78,7 @@ PiのIPと`target_id`は`192.168.10.101`→`0`、`.102`→`1`、`.103`→`2`、`
 | `--led-brightness N` | `40` | パネル輝度（0〜100%。指定時は既定値を上書き） |
 
 上記に加えて rpi-rgb-led-matrix の `--led-*` 系オプションをそのまま受ける。
-既定のパネル輝度は40%で、全体を低めに抑えている。既定のパネル構成は 32×32・`chain_length=6`・`parallel=3`（= 192×96）、
+既定のパネル輝度は40%で、全体を低めに抑えている。既定のパネル構成は 32×32・`chain_length=8`・`parallel=3`（= 192×128）、
 `hardware_mapping=regular`。
 
 ## 死活報告
@@ -104,7 +104,7 @@ PIHEALTH target=0 displayed=1234 dropped=2 fps=59.8 up=41 rot=0 temp_c=42.1
 ## 受信の扱い
 
 `test_mode.py` と同じ 20 バイトのヘッダー（`!IIBBHHHI`、magic `RLED` = `0x524C4544`）で、
-1 スライス 18432 バイトを `--chunk-size`（既定 1200）ずつに分けて受ける。
+1 スライス 24576 バイトを `--chunk-size`（既定 1200）ずつに分けて受ける。
 
 - magic 不一致、自機宛以外、`chunk_id`/`chunk_count` 不正、長さ不一致、CRC32 不一致は破棄する
 - 書き込み位置は「最終チャンク以外の大きさ」を刻み幅として求める。最終チャンクだけは端数に

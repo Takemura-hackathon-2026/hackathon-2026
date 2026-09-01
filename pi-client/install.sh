@@ -6,8 +6,8 @@ INSTALL_ROOT="/opt/hackathon-2026/pi-client"
 RGB_LIB_DISTRIBUTION="${RGB_LIB_DISTRIBUTION:-$HOME/rpi-rgb-led-matrix}"
 TARGET_ID="${1:-}"
 
-if [[ ! "$TARGET_ID" =~ ^[0-3]$ ]]; then
-  printf '使い方: %s TARGET_ID(0..3)\n' "$0" >&2
+if [[ ! "$TARGET_ID" =~ ^[0-2]$ ]]; then
+  printf '使い方: %s TARGET_ID(0..2)\n' "$0" >&2
   exit 2
 fi
 

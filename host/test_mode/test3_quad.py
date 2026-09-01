@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""TEST3: 4分割モード。各 Pi の担当領域へ同じ画像を1枚ずつ表示する。
+"""TEST3: Pi分割モード。各 Pi の担当領域へ同じ画像を1枚ずつ表示する。
 
-192x384 の論理画面を 192x96 の 4 帯に分け、それぞれへ同一画像を描く。
+192x384 の論理画面を 192x128 の 3 帯に分け、それぞれへ同一画像を描く。
 1 台ずつの色再現・向き・欠けを個別に確認するためのモード。
 
-主機で画像をパレット量子化し、各帯へ配置してから 4 分割して送る。
+主機で画像をパレット量子化し、各帯へ配置してから Pi 台数ぶんに分割して送る。
 Pi 側の処理は通常運用と同じ（受信・LUT変換・HUB75出力のみ）。
 """
 from __future__ import annotations
@@ -116,7 +116,7 @@ def build_frame(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="TEST3: 4分割モード。各 Pi の担当領域へ同じ画像を表示する"
+        description="TEST3: Pi分割モード。各 Pi の担当領域へ同じ画像を表示する"
     )
     parser.add_argument("--image", type=Path, default=Path("color_bar.webp"))
     parser.add_argument("--palette", choices=("fc6", "msx16"), default="fc6")
@@ -183,7 +183,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     sender: UdpFrameSender | None = None
     if args.send:
         if len(args.pi) != PI_COUNT:
-            print("error: --send には --pi をちょうど 4 個指定する", file=sys.stderr)
+            print(f"error: --send には --pi をちょうど {PI_COUNT} 個指定する", file=sys.stderr)
             return 2
         sender = UdpFrameSender(
             [parse_pi(item) for item in args.pi], args.chunk_size, profiler
@@ -199,7 +199,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, stop_handler)
 
     print(
-        f"TEST3 4分割: {args.image} palette={palette_mode.name} "
+        f"TEST3 {PI_COUNT}分割: {args.image} palette={palette_mode.name} "
         f"帯={CANVAS_WIDTH}x{PI_HEIGHT} x{PI_COUNT} fps={args.fps:g} "
         f"range=0x00-{frame.max():#04x}"
     )
@@ -218,7 +218,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     sender.send(frame_id, palette_mode, frame)
             if not args.no_preview:
                 with profiler.span("preview"):
-                    cv2.imshow("TEST3 4分割", preview)
+                    cv2.imshow(f"TEST3 {PI_COUNT}分割", preview)
                 with profiler.span("waitkey"):
                     if (cv2.waitKey(1) & 0xFF) in (27, ord("q")):
                         running = False

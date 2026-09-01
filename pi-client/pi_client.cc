@@ -1,6 +1,6 @@
 // RGB LED ゲーム Pi 常駐表示クライアント。
 //
-// 主機から届く 192x96 のパレットインデックス配列を受信し、固定 LUT で RGB へ
+// 主機から届く 192x128 のパレットインデックス配列を受信し、固定 LUT で RGB へ
 // 変換して HUB75 へ出力するだけの処理に限定する。ゲームロジック、画像生成、
 // 圧縮・解凍、動的メモリ確保、外部プロセス起動は行わない。
 //
@@ -26,8 +26,45 @@
 namespace {
 
 constexpr int kCanvasWidth = 192;
-constexpr int kSliceHeight = 96;
+constexpr int kSliceHeight = 128;
 constexpr int kSliceBytes = kCanvasWidth * kSliceHeight;
+
+// 1枚のパネルの辺長と、1台が受け持つスライス内のパネル格子。
+constexpr int kPanelSize = 32;
+constexpr int kPanelCols = kCanvasWidth / kPanelSize;   // 6
+constexpr int kPanelRows = kSliceHeight / kPanelSize;   // 4
+constexpr int kChainLength = 8;
+constexpr int kParallel = 3;
+
+// スライス上のパネル格子から、HUB75 のチェーン位置への対応表。
+// 2026-09-01 指定の配線（1台分。A=チェーン0 / B=チェーン1 / C=チェーン2）:
+//   row0: A5 A4 A3 A2 A1 A0
+//   row1: A6 A7 B3 B2 B1 B0
+//   row2: C6 C7 B4 B5 B6 B7
+//   row3: C5 C4 C3 C2 C1 C0
+// チェーンは各行を右から左へ進み、端で下の行へ折り返す蛇行配線である。
+struct PanelSlot {
+  std::uint8_t parallel;  // 何番目のチェーンか
+  std::uint8_t chain;     // そのチェーンの何枚目か
+};
+constexpr PanelSlot kPanelMap[kPanelRows][kPanelCols] = {
+    {{0, 5}, {0, 4}, {0, 3}, {0, 2}, {0, 1}, {0, 0}},
+    {{0, 6}, {0, 7}, {1, 3}, {1, 2}, {1, 1}, {1, 0}},
+    {{2, 6}, {2, 7}, {1, 4}, {1, 5}, {1, 6}, {1, 7}},
+    {{2, 5}, {2, 4}, {2, 3}, {2, 2}, {2, 1}, {2, 0}},
+};
+
+// 180度回して取り付けてあるパネル。折り返した先の行（A6 A7 / B4-B7 / C6 C7）が該当する。
+// 途中で A0 A1 B0-B3 C0 C1 と設定したことがあるが、それは chain_x を取り違えて各行が
+// 7→0 に並んでいたときの見え方であり、向きを直した時点で本来の値へ戻した。
+// 3台とも同じ向き。正本は panel_wiring.json。
+// --no-panel-flip を付けると全パネルを正立として扱う。
+constexpr bool kPanelFlipped[kPanelRows][kPanelCols] = {
+    {false, false, false, false, false, false},
+    {true, true, false, false, false, false},
+    {true, true, true, true, true, true},
+    {false, false, false, false, false, false},
+};
 constexpr std::uint32_t kMagic = 0x524C4544;  // "RLED"
 constexpr int kMaxChunks = 64;
 // これ以上巻き戻ったら主機の再起動とみなし、新しい frame_id 系列へ追従する。
@@ -136,14 +173,16 @@ int main(int argc, char *argv[]) {
   rgb_matrix::RuntimeOptions runtime_options;
   matrix_options.rows = 32;
   matrix_options.cols = 32;
-  matrix_options.chain_length = 6;
-  matrix_options.parallel = 3;
+  matrix_options.chain_length = kChainLength;
+  matrix_options.parallel = kParallel;
   matrix_options.hardware_mapping = "regular";
   matrix_options.brightness = kDefaultBrightnessPercent;
 
   if (!rgb_matrix::ParseOptionsFromFlags(&argc, &argv, &matrix_options,
                                          &runtime_options)) {
-    fprintf(stderr, "usage: %s --target-id N [--port 5000] [led options]\n",
+    fprintf(stderr,
+            "usage: %s --target-id N [--port 5000] [--no-panel-flip] "
+            "[led options]\n",
             argv[0]);
     return 1;
   }
@@ -152,6 +191,9 @@ int main(int argc, char *argv[]) {
   int port = 5000;
   bool verbose = false;
   bool rotate180 = false;  // パネルを上下逆に取り付けた個体向け
+  // 蛇行の折り返し行を180度回して取り付けてある前提。実機がそうでなければ
+  // --no-panel-flip を付けて無効化する。
+  bool panel_flip = true;
   int health_port = kHealthPort;
   for (int i = 1; i < argc; ++i) {
     if (strcmp(argv[i], "--target-id") == 0 && i + 1 < argc) {
@@ -162,12 +204,14 @@ int main(int argc, char *argv[]) {
       verbose = true;
     } else if (strcmp(argv[i], "--rotate180") == 0) {
       rotate180 = true;
+    } else if (strcmp(argv[i], "--no-panel-flip") == 0) {
+      panel_flip = false;
     } else if (strcmp(argv[i], "--health-port") == 0 && i + 1 < argc) {
       health_port = atoi(argv[++i]);
     }
   }
-  if (target_id < 0 || target_id > 3) {
-    fprintf(stderr, "error: --target-id は 0〜3 で指定する\n");
+  if (target_id < 0 || target_id > 2) {
+    fprintf(stderr, "error: --target-id は 0〜2 で指定する\n");
     return 1;
   }
 
@@ -205,9 +249,11 @@ int main(int argc, char *argv[]) {
   signal(SIGINT, StopHandler);
   signal(SIGTERM, StopHandler);
 
-  printf("pi-client: target_id=%d port=%d %dx%d (chain=%d parallel=%d) rotate180=%s\n",
+  printf("pi-client: target_id=%d port=%d %dx%d (chain=%d parallel=%d) "
+         "rotate180=%s panel_flip=%s\n",
          target_id, port, kCanvasWidth, kSliceHeight, matrix_options.chain_length,
-         matrix_options.parallel, rotate180 ? "yes" : "no");
+         matrix_options.parallel, rotate180 ? "yes" : "no",
+         panel_flip ? "yes" : "no");
   fflush(stdout);
 
   FrameAssembler assembler;
@@ -364,13 +410,32 @@ int main(int argc, char *argv[]) {
 
     const std::uint8_t(*lut)[3] = (assembler.palette_mode == 0) ? kFc6 : kMsx16;
     const std::uint8_t *src = assembler.buffer;
-    for (int y = 0; y < kSliceHeight; ++y) {
-      for (int x = 0; x < kCanvasWidth; ++x) {
-        const std::uint8_t *rgb = lut[*src++];
-        // 上下逆に取り付けたパネルは、描画時に点対称へ写す。
-        const int dx = rotate180 ? (kCanvasWidth - 1 - x) : x;
-        const int dy = rotate180 ? (kSliceHeight - 1 - y) : y;
-        canvas->SetPixel(dx, dy, rgb[0], rgb[1], rgb[2]);
+    // スライスはパネル単位で走査する。格子上の位置ごとにチェーン位置が決まる
+    // ため、除算を画素ごとに繰り返さずに済む。
+    for (int panel_row = 0; panel_row < kPanelRows; ++panel_row) {
+      for (int panel_col = 0; panel_col < kPanelCols; ++panel_col) {
+        const PanelSlot slot = kPanelMap[panel_row][panel_col];
+        const bool flip = panel_flip && kPanelFlipped[panel_row][panel_col];
+        // rpi-rgb-led-matrix はチェーンの1枚目を canvas の右端へ置く。素直に
+        // chain 番号を左からの位置として扱うと、各行が 0→7 ではなく 7→0 に並ぶ。
+        const int chain_x = (kChainLength - 1 - slot.chain) * kPanelSize;
+        const int chain_y = slot.parallel * kPanelSize;
+        for (int oy = 0; oy < kPanelSize; ++oy) {
+          for (int ox = 0; ox < kPanelSize; ++ox) {
+            // スライス上の読み出し位置。装置ごと上下逆なら点対称へ写す。
+            int sx = panel_col * kPanelSize + ox;
+            int sy = panel_row * kPanelSize + oy;
+            if (rotate180) {
+              sx = kCanvasWidth - 1 - sx;
+              sy = kSliceHeight - 1 - sy;
+            }
+            const std::uint8_t *rgb = lut[src[sy * kCanvasWidth + sx]];
+            // 折り返し行のパネルが180度回してあるなら、パネル内も点対称へ。
+            const int dx = chain_x + (flip ? kPanelSize - 1 - ox : ox);
+            const int dy = chain_y + (flip ? kPanelSize - 1 - oy : oy);
+            canvas->SetPixel(dx, dy, rgb[0], rgb[1], rgb[2]);
+          }
+        }
       }
     }
     canvas = matrix->SwapOnVSync(canvas);
