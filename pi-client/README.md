@@ -96,6 +96,29 @@ sudo ./chain8_test --led-chain=8 --led-parallel=1 \
 配線は電源断状態で行い、パネル1枚、2枚、4枚、8枚の順に増やして確認する。番号が
 途中から欠ける・順番が違う・乱れる場合は、直前に追加したパネルとそのHUB75ケーブルを外して確認する。
 
+## パネルごとの色補正
+
+パネルの個体差は、HUB75の出力レーンとチェーン位置ごとのRGB倍率で補正できる。まず
+`panel_calibration.example.conf`をPi上へコピーして編集する。形式は
+`lane chain R G B`で、`lane`はP0/P1/P2を`0/1/2`、`chain`はPiから数えて`0`始まりで指定する。
+倍率は`0`〜`2`で、色が強いチャンネルは1未満、弱いチャンネルは1超へ少しずつ調整する。
+
+```bash
+cp panel_calibration.example.conf panel_calibration.conf
+sudo ./pi_client --target-id 0 --panel-calibration "$PWD/panel_calibration.conf"
+```
+
+調整中は、制御Piから対象の表示Piだけへ同じ単色を送る。白→グレー→赤→緑→青の順に
+中心付近の明るさ・色味を見比べる。ディスプレーPiの`target_id`は通常どおり保持する。
+
+```bash
+python3 host/test_mode/panel_calibration.py --pi 192.168.10.101:5000 \
+  --target-id 0 --color white
+```
+
+補正値を変えたらPiの表示クライアントを再起動して再確認する。スマートフォン撮影で判断する場合は、
+自動露出・自動ホワイトバランスをロックする。自動補正なしの色彩計があれば、その測定値を基準にする。
+
 ## 死活報告
 
 1 秒ごとに 1 行の ASCII テキストを UDP で送る。宛先は受信パケットの送信元から学習するため、
