@@ -15,6 +15,7 @@ import math
 import signal
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -87,6 +88,44 @@ DEFAULT_START_SETTINGS = {
     "upper_width_min": 0.30,
     "area_gain_min": 0.05,
 }
+DEFAULT_SENSOR_SETTINGS = {
+    "lateral_left_delta_min": 0.10,
+    "lateral_right_delta_min": 0.10,
+    "lateral_center_deadband": 0.045,
+    "jump_rise_y_min": 0.05,
+    "jump_rise_bottom_min": 0.04,
+    **DEFAULT_START_SETTINGS,
+}
+
+# 1フレームだけの深度欠損・反射を人物候補へ昇格させない。
+DEPTH_MASK_HISTORY_SIZE = 3
+DEPTH_MASK_MIN_SUPPORT = 2
+
+
+def temporal_mask_consensus(mask: np.ndarray, history: deque[np.ndarray]) -> np.ndarray:
+    """現在も含む直近フレームの合意を満たす深度マスクだけを残す。"""
+    binary = np.asarray(mask, dtype=np.uint8) > 0
+    history.append(binary.copy())
+    if len(history) < 2:
+        return binary.astype(np.uint8) * 255
+    support = np.sum(np.stack(tuple(history), axis=0), axis=0)
+    return (binary & (support >= min(DEPTH_MASK_MIN_SUPPORT, len(history)))).astype(np.uint8) * 255
+
+
+def valid_percentile(values: np.ndarray, valid: np.ndarray, percentile: float) -> np.ndarray:
+    """無効深度を除外した、画素ごとの保守的な分位点を返す。"""
+    samples = np.asarray(values, dtype=np.float32)
+    valid_mask = np.asarray(valid, dtype=bool)
+    if samples.ndim != 3 or valid_mask.shape != samples.shape:
+        raise ValueError("画素別分位点の入力形状が不正")
+    if not 0.0 <= percentile <= 100.0:
+        raise ValueError("分位点は0以上100以下")
+    counts = np.sum(valid_mask, axis=0)
+    ordered = np.sort(np.where(valid_mask, samples, np.inf), axis=0)
+    # 補間せず上側の標本を選び、少数サンプルでノイズを過小評価しない。
+    rank = np.ceil((counts - 1) * percentile / 100.0).astype(np.intp)
+    result = np.take_along_axis(ordered, rank[None, :, :], axis=0)[0]
+    return np.where(counts > 0, result, 0.0).astype(np.float32)
 
 
 def load_boss_sprite(path: Path = BOSS_IMAGE) -> tuple[np.ndarray, np.ndarray]:
@@ -140,6 +179,9 @@ class InputClassifier:
         jump_rise_y_min: float = 0.05,
         jump_rise_bottom_min: float = 0.04,
         lateral_confirm_frames: int = 4,
+        lateral_left_delta_min: float = 0.10,
+        lateral_right_delta_min: float = 0.10,
+        lateral_center_deadband: float = 0.045,
         start_center_tolerance: float = 0.18,
         start_width_gain: float = 0.06,
         start_upper_width_gain: float = 0.04,
@@ -159,6 +201,18 @@ class InputClassifier:
         self.jump_rise_y_min = float(jump_rise_y_min)
         self.jump_rise_bottom_min = float(jump_rise_bottom_min)
         self.lateral_confirm_frames = max(2, int(lateral_confirm_frames))
+        if (
+            not math.isfinite(lateral_left_delta_min)
+            or not math.isfinite(lateral_right_delta_min)
+            or not math.isfinite(lateral_center_deadband)
+            or not 0.0 < lateral_left_delta_min <= 1.0
+            or not 0.0 < lateral_right_delta_min <= 1.0
+            or not 0.0 < lateral_center_deadband <= 1.0
+        ):
+            raise ValueError("左右移動の閾値は0より大きく1以下の有限値")
+        self.lateral_left_delta_min = float(lateral_left_delta_min)
+        self.lateral_right_delta_min = float(lateral_right_delta_min)
+        self.lateral_center_deadband = float(lateral_center_deadband)
         if (
             not math.isfinite(start_center_tolerance)
             or not math.isfinite(start_width_gain)
@@ -203,6 +257,9 @@ class InputClassifier:
             self.jump_rise_y_min,
             self.jump_rise_bottom_min,
             self.lateral_confirm_frames,
+            self.lateral_left_delta_min,
+            self.lateral_right_delta_min,
+            self.lateral_center_deadband,
             self.start_center_tolerance,
             self.start_width_gain,
             self.start_upper_width_gain,
@@ -257,7 +314,15 @@ class InputClassifier:
             self.x_history.pop(0)
         filtered_x = float(np.median(np.asarray(self.x_history, dtype=np.float32)))
         offset = filtered_x - base.x
-        target = -1 if offset <= -.10 else 1 if offset >= .10 else 0 if abs(offset) <= .045 else self.lateral
+        target = (
+            -1
+            if offset <= -self.lateral_left_delta_min
+            else 1
+            if offset >= self.lateral_right_delta_min
+            else 0
+            if abs(offset) <= self.lateral_center_deadband
+            else self.lateral
+        )
         if target != self.lateral:
             if target != self.candidate:
                 self.candidate, self.candidate_frames = target, 1
@@ -419,13 +484,28 @@ class ForegroundGate:
         self,
         mask: np.ndarray,
         nearer: np.ndarray,
-        threshold: float,
+        threshold: float | np.ndarray,
     ) -> tuple[list[PersonCandidate], np.ndarray]:
         """分離して見える人物候補をすべて返す。追跡の継続判定はPersonTrackerが行う。"""
         binary = np.asarray(mask, dtype=np.uint8).copy()
         depth_gain = np.asarray(nearer, dtype=np.float32)
         if binary.ndim != 2 or depth_gain.shape != binary.shape:
             raise ValueError("人物候補のマスクと深度差分の形状が一致しない")
+        threshold_array = np.asarray(threshold, dtype=np.float32)
+        if threshold_array.ndim == 0:
+            if not math.isfinite(float(threshold_array)) or float(threshold_array) <= 0.0:
+                raise ValueError("人物候補の深度閾値が不正")
+            threshold_map: np.ndarray | None = None
+            scalar_threshold = float(threshold_array)
+        elif (
+            threshold_array.shape == binary.shape
+            and np.all(np.isfinite(threshold_array))
+            and np.all(threshold_array > 0.0)
+        ):
+            threshold_map = threshold_array
+            scalar_threshold = 0.0
+        else:
+            raise ValueError("人物候補の深度閾値マップの形状または値が不正")
         height, width = binary.shape
         floor_start = min(height, max(0, int(round(height * self.FLOOR_CUTOFF_RATIO))))
         binary[floor_start:, :] = 0
@@ -466,7 +546,12 @@ class ForegroundGate:
             if values.size == 0:
                 continue
             median_gain = float(np.median(values))
-            if median_gain < max(self.MIN_DEPTH_GAIN_MM, float(threshold) * 0.75):
+            component_threshold = (
+                scalar_threshold
+                if threshold_map is None
+                else float(np.median(threshold_map[component > 0]))
+            )
+            if median_gain < max(self.MIN_DEPTH_GAIN_MM, component_threshold * 0.75):
                 continue
             local_component = component[y:y + box_height, x:x + box_width] > 0
             upper_height = max(1, int(round(box_height * 0.72)))
@@ -497,7 +582,7 @@ class ForegroundGate:
         self,
         mask: np.ndarray,
         nearer: np.ndarray,
-        threshold: float,
+        threshold: float | np.ndarray,
     ) -> tuple[BodyMeasurement | None, np.ndarray | None, np.ndarray]:
         """単一候補向けの互換API。新規処理はdetect_all()とPersonTrackerを使う。"""
         candidates, binary = self.detect_all(mask, nearer, threshold)
@@ -659,6 +744,9 @@ class SensorController:
         start_upper_width_gain: float = 0.04,
         start_upper_width_min: float = 0.30,
         start_area_gain: float = 0.05,
+        lateral_left_delta_min: float = 0.10,
+        lateral_right_delta_min: float = 0.10,
+        lateral_center_deadband: float = 0.045,
     ) -> None:
         if start_mode not in ("still", "passby", "arm-circle"):
             raise ValueError("開始モードはstill、passby、arm-circleのいずれか")
@@ -672,11 +760,16 @@ class SensorController:
         self.depth_frames: list[np.ndarray] = []
         self.depth_background: np.ndarray | None = None
         self.depth_noise_p95 = 0.0
+        self.depth_noise_p95_map: np.ndarray | None = None
+        self.depth_mask_history: deque[np.ndarray] = deque(maxlen=DEPTH_MASK_HISTORY_SIZE)
         self.foreground_gate = ForegroundGate(self.min_area)
         self.person_tracker = PersonTracker(
             {
                 "jump_rise_y_min": jump_rise_y_min,
                 "jump_rise_bottom_min": jump_rise_bottom_min,
+                "lateral_left_delta_min": lateral_left_delta_min,
+                "lateral_right_delta_min": lateral_right_delta_min,
+                "lateral_center_deadband": lateral_center_deadband,
                 "start_center_tolerance": start_center_tolerance,
                 "start_width_gain": start_width_gain,
                 "start_upper_width_gain": start_upper_width_gain,
@@ -735,9 +828,13 @@ class SensorController:
             stack = np.asarray(self.depth_frames, dtype=np.float32)
             self.depth_background = np.median(stack, axis=0).astype(np.float32)
             valid_background = (stack > 0) & (self.depth_background[None, :, :] > 0)
-            noise_values = np.abs(stack - self.depth_background[None, :, :])[valid_background]
+            deviations = np.abs(stack - self.depth_background[None, :, :])
+            noise_values = deviations[valid_background]
             self.depth_noise_p95 = float(np.percentile(noise_values, 95.0)) if noise_values.size else 0.0
+            # 画面全体の外れ値で全領域の閾値を引き上げず、画素ごとの背景揺れだけを使う。
+            self.depth_noise_p95_map = valid_percentile(deviations, valid_background, 95.0)
             self.depth_frames.clear()
+            self.depth_mask_history.clear()
             self.foreground_gate.reset()
         candidates: list[PersonCandidate] = []
         if background_phase or self.depth_background is None:
@@ -748,10 +845,15 @@ class SensorController:
             valid = (depth > 0) & (background > 0)
             # 人物は背景より手前に現れるため、遠くなる変化は入力候補にしない。
             nearer = background - depth
-            threshold = max(60.0, self.depth_noise_p95 * 3.0, self.depth_min_change_mm)
+            base_threshold = max(60.0, self.depth_min_change_mm)
+            if self.depth_noise_p95_map is None:
+                threshold: float | np.ndarray = max(base_threshold, self.depth_noise_p95 * 3.0)
+            else:
+                threshold = np.maximum(base_threshold, self.depth_noise_p95_map * 3.0)
             mask = ((valid & (nearer >= threshold)).astype(np.uint8) * 255)
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+            mask = temporal_mask_consensus(mask, self.depth_mask_history)
             candidates, mask = self.foreground_gate.detect_all(mask, nearer, threshold)
         if background_phase:
             self.person_tracker.reset()
@@ -1336,9 +1438,12 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--start-still-tolerance", type=float, default=.035, help="静止とみなす人物中心Xの許容幅（ROI比、既定0.035）")
     result.add_argument("--passby-confirm-frames", type=int, default=4, help="通過検知を確定する連続フレーム数")
     result.add_argument("--passby-rearm-frames", type=int, default=15, help="再通過を受け付けるまでの無検知フレーム数")
-    result.add_argument("--jump-rise-y-min", type=float, default=0.05, help="ジャンプ判定の重心上昇量（既定0.05）")
-    result.add_argument("--jump-rise-bottom-min", type=float, default=0.04, help="ジャンプ判定の下端上昇量（既定0.04）")
-    result.add_argument("--calibration", type=Path, default=None, help="🙆学習済みcamera_calibration.json（既定: リポジトリ直下/camera_calibration.json）")
+    result.add_argument("--jump-rise-y-min", type=float, default=None, help="ジャンプ判定の重心上昇量（未指定時は校正値、既定0.05）")
+    result.add_argument("--jump-rise-bottom-min", type=float, default=None, help="ジャンプ判定の下端上昇量（未指定時は校正値、既定0.04）")
+    result.add_argument("--lateral-left-delta-min", type=float, default=None, help="LEFT確定に必要な中心からの距離（未指定時は校正値、既定0.10）")
+    result.add_argument("--lateral-right-delta-min", type=float, default=None, help="RIGHT確定に必要な中心からの距離（未指定時は校正値、既定0.10）")
+    result.add_argument("--lateral-center-deadband", type=float, default=None, help="左右入力を解除する中央不感帯（未指定時は既定0.045）")
+    result.add_argument("--calibration", type=Path, default=None, help="学習済みcamera_calibration.json（既定: リポジトリ直下/camera_calibration.json）")
     result.add_argument("--start-center-tolerance", type=float, default=None, help="腕輪スタート時の中央許容幅。未指定時は校正値")
     result.add_argument("--start-width-gain", type=float, default=None, help="腕輪スタート時の人物幅増加。未指定時は校正値")
     result.add_argument("--start-upper-width-gain", type=float, default=None, help="腕輪スタート時の上半身幅増加。未指定時は校正値")
@@ -1403,8 +1508,8 @@ def preview(indexed: np.ndarray, mode: PaletteMode = PaletteMode.FC6) -> np.ndar
     return np.asarray([item[:3] for item in palette], np.uint8)[indexed][:, :, ::-1]
 
 
-def load_start_calibration(path: Path | None) -> dict[str, float]:
-    """valid校正JSONから🙆判定の学習値だけを安全に読み込む。"""
+def _read_calibration_thresholds(path: Path | None) -> dict[str, object]:
+    """valid校正JSONのthresholdsだけを、壊れた入力を無視して読み込む。"""
     if path is None or not path.is_file():
         return {}
     try:
@@ -1412,27 +1517,76 @@ def load_start_calibration(path: Path | None) -> dict[str, float]:
         if not isinstance(data, dict) or data.get("valid") is not True:
             return {}
         thresholds = data.get("thresholds")
-        start = thresholds.get("start") if isinstance(thresholds, dict) else None
-        if not isinstance(start, dict):
-            return {}
+        return thresholds if isinstance(thresholds, dict) else {}
     except (OSError, UnicodeError, json.JSONDecodeError):
         return {}
+
+
+def _calibration_value(value: object, maximum: float = 1.0) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or not 0.0 < number <= maximum:
+        return None
+    return number
+
+
+def load_sensor_calibration(path: Path | None) -> dict[str, float]:
+    """valid校正JSONから、ゲーム入力に使える閾値を安全に読み込む。"""
+    thresholds = _read_calibration_thresholds(path)
     result: dict[str, float] = {}
-    for key in DEFAULT_START_SETTINGS:
-        value = start.get(key)
-        try:
-            number = float(value)
-        except (TypeError, ValueError):
+    sections = (
+        ("left", "delta_min", "lateral_left_delta_min"),
+        ("right", "delta_min", "lateral_right_delta_min"),
+        ("jump", "rise_y_min", "jump_rise_y_min"),
+        ("jump", "rise_bottom_min", "jump_rise_bottom_min"),
+    )
+    for section_name, key, result_key in sections:
+        section = thresholds.get(section_name)
+        if not isinstance(section, dict):
             continue
-        if math.isfinite(number) and number > 0.0:
-            result[key] = number
+        number = _calibration_value(section.get(key))
+        if number is not None:
+            result[result_key] = number
+
+    start = thresholds.get("start")
+    if isinstance(start, dict):
+        for key in DEFAULT_START_SETTINGS:
+            number = _calibration_value(start.get(key))
+            if number is not None:
+                result[key] = number
     return result
+
+
+def load_start_calibration(path: Path | None) -> dict[str, float]:
+    """valid校正JSONから🙆判定の学習値だけを安全に読み込む互換API。"""
+    calibration = load_sensor_calibration(path)
+    return {key: calibration[key] for key in DEFAULT_START_SETTINGS if key in calibration}
 
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = parser().parse_args(argv)
     calibration_path = args.calibration or HOST.parent / "camera_calibration.json"
-    learned_start = load_start_calibration(calibration_path)
+    learned = load_sensor_calibration(calibration_path)
+    learned_start = {key: learned[key] for key in DEFAULT_START_SETTINGS if key in learned}
+    jump_rise_y_min = args.jump_rise_y_min if args.jump_rise_y_min is not None else learned.get(
+        "jump_rise_y_min", DEFAULT_SENSOR_SETTINGS["jump_rise_y_min"]
+    )
+    jump_rise_bottom_min = args.jump_rise_bottom_min if args.jump_rise_bottom_min is not None else learned.get(
+        "jump_rise_bottom_min", DEFAULT_SENSOR_SETTINGS["jump_rise_bottom_min"]
+    )
+    lateral_left_delta_min = args.lateral_left_delta_min if args.lateral_left_delta_min is not None else learned.get(
+        "lateral_left_delta_min", DEFAULT_SENSOR_SETTINGS["lateral_left_delta_min"]
+    )
+    lateral_right_delta_min = args.lateral_right_delta_min if args.lateral_right_delta_min is not None else learned.get(
+        "lateral_right_delta_min", DEFAULT_SENSOR_SETTINGS["lateral_right_delta_min"]
+    )
+    lateral_center_deadband = args.lateral_center_deadband if args.lateral_center_deadband is not None else DEFAULT_SENSOR_SETTINGS[
+        "lateral_center_deadband"
+    ]
     start_center_tolerance = (
         args.start_center_tolerance
         if args.start_center_tolerance is not None
@@ -1463,8 +1617,16 @@ def main(argv: Iterable[str] | None = None) -> int:
         or args.sensor_width <= 0
         or args.sensor_height <= 0
         or args.preview_scale <= 0
-        or args.jump_rise_y_min <= 0
-        or args.jump_rise_bottom_min <= 0
+        or not math.isfinite(jump_rise_y_min)
+        or not math.isfinite(jump_rise_bottom_min)
+        or not math.isfinite(lateral_left_delta_min)
+        or not math.isfinite(lateral_right_delta_min)
+        or not math.isfinite(lateral_center_deadband)
+        or not 0.0 < jump_rise_y_min <= 1.0
+        or not 0.0 < jump_rise_bottom_min <= 1.0
+        or not 0.0 < lateral_left_delta_min <= 1.0
+        or not 0.0 < lateral_right_delta_min <= 1.0
+        or not 0.0 < lateral_center_deadband <= 1.0
         or start_center_tolerance <= 0
         or start_width_gain <= 0
         or start_upper_width_gain <= 0
@@ -1508,8 +1670,8 @@ def main(argv: Iterable[str] | None = None) -> int:
                 args.sensor_background_seconds,
                 args.min_foreground_area,
                 args.roi,
-                args.jump_rise_y_min,
-                args.jump_rise_bottom_min,
+                jump_rise_y_min,
+                jump_rise_bottom_min,
                 args.depth_min_change_mm,
                 start_mode=args.start_mode,
                 passby_confirm_frames=args.passby_confirm_frames,
@@ -1521,6 +1683,9 @@ def main(argv: Iterable[str] | None = None) -> int:
                 start_upper_width_gain=start_upper_width_gain,
                 start_upper_width_min=start_upper_width_min,
                 start_area_gain=start_area_gain,
+                lateral_left_delta_min=lateral_left_delta_min,
+                lateral_right_delta_min=lateral_right_delta_min,
+                lateral_center_deadband=lateral_center_deadband,
             )
         sender = UdpFrameSender([parse_pi(value) for value in args.pi], args.chunk_size) if args.send else None
     except (RuntimeError, ValueError) as exc:
