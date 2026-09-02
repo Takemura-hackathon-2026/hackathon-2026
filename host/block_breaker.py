@@ -747,10 +747,28 @@ class SensorController:
         lateral_left_delta_min: float = 0.10,
         lateral_right_delta_min: float = 0.10,
         lateral_center_deadband: float = 0.045,
+        debug_preview: bool = True,
+        capture_decimate: int = 1,
     ) -> None:
         if start_mode not in ("still", "passby", "arm-circle"):
             raise ValueError("開始モードはstill、passby、arm-circleのいずれか")
-        self.capture = capture if capture is not None else StructureSensorSource(width, height, capture_fps)
+        try:
+            capture_decimate = int(capture_decimate)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("深度取得の間引き幅は1〜16の整数") from exc
+        if not 1 <= capture_decimate <= 16:
+            raise ValueError("深度取得の間引き幅は1〜16の整数")
+        # ROIは取得解像度の座標で指定されるため、間引くと意味が変わる。両立させない。
+        self.capture_decimate = 1 if roi is not None else capture_decimate
+        if capture is not None:
+            self.capture = capture
+        elif self.capture_decimate == 1:
+            self.capture = StructureSensorSource(width, height, capture_fps)
+        else:
+            self.capture = StructureSensorSource(width, height, capture_fps, decimate=self.capture_decimate)
+        # 表示しない経路（sensor_agent）でプレビューを描くと、1フレームの処理が
+        # 取得周期を超えて入力遅延になる。描画は見る側だけが有効にする。
+        self.debug_preview = bool(debug_preview)
         self.start_mode = start_mode
         self.background_seconds = max(.2, background_seconds)
         self.min_area = max(1, min_area)
@@ -868,22 +886,24 @@ class SensorController:
         accepted_mask = np.zeros_like(mask)
         if body is not None and contour is not None:
             cv2.drawContours(accepted_mask, [contour], -1, 255, -1)
-        debug = depth_preview(image)
-        for candidate in candidates:
-            cv2.drawContours(debug, [candidate.contour], -1, (255, 170, 0), 1)
-        if body is not None and contour is not None:
-            cv2.drawContours(debug, [contour], -1, (0, 255, 0), 1)
-            cv2.putText(
-                debug,
-                f"P{active.track_id}/{people_detected}",
-                (max(0, int(body.x * width) - 20), max(30, int(body.y * height) - 8)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                .42,
-                (0, 255, 0),
-                1,
-                cv2.LINE_AA,
-            )
-        cv2.putText(debug, self.stage, (6, 18), cv2.FONT_HERSHEY_SIMPLEX, .55, (0, 230, 230), 1, cv2.LINE_AA)
+        debug: np.ndarray | None = None
+        if self.debug_preview:
+            debug = depth_preview(image)
+            for candidate in candidates:
+                cv2.drawContours(debug, [candidate.contour], -1, (255, 170, 0), 1)
+            if body is not None and contour is not None:
+                cv2.drawContours(debug, [contour], -1, (0, 255, 0), 1)
+                cv2.putText(
+                    debug,
+                    f"P{active.track_id}/{people_detected}",
+                    (max(0, int(body.x * width) - 20), max(30, int(body.y * height) - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    .42,
+                    (0, 255, 0),
+                    1,
+                    cv2.LINE_AA,
+                )
+            cv2.putText(debug, self.stage, (6, 18), cv2.FONT_HERSHEY_SIMPLEX, .55, (0, 230, 230), 1, cv2.LINE_AA)
         self.debug, self.mask, self.accepted_mask = debug, mask, accepted_mask
         if background_phase:
             return InputState()

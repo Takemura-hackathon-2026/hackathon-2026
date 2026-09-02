@@ -30,6 +30,12 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--sensor-width", type=int, default=640)
     result.add_argument("--sensor-height", type=int, default=480)
     result.add_argument("--sensor-fps", type=float, default=30.0)
+    result.add_argument(
+        "--capture-decimate",
+        type=int,
+        default=1,
+        help="深度をN画素おきに間引いて取得（既定1。2で転送量1/4）",
+    )
     result.add_argument("--sensor-background-seconds", type=float, default=2.0)
     result.add_argument("--min-foreground-area", type=int, default=420)
     result.add_argument("--depth-min-change-mm", type=float, default=0.0)
@@ -65,6 +71,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         or args.passby_rearm_frames < 2
         or args.seconds < 0
         or args.frames < 0
+        or not 1 <= args.capture_decimate <= 16
     ):
         print("error: センサー、判定、実行時間の引数が不正", file=sys.stderr)
         return 2
@@ -129,6 +136,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             lateral_left_delta_min=lateral_left_delta_min,
             lateral_right_delta_min=lateral_right_delta_min,
             lateral_center_deadband=lateral_center_deadband,
+            debug_preview=False,
+            capture_decimate=args.capture_decimate,
         )
         sender = InputStateSender(destination)
         control_receiver = SensorControlReceiver(control_bind)
