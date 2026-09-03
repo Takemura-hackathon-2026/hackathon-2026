@@ -12,6 +12,7 @@ import ctypes
 import ctypes.util
 import json
 import math
+import random
 import signal
 import sys
 import time
@@ -44,7 +45,12 @@ UP_KEYS = frozenset((82, 2490368, 65362, 63232))
 # これを長くすると、キーを離した後も慣性のように動いて見える。
 # X11のキー状態取得が使えない環境でのフォールバック用。
 KEYBOARD_EVENT_HOLD_SECONDS = 0.08
-BOSS_IMAGE = HOST / "assets" / "takemuraface_fc6.png"
+BOSS_IMAGES = (
+    HOST / "assets" / "takemuraface_fc6.png",
+    HOST / "assets" / "inagakiface.png",
+    HOST / "assets" / "ookiface.png",
+    HOST / "assets" / "robo_takemuraface.png",
+)
 DEFAULT_START_SETTINGS = {
     "center_tolerance": 0.18,
     "width_gain_min": 0.06,
@@ -54,7 +60,7 @@ DEFAULT_START_SETTINGS = {
 }
 
 
-def load_boss_sprite(path: Path = BOSS_IMAGE) -> tuple[np.ndarray, np.ndarray]:
+def load_boss_sprite(path: Path) -> tuple[np.ndarray, np.ndarray]:
     """透過PNGをFC6インデックス画像と不透明マスクへ変換する。"""
     source = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
     if source is None:
@@ -934,8 +940,9 @@ class BlockBreaker:
     boss_move_speed = 52.0
     clear_delay = 1.8
 
-    def __init__(self) -> None:
-        sprite, mask = load_boss_sprite()
+    def __init__(self, boss_image: Path | None = None) -> None:
+        self.boss_image = boss_image or BOSS_IMAGES[0]
+        sprite, mask = load_boss_sprite(self.boss_image)
         size = (round(sprite.shape[1] * self.boss_scale), round(sprite.shape[0] * self.boss_scale))
         self.boss_sprite = cv2.resize(sprite, size, interpolation=cv2.INTER_NEAREST)
         self.boss_mask = cv2.resize(mask.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST) > 0
@@ -1243,6 +1250,276 @@ class BlockBreaker:
         return frame
 
 
+@dataclass
+class ClassicBlock:
+    x: float
+    y: float
+    width: float
+    height: float
+    color: int
+
+
+class ClassicThenBoss:
+    """穴あき通常面をクリアすると、ランダムなボス戦へ進むゲーム本体。"""
+
+    paddle_width, paddle_height, paddle_y = BlockBreaker.paddle_width, BlockBreaker.paddle_height, BlockBreaker.paddle_y
+    ball_radius, paddle_speed, initial_speed = BlockBreaker.ball_radius, BlockBreaker.paddle_speed, BlockBreaker.initial_speed
+    stage_clear_delay = 1.8
+    # 最初から縦に抜いた通路。ボールが奥まで入りやすく、連続してブロックを崩せる。
+    opening_columns = frozenset((1, 4, 6))
+    block_colors = (0x00, 0x05, 0x0A, 0x0E, 0x12, 0x16, 0x1E, 0x22, 0x29, 0x2D)
+
+    def __init__(self) -> None:
+        self.phase = "classic"
+        self.blocks: list[ClassicBlock] = []
+        self.boss: BlockBreaker | None = None
+        self.score = 0
+        self.lives = 3
+        self.ball = Ball(0.0, 0.0)
+        self._paddle_x = 0.0
+        self._serving = True
+        self._game_started = False
+        self._game_over_until = 0.0
+        self._life_loss_event = False
+        self._stage_start_request = False
+        self.stage_clear_remaining = 0.0
+        self.reset(full=True)
+
+    @property
+    def paddle_x(self) -> float:
+        return self.boss.paddle_x if self.boss is not None else self._paddle_x
+
+    @paddle_x.setter
+    def paddle_x(self, value: float) -> None:
+        if self.boss is not None:
+            self.boss.paddle_x = value
+        else:
+            self._paddle_x = value
+
+    @property
+    def serving(self) -> bool:
+        return self.boss.serving if self.boss is not None else self._serving
+
+    @property
+    def game_started(self) -> bool:
+        return self.boss.game_started if self.boss is not None else self._game_started
+
+    @property
+    def game_over_until(self) -> float:
+        return self.boss.game_over_until if self.boss is not None else self._game_over_until
+
+    def _make_blocks(self) -> list[ClassicBlock]:
+        columns, rows, margin, gap = 8, 6, 8, 2
+        width = (CANVAS_WIDTH - margin * 2 - gap * (columns - 1)) / columns
+        return [
+            ClassicBlock(
+                margin + column * (width + gap),
+                48 + row * 14,
+                width,
+                12,
+                self.block_colors[(row + column) % len(self.block_colors)],
+            )
+            for row in range(rows)
+            for column in range(columns)
+            if column not in self.opening_columns
+        ]
+
+    def reset(self, full: bool = False) -> None:
+        self.phase = "classic"
+        self.boss = None
+        self.score = 0
+        self.lives = 3
+        self._paddle_x = (CANVAS_WIDTH - self.paddle_width) / 2
+        self._serving = True
+        self._game_started = False
+        self._game_over_until = 0.0
+        self._life_loss_event = False
+        self._stage_start_request = False
+        self.stage_clear_remaining = 0.0
+        self.blocks = self._make_blocks()
+        self._place_ball_on_paddle()
+
+    def _place_ball_on_paddle(self) -> None:
+        self.ball = Ball(self._paddle_x + self.paddle_width / 2, self.paddle_y - self.ball_radius - 1)
+
+    def _move_paddle(self, dt: float, controls: GameInput) -> None:
+        if controls.paddle_center_x is not None and math.isfinite(float(controls.paddle_center_x)):
+            self._paddle_x = min(
+                max(0.0, float(controls.paddle_center_x) - self.paddle_width / 2),
+                CANVAS_WIDTH - self.paddle_width,
+            )
+        else:
+            self._paddle_x = min(
+                max(0.0, self._paddle_x + max(-1, min(1, controls.lateral)) * self.paddle_speed * dt),
+                CANVAS_WIDTH - self.paddle_width,
+            )
+
+    def _launch_classic(self) -> None:
+        self._serving = False
+        self._game_started = True
+        self.ball.vx, self.ball.vy = self.initial_speed * .52, -self.initial_speed * .86
+
+    def _hit_block(self, block: ClassicBlock) -> bool:
+        near_x = min(max(self.ball.x, block.x), block.x + block.width)
+        near_y = min(max(self.ball.y, block.y), block.y + block.height)
+        dx, dy = self.ball.x - near_x, self.ball.y - near_y
+        if dx * dx + dy * dy > self.ball_radius ** 2:
+            return False
+        if abs(dx) > abs(dy):
+            self.ball.vx = -self.ball.vx
+        else:
+            self.ball.vy = -self.ball.vy
+        return True
+
+    def _bounce_edges(self) -> None:
+        ball = self.ball
+        if ball.x - self.ball_radius < 0 or ball.x + self.ball_radius >= CANVAS_WIDTH:
+            ball.x = min(max(self.ball_radius, ball.x), CANVAS_WIDTH - self.ball_radius - 1)
+            ball.vx = -ball.vx
+        if ball.y - self.ball_radius < 26:
+            ball.y, ball.vy = 26 + self.ball_radius, abs(ball.vy)
+        if (
+            ball.vy > 0
+            and ball.y + self.ball_radius >= self.paddle_y
+            and ball.y - self.ball_radius <= self.paddle_y + self.paddle_height
+            and self._paddle_x - self.ball_radius <= ball.x <= self._paddle_x + self.paddle_width + self.ball_radius
+        ):
+            ball.y = self.paddle_y - self.ball_radius - 1
+            hit = (ball.x - (self._paddle_x + self.paddle_width / 2)) / (self.paddle_width / 2)
+            speed = min(300, math.hypot(ball.vx, ball.vy) * 1.015)
+            ball.vx = speed * hit * .92
+            ball.vy = -max(80, math.sqrt(max(1, speed * speed - ball.vx * ball.vx)))
+
+    def _lose_classic_ball(self, now: float) -> None:
+        self.lives -= 1
+        self._life_loss_event = self.lives > 0
+        self._serving = True
+        self.ball.vx = self.ball.vy = 0.0
+        if self.lives <= 0:
+            self._game_over_until = now + 1.8
+        self._place_ball_on_paddle()
+
+    def _start_random_boss(self) -> None:
+        self.phase = "boss"
+        self.boss = BlockBreaker(random.choice(BOSS_IMAGES))
+        self._stage_start_request = True
+
+    def consume_life_loss_event(self) -> bool:
+        if self.boss is not None:
+            return self.boss.consume_life_loss_event()
+        event = self._life_loss_event
+        self._life_loss_event = False
+        return event
+
+    def consume_stage_start_request(self) -> bool:
+        event = self._stage_start_request
+        self._stage_start_request = False
+        return event
+
+    def step(self, dt: float, controls: GameInput, now: float) -> None:
+        dt = min(.04, max(0.0, dt))
+        if self.boss is not None:
+            if (self.boss.boss_defeated and self.boss.clear_remaining <= dt) or (
+                self.boss.game_over_until and now >= self.boss.game_over_until
+            ):
+                self.reset(full=True)
+                return
+            self.boss.step(dt, controls, now)
+            return
+        if self.phase == "transition":
+            self.stage_clear_remaining = max(0.0, self.stage_clear_remaining - dt)
+            if self.stage_clear_remaining == 0.0:
+                self._start_random_boss()
+            return
+        if self._game_over_until:
+            if now >= self._game_over_until:
+                self.reset(full=True)
+            return
+        self._move_paddle(dt, controls)
+        if self._serving:
+            self._place_ball_on_paddle()
+            if controls.launch:
+                self._launch_classic()
+            return
+        steps = max(1, min(8, math.ceil(math.hypot(self.ball.vx * dt, self.ball.vy * dt) / 2)))
+        for _ in range(steps):
+            self.ball.x += self.ball.vx * dt / steps
+            self.ball.y += self.ball.vy * dt / steps
+            self._bounce_edges()
+            for index, block in enumerate(self.blocks):
+                if self._hit_block(block):
+                    del self.blocks[index]
+                    self.score += 10
+                    break
+            if not self.blocks:
+                self.phase = "transition"
+                self.stage_clear_remaining = self.stage_clear_delay
+                self._serving = True
+                self.ball.vx = self.ball.vy = 0.0
+                return
+            if self.ball.y - self.ball_radius > CANVAS_HEIGHT:
+                self._lose_classic_ball(now)
+                return
+
+    def _render_classic(
+        self,
+        sensor_stage: str,
+        boundaries: bool,
+        countdown: int | None,
+        start_mode: str,
+        start_hold_remaining: float | None,
+    ) -> np.ndarray:
+        frame = np.full((CANVAS_HEIGHT, CANVAS_WIDTH), SKY, np.uint8)
+        for index in range(30):
+            frame[30 + (index * 71 + 13) % 300, (index * 47 + 19) % CANVAS_WIDTH] = SKY_DOT
+        frame[22:24, :] = DIM
+        BlockBreaker._text(frame, f"SCORE {self.score:05d}", (6, 17), TEXT, .38)
+        for life in range(self.lives):
+            cv2.circle(frame, (164 + life * 11, 12), 3, int(TEXT), -1, lineType=cv2.LINE_8)
+        for block in self.blocks:
+            x0, y0 = int(round(block.x)), int(round(block.y))
+            x1, y1 = int(round(block.x + block.width)), int(round(block.y + block.height))
+            frame[y0:y1, x0:x1] = block.color
+            frame[y0:y0 + 2, x0:x1] = TEXT
+        x = int(round(self._paddle_x))
+        frame[int(self.paddle_y):int(self.paddle_y + self.paddle_height), x:x + int(self.paddle_width)] = PADDLE
+        frame[int(self.paddle_y):int(self.paddle_y + 2), x:x + int(self.paddle_width)] = PADDLE_EDGE
+        if self.phase != "transition" and not self._game_over_until:
+            cv2.circle(frame, (int(round(self.ball.x)), int(round(self.ball.y))), int(self.ball_radius), int(BALL), -1, lineType=cv2.LINE_8)
+        if self.phase == "transition":
+            BlockBreaker._text(frame, "STAGE CLEAR", (30, 228), 0x12, .62)
+        elif self._game_over_until:
+            BlockBreaker._text(frame, "GAME OVER", (43, 228), 0x06, .72)
+        elif self._serving:
+            if countdown is not None and countdown > 0:
+                BlockBreaker._text(frame, f"START IN {countdown}", (50, 232), 0x0E, .58)
+            else:
+                prompt = "STAND STILL TO START" if start_mode == "still" else "WALK PAST TO START" if start_mode == "passby" else "ARMS CIRCLE TO LAUNCH"
+                BlockBreaker._text(frame, prompt if sensor_stage == "READY" else "SENSOR CAL", (16, 232), 0x0E, .42)
+            if sensor_stage == "BACKGROUND":
+                BlockBreaker._text(frame, "CLEAR SENSOR", (32, 252), TEXT, .40)
+            elif sensor_stage == "STANCE":
+                BlockBreaker._text(frame, "STAND STILL", (37, 252), TEXT, .40)
+            elif start_mode == "still" and start_hold_remaining is not None:
+                BlockBreaker._text(frame, f"HOLD {math.ceil(start_hold_remaining)}", (62, 252), TEXT, .40)
+        if boundaries:
+            for y in (96, 192, 288):
+                frame[y:y + 1, :] = DIM
+        return frame
+
+    def render(
+        self,
+        sensor_stage: str,
+        boundaries: bool = False,
+        countdown: int | None = None,
+        start_mode: str = "arm-circle",
+        start_hold_remaining: float | None = None,
+    ) -> np.ndarray:
+        if self.boss is not None:
+            return self.boss.render(sensor_stage, boundaries, countdown, start_mode, start_hold_remaining)
+        return self._render_classic(sensor_stage, boundaries, countdown, start_mode, start_hold_remaining)
+
+
 def parse_roi(value: str) -> tuple[int, int, int, int]:
     try:
         parts = tuple(int(part) for part in value.split(","))
@@ -1421,7 +1698,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         print(f"error: {exc}（開発用には --keyboard）", file=sys.stderr)
         return 2
     keyboard_state = X11KeyboardState() if not args.no_preview else None
-    game, running, frame_id = BlockBreaker(), True, 0
+    game, running, frame_id = ClassicThenBoss(), True, 0
     follower = PaddleFollower(
         CANVAS_WIDTH,
         game.paddle_width,
@@ -1530,12 +1807,21 @@ def main(argv: Iterable[str] | None = None) -> int:
                     print("event=life-lost select=front-player wait=still-hold", flush=True)
                 else:
                     print("event=life-lost wait=manual-launch", flush=True)
-            if was_game_started and not game.game_started:
+            stage_start_requested = game.consume_stage_start_request()
+            if was_game_started and not game.game_started and not stage_start_requested:
                 countdown_remaining = 0.0
                 awaiting_player_hold = False
                 if sensor is not None:
                     sensor.reselect_player()
                 print("event=round-reset select=front-player", flush=True)
+            if stage_start_requested:
+                countdown_remaining = 0.0
+                if sensor is not None:
+                    sensor.reselect_player()
+                    awaiting_player_hold = True
+                    print("event=stage-clear boss=random select=front-player wait=still-hold", flush=True)
+                else:
+                    print("event=stage-clear boss=random wait=manual-launch", flush=True)
             if was_serving and not game.serving:
                 print("event=game-launch", flush=True)
             manual_launch, last = False, now
