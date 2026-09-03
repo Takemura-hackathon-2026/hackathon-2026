@@ -14,13 +14,16 @@ all: pi_client
 pi_client: pi_client.o $(RGB_LIBRARY)
 	$(CXX) $< -o $@ $(LDFLAGS)
 
-pi_client.o: pi_client.cc
+pi_client.o: pi_client.cc panel_calibration.h
 	$(CXX) -I$(RGB_INCDIR) $(CXXFLAGS) -c -o $@ $<
+
+panel_calibration_selftest: panel_calibration_selftest.cc panel_calibration.h
+	$(CXX) $(CXXFLAGS) -o $@ $<
 
 $(RGB_LIBRARY):
 	$(MAKE) -C $(RGB_LIBDIR)
 
 clean:
-	rm -f pi_client pi_client.o
+	rm -f pi_client pi_client.o panel_calibration_selftest
 
-.PHONY: all clean
+.PHONY: all clean panel_calibration_selftest

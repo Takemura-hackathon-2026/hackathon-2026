@@ -1,13 +1,17 @@
-# ネットワーク設計
+# ネットワーク設計（現行3台表示構成）
 
-計画書 §2・§5 に対応する実配線・アドレス設計。2026-08-06 時点の実機構成に基づく。
+計画書 §2・§5 に対応する実配線・アドレス設計。現行実機の接続先・台数は
+[docs/CONNECTION_INFO.md](CONNECTION_INFO.md)を正本とする。
+
+現行は制御Pi `pi3-control`、センサーPi `pi3-sensor`、表示Pi 3台（`.101`、`.102`、`.104`）で構成する。
+本書に残る4台の送信・テスト例は旧構成の検証用であり、現行運用の接続先には`.103`を含めない。
 
 ## セグメント
 
 | 記号 | 用途 | 経路 | ネットワーク | 備考 |
 |---|---|---|---|---|
-| A | フレーム配信 | 親機 `enp2s0` — 1GbEスイッチ — Pi ×4 | `192.168.10.0/24` | 専用有線。ここに他機器を接続しない |
-| B | 開発機直結 | 親機 `enp3s0` — Mac `en7`（USB-Ethernet） | `192.168.20.0/24` | SSH・転送・インターネット共有 |
+| A | フレーム配信 | 制御Pi `192.168.10.2` — 1GbEスイッチ — 表示Pi ×3 | `192.168.10.0/24` | 専用有線。ここに他機器を接続しない |
+| B | 開発機直結 | 親機 `enp3s0` — Mac `en9`（USB-Ethernet） | `192.168.20.0/24` | SSH・転送・インターネット共有 |
 
 セグメントAは60fpsのフレーム配信専用とし、ブロードキャストを出す機器やWi-Fiブリッジを混ぜない。
 
@@ -15,19 +19,21 @@
 
 ### セグメントA（フレーム配信）
 
-| 機器 | ホスト名 | IP | `target_id` | 担当行（論理画面 192×384） |
+| 機器 | ホスト名 | IP | `target_id` | 現行の役割 |
 |---|---|---|---:|---|
-| 親機（Ubuntu） | `th1` | `192.168.10.1` | — | 全体を描画・4分割 |
-| Raspberry Pi 1 | `pi1` | `192.168.10.101` | `0` | Y = 0–95（最上段） |
-| Raspberry Pi 2 | `pi2` | `192.168.10.102` | `1` | Y = 96–191 |
-| Raspberry Pi 3 | `pi3` | `192.168.10.103` | `2` | Y = 192–287 |
-| Raspberry Pi 4 | `pi4` | `192.168.10.104` | `3` | Y = 288–383（最下段） |
+| 制御Pi（表示LAN側） | `pi3-control` | `192.168.10.2` | — | 3台へ送信 |
+| 表示機1 | `pi1` | `192.168.10.101` | `0` | 表示順1、UDP受信 |
+| 表示機2 | `pi2` | `192.168.10.102` | `1` | 表示順2、UDP受信 |
+| 表示機3 | `pi4` | `192.168.10.104` | `3` | 表示順3、UDP受信 |
+| 旧表示機3 | `pi3` | `192.168.10.103` | `2` | 現行構成では未接続 |
+| Ubuntu主機（管理・開発） | `th1` | `192.168.10.1` | — | 現行の送信元ではない |
 | 保守用PC等 | — | `192.168.10.200`–`254` | — | 常設しない |
 
 規約:
 
-- **`target_id` = 第4オクテット − 101**。物理的な段の上から順に採番し、配線を入れ替えたらIPも入れ替える。
+- **`target_id` = 第4オクテット − 101**。現行の表示Piは`0`、`1`、`3`で、`2`は未使用。
   `pi_client` 側は `--target-id` で明示し、自機宛以外のチャンクは捨てる。
+- 表示順は`1`、`2`、`3`だが、IP・`target_id`の連番とは一致しない。表示順3は`pi4`（`.104`、`target_id 3`）。
 - 上表の「担当行」は縦一列（192×384）に積んだ通常配置の場合。TEST4（SUPERTESTMODE）のように
   縦一列でない物理配置では、`target_id` と IP の対応はそのままに、割り当てる領域だけを
   主機側（`test4_super.py` の `LAYOUT`）で差し替える。
@@ -40,15 +46,15 @@
 | 機器 | IP | 備考 |
 |---|---|---|
 | 親機 `enp3s0` | `192.168.20.1/24` | `169.254.10.1/16` も併記（旧設定の退避用） |
-| Mac `en7` | `192.168.20.50/24` | インターネット共有時は親機のゲートウェイになる |
+| Mac `en9` | `192.168.20.50/24` | インターネット共有時は親機のゲートウェイになる |
 
 ## ポート
 
 | 用途 | 方向 | プロトコル | ポート | 状態 |
 |---|---|---|---|---|
-| フレームチャンク | 主機 → 各Pi | UDP | `5000`（各Pi側で待受） | 実装済み |
-| READY 応答 | 各Pi → 主機 | UDP | `5100`（主機側で待受） | **未実装**（同期段階B） |
-| 死活・診断（FPS、欠損数） | 各Pi → 主機 | UDP | `5101`（主機側で待受） | 実装済み。`pi_client` が1秒ごとに送出、TEST2 が受信 |
+| フレームチャンク | 現行: 制御Pi → 表示Pi 3台／旧汎用経路: 主機 → 各Pi | UDP | `5000`（各Pi側で待受） | 実装済み |
+| READY 応答 | 各Pi → 制御Pi（現行） | UDP | `5100`（制御Pi側で待受） | **未実装**（同期段階B） |
+| 死活・診断（FPS、欠損数） | 各Pi → 制御Pi（現行） | UDP | `5101`（制御Pi側で待受） | 実装済み。`pi_client` が1秒ごとに送出、TEST2 が受信 |
 | SSH | 開発機 → 各機 | TCP | `22` | — |
 
 UDPペイロードは1200バイト固定（`--chunk-size`）。MTU 1500のままIPフラグメントを避ける。
@@ -64,9 +70,11 @@ PIHEALTH target=0 displayed=1234 dropped=2 fps=59.8 up=41 rot=0 temp_c=42.1
 
 いずれもNetworkManager（`nmcli`）を使う。netplanの `90-NM-*.yaml` はNMの生成物なので手編集しない。
 
-### 親機 `enp2s0`（セグメントA）
+### 旧主機 `enp2s0`（旧セグメントAの直接送信例）
 
-既存の `netplan-enp2s0` プロファイルと競合するため、先に自動接続を止める。
+現行は制御Pi `pi3-control` が表示LANの送信元であり、以下はUbuntu主機から直接送信していた
+旧構成の設定例として残す。実機の現行サービスを変更する手順ではない。旧来の
+`netplan-enp2s0` プロファイルと競合する場合は、先に自動接続を止める。
 
 ```bash
 sudo nmcli con mod netplan-enp2s0 connection.autoconnect no
@@ -78,7 +86,8 @@ sudo nmcli con up led-net
 
 ### Raspberry Pi 各機（Raspberry Pi OS Bookworm 以降、NetworkManager）
 
-`pi1` の例。`.101` の部分を各機で `.102` / `.103` / `.104` に変える。
+`pi1`（`.101`、`target_id 0`）の例。現行の他機は`pi2`（`.102`、`target_id 1`）と
+`pi4`（`.104`、`target_id 3`）に合わせる。`.103`は現行構成では設定しない。
 
 ```bash
 sudo nmcli con add type ethernet ifname eth0 con-name led-net \
@@ -88,7 +97,7 @@ sudo nmcli con up led-net
 sudo hostnamectl set-hostname pi1
 ```
 
-### 親機 `enp3s0`（セグメントB、設定済み）
+### 親機 `enp3s0`（セグメントB、管理・開発用）
 
 ```bash
 sudo nmcli con add type ethernet ifname enp3s0 con-name mac-direct \
@@ -132,24 +141,31 @@ sudo nmcli con mod mac-direct ipv4.never-default yes ipv4.gateway "" ipv4.dns ""
 sudo nmcli con up mac-direct
 ```
 
-## 確認手順
+## 確認手順（現行3台）
 
 ```bash
-ping -c 3 192.168.10.101
+for ip in 192.168.10.101 192.168.10.102 192.168.10.104; do
+  ping -c 1 "$ip"
+done
 ```
 
 ```bash
-ssh oyaki "for i in 1 2 3 4; do ping -c1 -W1 192.168.10.10\$i >/dev/null && echo pi\$i OK || echo pi\$i NG; done"
+ssh oyaki "for i in 1 2 4; do ping -c1 -W1 192.168.10.10\$i >/dev/null && echo pi\$i OK || echo pi\$i NG; done"
 ```
 
-各Pi側で表示クライアントを手動インストールする場合（`target_id` は自機のIP末尾 − 101）:
+各表示Pi側で表示クライアントを手動インストールする場合:
 
 ```bash
-./install.sh 0
+./install.sh 0  # pi1 / .101
+./install.sh 1  # pi2 / .102
+./install.sh 3  # pi4 / .104
 ```
 
-通常は主機から4台へ転送・Pi上ビルド・systemd自動起動を一括で設定する。`PI_SSH_USER`はPi側の
-実ユーザー名に置き換える。Pi側でパスワードなしsudoと、`$HOME/rpi-rgb-led-matrix`の配置が必要。
+### 旧配備ヘルパーの注意
+
+`host/oyaki_camera_calibrate.sh` の`pi-deploy`、`pi-status`、`pi-start`は旧4台構成の
+`pi_specs`を使うため、現行3台へそのまま実行しない。Pi側で個別にビルド・有効化するか、
+3台対応の配備処理を使う。Pi側でパスワードなしsudoと、`$HOME/rpi-rgb-led-matrix`の配置が必要。
 
 ```bash
 PI_SSH_USER=takemuralab host/oyaki_camera_calibrate.sh pi-deploy
@@ -161,6 +177,10 @@ PI_SSH_USER=takemuralab host/oyaki_camera_calibrate.sh pi-status
 ```bash
 PI_SSH_USER=takemuralab host/oyaki_camera_calibrate.sh pi-start
 ```
+
+## 旧4台構成の検証（現行運用では使用しない）
+
+テストモードの`send()`は4分割と4宛先を要求するため、以下は旧構成またはローカル結合試験用に残す。
 
 4台へ実際にフレームを送る:
 
@@ -180,15 +200,17 @@ cd host/test_mode && python3 test2_status.py --send \
 
 `NO SIGNAL` は一度も報告が届いていない状態、`LOST` は3秒以上途絶えた状態を指す。
 
-## 現状
-
-2026-08-06 時点。
+## 現状（2026-09-02）
 
 | 項目 | 状態 |
 |---|---|
-| セグメントB（Mac直結） | 疎通確認済み。`ssh oyaki` で鍵認証 |
-| セグメントA（Pi hub） | **未設定**。親機 `enp2s0` はリンク検出済み・IP未割当、Pi側も未設定 |
-| インターネット共有 | 未適用 |
-| フレーム配信（UDP 5000） | 主機側・Pi側とも実装済み。実機での疎通は未確認 |
-| 死活報告（UDP 5101） | 実装済み。実機での疎通は未確認 |
+| Mac `en9` → 表示LAN | `192.168.10.50/24`を保持し、`.101/.102/.104`へSSH疎通確認済み |
+| 表示Pi | `pi1`（`.101`）、`pi2`（`.102`）、`pi4`（`.104`）の3台 |
+| `.103` / `pi3` | ARP応答なし。現行表示機ではない |
+| 制御Pi | `pi3-control`（`.2`）の`pi3-control.service` activeを確認 |
+| センサーPi | `pi3-sensor`（セグメントB `.33`） |
+| フレーム配信（UDP 5000） | 現行制御Piサービスは3台へ送信。汎用テスト経路は4台前提 |
+| 死活報告（UDP 5101） | 現行表示Piから制御Piへ送信する構成 |
 | READY バリア（UDP 5100） | 未実装 |
+
+現行の接続先・台数を変更する場合は、先に[docs/CONNECTION_INFO.md](CONNECTION_INFO.md)を更新する。

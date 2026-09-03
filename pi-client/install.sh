@@ -5,6 +5,8 @@ SOURCE_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 INSTALL_ROOT="/opt/hackathon-2026/pi-client"
 RGB_LIB_DISTRIBUTION="${RGB_LIB_DISTRIBUTION:-$HOME/rpi-rgb-led-matrix}"
 TARGET_ID="${1:-}"
+CALIBRATION_ROOT="/etc/hackathon-2026"
+CALIBRATION_CONFIG="$CALIBRATION_ROOT/panel_calibration.conf"
 
 if [[ ! "$TARGET_ID" =~ ^[0-3]$ ]]; then
   printf '使い方: %s TARGET_ID(0..3)\n' "$0" >&2
@@ -29,6 +31,10 @@ as_root() {
 
 as_root install -d -m 0755 "$INSTALL_ROOT"
 as_root install -m 0755 "$SOURCE_ROOT/pi_client" "$INSTALL_ROOT/pi_client"
+as_root install -d -m 0755 "$CALIBRATION_ROOT"
+if [[ ! -e "$CALIBRATION_CONFIG" ]]; then
+  as_root install -m 0644 "$SOURCE_ROOT/panel_calibration.example.conf" "$CALIBRATION_CONFIG"
+fi
 as_root install -m 0644 "$SOURCE_ROOT/pi-client@.service" /etc/systemd/system/pi-client@.service
 as_root systemctl daemon-reload
 as_root systemctl enable --now "pi-client@${TARGET_ID}.service"

@@ -3,6 +3,11 @@
 Raspberry Pi 上で動く表示専用プロセス。主機から届く 192×96 のパレットインデックス配列を
 受信し、固定 LUT で RGB へ変換して HUB75 へ出力するだけの処理に限定する。
 
+> **現行実機（2026-09-02）:** 表示Piは3台構成で、`pi1`（`192.168.10.101`、
+> `target_id 0`）、`pi2`（`.102`、`target_id 1`）、`pi4`（`.104`、`target_id 3`）を使う。
+> `192.168.10.103` / `target_id 2` は現行構成に含めない。接続先・表示順の正本は
+> [docs/CONNECTION_INFO.md](../docs/CONNECTION_INFO.md) とする。
+
 ```text
 UDP受信 → 固定位置へmemcpy → CRC・パレット範囲確認 → 裏表バッファ交換 → HUB75出力
 ```
@@ -34,8 +39,9 @@ make RGB_LIB_DISTRIBUTION=$HOME/rpi-rgb-led-matrix
 
 ## 実行
 
-GPIO を直接叩くため root 権限が必要。`--target-id` は自機の IP 末尾 − 101
-（`192.168.10.101` なら `0`）。詳しくは [docs/NETWORK.md](../docs/NETWORK.md)。
+GPIO を直接叩くため root 権限が必要。`--target-id` は自機が担当する表示領域を指定する。
+現行の割当は `.101`→`0`、`.102`→`1`、`.104`→`3`（`.103`→`2`は未使用）。詳しくは
+[docs/NETWORK.md](../docs/NETWORK.md)。
 
 ```bash
 sudo ./pi_client --target-id 0
@@ -55,8 +61,13 @@ systemctl is-enabled pi-client@0.service
 systemctl status pi-client@0.service
 ```
 
-主機から4台へ転送・Pi上ビルド・systemd有効化まで行う場合は、oyakiからPiへSSHできるユーザーを
-指定する。`pi-deploy`はPi上の`$HOME/rpi-rgb-led-matrix`を既定のライブラリ位置として使い、
+主機から転送・Pi上ビルド・systemd有効化まで行う配備ヘルパーは、リポジトリ上では旧4台構成の
+`pi_specs`（`.101`〜`.104`）を使う。現行3台構成では`.103`を含めず、各Piへ個別に
+`target_id 0`、`1`、`3`を配備するか、現行の3台用サービス設定を使うこと。
+`pi-deploy`は現状のままでは現行運用へ流用しない。
+
+旧4台構成の配備ヘルパーを検証するときは、oyakiからPiへSSHできるユーザーを指定する。
+`pi-deploy`はPi上の`$HOME/rpi-rgb-led-matrix`を既定のライブラリ位置として使い、
 `PI_RGB_LIB_DISTRIBUTION`で変更できる。Pi側でパスワードなしsudoが使える必要がある。
 
 ```bash
@@ -65,12 +76,12 @@ PI_SSH_USER=takemuralab host/oyaki_camera_calibrate.sh pi-status
 PI_SSH_USER=takemuralab host/oyaki_camera_calibrate.sh pi-start
 ```
 
-PiのIPと`target_id`は`192.168.10.101`→`0`、`.102`→`1`、`.103`→`2`、`.104`→`3`で固定する。
-主機の待機画面は別途`standby-start`で起動する。
+PiのIPと`target_id`は固定する。現行構成では`192.168.10.101`→`0`、`.102`→`1`、
+`.104`→`3`で、`.103`→`2`は未使用。主機の待機画面は別途`standby-start`で起動する。
 
 | オプション | 既定 | 内容 |
 |---|---|---|
-| `--target-id N` | （必須） | 担当領域の番号 `0`〜`3`。他機宛のチャンクは捨てる |
+| `--target-id N` | （必須） | 担当領域の番号 `0`〜`3`。現行は `0`、`1`、`3`。他機宛のチャンクは捨てる |
 | `--port N` | `5000` | フレームチャンクの待受ポート |
 | `--health-port N` | `5101` | 死活報告の送信先ポート |
 | `--rotate180` | 無効 | パネルを上下逆に取り付けた個体向けに点対称へ写す |
@@ -80,6 +91,51 @@ PiのIPと`target_id`は`192.168.10.101`→`0`、`.102`→`1`、`.103`→`2`、`
 上記に加えて rpi-rgb-led-matrix の `--led-*` 系オプションをそのまま受ける。
 既定のパネル輝度は40%で、全体を低めに抑えている。既定のパネル構成は 32×32・`chain_length=6`・`parallel=3`（= 192×96）、
 `hardware_mapping=regular`。
+
+## 32×32パネル単位の色校正
+
+`--panel-calibration PATH` を指定すると、HUB75キャンバス上の32×32パネルごとに
+RGBゲイン（0〜2倍）とRGB共通の輝度倍率（0〜2倍）を適用する。補正対象は論理画面の座標ではなく、
+P0/P1/P2の出力レーンとチェーン位置（0始まり）で指定する。未記載のパネルは1.00倍のままなので、
+現在の構成に合わせて `3レーン×8枚` の設定ファイルを使用する。5列の旧形式も読み込め、その場合の輝度は1.00倍になる。
+
+`install.sh` は `/etc/hackathon-2026/panel_calibration.conf` を初回だけ作成し、既存の
+校正値を上書きしない。systemdサービスはこのファイルを自動的に読み込む。
+
+```text
+# lane chain red_gain green_gain blue_gain brightness
+0 0 0.95 1.00 1.08 0.80
+2 7 1.00 0.92 1.00 1.00
+```
+
+`red_gain` / `green_gain` / `blue_gain` は色味の補正、`brightness` はそのパネルのRGB共通の明るさ補正。
+最終的には各チャンネルへ `RGBゲイン×brightness` を適用する。
+
+校正値を編集した後は対象Piの表示クライアントを再起動する。
+
+```bash
+sudoedit /etc/hackathon-2026/panel_calibration.conf
+sudo systemctl restart pi-client@0.service
+```
+
+表示確認用に、主機から1台の表示Piへ単色フレームを送れる。`--panel ROW,COL` は
+入力スライス上の32×32領域を1枚だけ点灯し、`all` はスライス全体を点灯する。
+現行の192×128スライスは4行×6列で、旧192×96スライスを使う場合は
+`--slice-height 96` を追加する。制御Piからのゲーム送信と同時に使わず、送信元を停止してから実行する。
+
+```bash
+python3 host/test_mode/panel_calibration.py \
+  --pi 192.168.10.101:5000 --target-id 0 \
+  --panel 0,0 --color white --slice-height 128 --seconds 10
+```
+
+校正ツールの自己テストは次で実行する。
+
+```bash
+python3 host/test_mode/panel_calibration_selftest.py
+make panel_calibration_selftest
+./panel_calibration_selftest
+```
 
 ## 死活報告
 

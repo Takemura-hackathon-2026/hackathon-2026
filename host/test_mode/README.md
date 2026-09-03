@@ -1,20 +1,89 @@
 # 主機側テストモード
 
 表示経路を実機で確認するためのテストモード群。すべて主機（Ubuntu）で動かし、
-`--send --pi ...`（4個）を付けると 4 台の Pi へ送信する。省略するとプレビューだけになる。
+旧4台構成の`--send --pi ...`（4個）を付けると 4 台の Pi へ送信する。省略するとプレビューだけになる。
+
+> **現行実機:** 表示Piは `pi1`（`.101` / `target_id 0`）、`pi2`（`.102` / `target_id 1`）、
+> `pi4`（`.104` / `target_id 3`）の3台。`.103` / `target_id 2` は未使用である。
+> このディレクトリの汎用送信・テストモードは4分割を前提とするため、以下の4台用例は
+> 旧構成またはローカル結合試験として扱う。現行の接続先は
+> [docs/CONNECTION_INFO.md](../../docs/CONNECTION_INFO.md)を参照する。
 
 | モード | スクリプト | 内容 | 主な確認対象 |
 |---|---|---|---|
-| TEST1 | `test_mode.py` | WebP を 192×384 内で DVD ロゴ風に反射移動 | パレット量子化・4分割・伝送経路 |
-| TEST2 | `test2_status.py` | 主機 → PI1 → … → PI4 とページを切り替えて状態を文字表示 | 各 Pi の死活・FPS・欠損 |
-| TEST3 | `test3_quad.py` | 192×96 の 4 帯すべてへ同じ画像を描く | 1 台ごとの色再現・向き・欠け |
-| TEST4 | `test4_super.py` | 斜めN字配置の仮想画面 576×192 で反射移動 | 縦一列でない物理配置の割り当て |
+| TEST1 | `test_mode.py` | WebP を 192×384 内で DVD ロゴ風に反射移動 | 旧4分割・伝送経路 |
+| TEST2 | `test2_status.py` | 旧4台の主機 → PI1 → … → PI4 とページを切り替えて状態を文字表示 | 各 Pi の死活・FPS・欠損 |
+| TEST3 | `test3_quad.py` | 旧4台の192×96の4帯すべてへ同じ画像を描く | 1台ごとの色再現・向き・欠け |
+| TEST4 | `test4_super.py` | 旧4台の斜めN字配置の仮想画面 576×192 で反射移動 | 旧構成の物理配置の割り当て |
 
 共通の補助として、`palette_check.py`（全色パターン）、`udp_preview.py`（1台PCでの結合試験）、
 `selftest.py`（機械的検証）がある。伝送は `test_mode.py` の `UdpFrameSender` を全モードで共用する。
 
-- `send()` … 192×384 の全画面を上から 96 行ずつ 4 分割して送る（TEST1〜3）
-- `send_slices()` … `target_id` 順に並べた 192×96 のスライスをそのまま送る（TEST4）
+## PC側（Mac / Windows）72枚RGB・輝度キャリブレーションUI
+
+現行実機の表示Pi 3台（各24枚、合計72枚）をPCから個別に選択し、パネルごとのR/G/B倍率を
+色相環または0.00〜2.00の数値入力欄で、RGB共通の輝度倍率を「輝度」欄で調整する。UIはPython標準の
+Tkinterだけを使うため、追加パッケージは不要。Windowsでも同じPythonスクリプトを実行できる。
+
+macOS / Linux:
+
+```bash
+python3 host/test_mode/panel_calibration_ui.py
+```
+
+Windows PowerShell:
+
+```powershell
+py -3 host\test_mode\panel_calibration_ui.py
+```
+
+またはWindows Explorerで`host\test_mode\panel_calibration_ui.bat`をダブルクリックする。
+
+Windows側の前提:
+
+- Python 3.10以降（公式インストーラーのTkinterを含む構成）
+- Windowsの「OpenSSH Client」。PowerShellで`ssh -V`が通ること
+- 表示Piと同じネットワーク、および`takemuralab`でパスワードなしSSH接続できる鍵
+
+初回はPowerShellで次を実行し、SSH鍵と接続を確認する。UIは`BatchMode=yes`で接続するため、
+パスワード入力待ちにはならない。
+
+```powershell
+ssh takemuralab@192.168.10.101
+ssh -o BatchMode=yes takemuralab@192.168.10.101 systemctl is-active pi-client@0.service
+```
+
+`ssh.exe`がPATHにない場合は、PowerShellでフルパスを指定できる。
+
+```powershell
+$env:PANEL_CALIBRATION_SSH = 'C:\Windows\System32\OpenSSH\ssh.exe'
+py -3 host\test_mode\panel_calibration_ui.py
+```
+
+起動時に`.101`（target 0）、`.102`（target 2）、`.104`（target 1）から現在の補正値を読み込む。
+「校正モード開始」で制御Piのゲーム送信を停止し、「単色表示開始」で選択した1枚だけへ
+赤・緑・青・白などの単色パターンを継続送信する。下側のパネルも画面上の`row=2/3`から
+個別に選べる。「全部単色表示開始」では同じ色を全3台・全72枚へ送信できる。
+
+画面上部の色相環は、現在選択中のパネルのRGB補正値を決める。中心はR/G/Bすべて`1.00倍`、
+色相が補正する色味、中心からの距離が補正量となり、外周で各ゲインが`0.00〜2.00倍`の範囲に
+なる。選択パネルを変えると、そのパネルの数値入力値に合う位置へ色相環も更新される。
+輝度は色相環とは独立したRGB共通倍率で、各カードの「輝度」欄へ`0.00〜2.00`を入力する。
+単色表示のテスト色は、上部のプリセット（赤・緑・青・白・グレーなど）から選択できる。
+
+数値入力の変更は「選択Piへ適用」または「全3台へ適用」を押すまでPiへ書き込まない。
+適用時は`/etc/hackathon-2026/panel_calibration.conf`を更新し、対象の`pi-client`を再起動する。UIはRGB3列に加えて
+6列目の`brightness`へ輝度を保存し、旧5列設定を読み込んだ場合は輝度1.00で表示する。
+終了時は校正モード開始前に稼働していた`pi3-control.service`を復帰する。
+
+UIの配線・設定変換だけを確認する自己テスト:
+
+```bash
+python3 -B host/test_mode/panel_calibration_ui_selftest.py
+```
+
+- `send()` … 旧4台向けに192×384の全画面を上から96行ずつ4分割して送る（TEST1〜3）
+- `send_slices()` … 旧4台向けに`target_id`順に並べた192×96のスライスをそのまま送る（TEST4）
 
 ---
 
@@ -25,7 +94,7 @@
 計画書 §4.7 の WBMP テストモードを、素材 WebP 対応へ置き換えたもの。
 
 - AI・カメラ処理なし
-- 主機で移動、反射、着色、パレット量子化、全画面描画、4分割まで実施
+- 主機で移動、反射、着色、パレット量子化、全画面描画、旧4分割まで実施
 - 1画素1バイトのパレットインデックス（FC6: `0x00〜0x33` / MSX16: `0x01〜0x0F`）
 - Pi 側は受信、バッファ交換、HUB75 出力のみ
 
@@ -58,7 +127,7 @@ python3 test_mode.py --image test.webp --palette msx16 --render-mode mask
 | `R` | 位置・色位相をリセット |
 | `Q` / `Esc` | 終了 |
 
-### 4台のPiへ送信
+### 旧4台構成のPiへ送信
 
 ```bash
 python3 test_mode.py --image test.webp --palette fc6 --send \
@@ -66,7 +135,8 @@ python3 test_mode.py --image test.webp --palette fc6 --send \
   --pi 192.168.10.103:5000 --pi 192.168.10.104:5000
 ```
 
-4台に同じ`frame_id`を付け、上から順に192×96ずつ送る。受け側は `pi-client/`（同期段階A）。
+旧4台に同じ`frame_id`を付け、上から順に192×96ずつ送る。受け側は `pi-client/`（同期段階A）。
+現行3台の実機にはこの4台用例をそのまま送信しない。
 M5の`FRAME_SYNC`と READY バリア（同期段階B）は未実装で、各 Pi は完成フレームを受け取り次第
 `SwapOnVSync` で表示する。
 
@@ -136,7 +206,7 @@ python3 test_mode.py --render-mode mask --color-style solid --rainbow-hz 0 \
 ## TEST2: 状態表示モード
 
 主機と各 Pi の状態を、192×384 の論理画面へ 1 ページずつ文字で描く。
-主機 → PI1 → PI2 → PI3 → PI4 → 主機 … と `--page-seconds` ごとに切り替える。
+旧4台構成では主機 → PI1 → PI2 → PI3 → PI4 → 主機 … と `--page-seconds` ごとに切り替える。
 文字はパレット登録色だけで描画するため、そのまま LED へ出せる。
 
 各 Pi の情報は `pi_client` が UDP 5101 へ 1 秒ごとに送る死活報告（`PIHEALTH ...`）から得る。
@@ -152,7 +222,7 @@ python3 test2_status.py --send \
 | ページ | 表示項目 |
 |---|---|
 | HOST | パレット、送信FPS、`frame_id`、論理画面・スライスの大きさ、稼働時間、送信先一覧 |
-| PI1〜PI4 | 状態、送信元アドレス、`target_id`、表示枚数、欠損数、FPS、`rotate180`、最終受信からの経過 |
+| PI1〜PI4 | 状態、送信元アドレス、`target_id`、表示枚数、欠損数、FPS、`rotate180`、最終受信からの経過（旧4台構成） |
 
 状態は 3 つ。
 
@@ -177,7 +247,7 @@ FPS が 30 未満、または欠損数が 0 でない場合は警告色（橙・
 --no-preview          プレビュー窓を開かない
 ```
 
-## TEST3: 4分割モード
+## TEST3: 4分割モード（旧4台構成）
 
 192×384 を 192×96 の 4 帯に分け、そのすべてへ同じ画像を 1 枚ずつ描く。
 1 台ごとの色再現・向き・欠けを個別に見るためのモード。既定素材は `color_bar.webp`。
@@ -276,7 +346,8 @@ python3 palette_check.py --palette fc6
 python3 palette_check.py --palette msx16 --no-preview --save msx16_pattern.png
 ```
 
-`--send --pi ...` を付けると同じパターンを4台へ送信できる。Pi 境界（Y=96/192/288）に1pxの目印を入れてある。
+`--send --pi ...` を付けると同じパターンを旧4台へ送信できる。Pi 境界（Y=96/192/288）に1pxの目印を入れてある。
+現行3台の表示確認には、制御Pi側の現行サービス設定を使う。
 
 ## 機械的検証
 
