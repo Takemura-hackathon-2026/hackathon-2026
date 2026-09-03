@@ -7,7 +7,9 @@ After=network-online.target
 Type=simple
 User=takemuralab
 WorkingDirectory=/home/takemuralab/hackathon-2026
-ExecStart=/home/takemuralab/hackathon-2026/.venv/bin/python host/sensor_agent.py --destination 192.168.50.32:5200 --control-bind 0.0.0.0:5201 --start-mode still
+# Current field installation: depth capture is decimated for stable throughput and
+# the Structure Sensor is mounted inverted in both axes.
+ExecStart=/home/takemuralab/hackathon-2026/.venv/bin/python host/sensor_agent.py --destination 192.168.50.32:5200 --control-bind 0.0.0.0:5201 --start-mode still --capture-decimate 2 --flip-vertical --flip-horizontal
 Restart=on-failure
 RestartSec=2
 

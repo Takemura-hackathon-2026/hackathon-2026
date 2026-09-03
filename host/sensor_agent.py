@@ -40,6 +40,16 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--min-foreground-area", type=int, default=420)
     result.add_argument("--depth-min-change-mm", type=float, default=0.0)
     result.add_argument("--roi", type=parse_roi, default=None)
+    result.add_argument(
+        "--flip-vertical",
+        action="store_true",
+        help="上下逆に設置したSTRUCTURE Sensorの深度フレームを上下反転する",
+    )
+    result.add_argument(
+        "--flip-horizontal",
+        action="store_true",
+        help="左右逆に設置したSTRUCTURE Sensorの深度フレームを左右反転する",
+    )
     result.add_argument("--start-mode", choices=("still", "passby", "arm-circle"), default="still")
     result.add_argument("--start-still-seconds", type=float, default=3.0)
     result.add_argument("--start-still-tolerance", type=float, default=.035)
@@ -138,6 +148,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             lateral_center_deadband=lateral_center_deadband,
             debug_preview=False,
             capture_decimate=args.capture_decimate,
+            flip_vertical=args.flip_vertical,
+            flip_horizontal=args.flip_horizontal,
         )
         sender = InputStateSender(destination)
         control_receiver = SensorControlReceiver(control_bind)
@@ -165,7 +177,9 @@ def main(argv: Iterable[str] | None = None) -> int:
     last_report = started
     print(
         f"sensor agent: destination={destination[0]}:{destination[1]} "
-        f"sensor={args.sensor_width}x{args.sensor_height}@{args.sensor_fps:g} start_mode={args.start_mode}",
+        f"sensor={args.sensor_width}x{args.sensor_height}@{args.sensor_fps:g} "
+        f"start_mode={args.start_mode} flip_vertical={args.flip_vertical} "
+        f"flip_horizontal={args.flip_horizontal}",
         flush=True,
     )
     try:
