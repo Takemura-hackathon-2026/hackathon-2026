@@ -508,27 +508,26 @@ def main() -> int:
         if profile_game.boss_profile.display_name != profile.display_name:
             errors.append(f"{profile.display_name}の表示名が反映されない")
 
-    # 土屋は5回のバリア、稲葉は頭上急所3回を通過して初めて撃破できる。
+    # 土屋は5回のバリア、稲葉は頭上急所1回を通過して初めて撃破できる。
     tuchiya = BlockBreaker(boss_profile=next(profile for profile in BOSS_PROFILES if profile.key == "tuchiya"))
-    top_point = tuchiya.boss_edge_points[np.argmin(tuchiya.boss_edge_points[:, 0])]
+    shield_x, shield_y, shield_radius = tuchiya._barrier_geometry()
     for hit in range(5):
         tuchiya.boss_collision_armed = True
-        tuchiya.ball.x = tuchiya.boss_x + float(top_point[1])
-        tuchiya.ball.y = tuchiya.boss_y + float(top_point[0]) - tuchiya.ball_radius + .25
+        tuchiya.ball.x = shield_x
+        tuchiya.ball.y = shield_y - shield_radius - tuchiya.ball_radius + .25
         tuchiya.ball.vx, tuchiya.ball.vy = 0, 220
         tuchiya._hit_boss()
     if not tuchiya.barrier_broken or tuchiya.boss_hp != tuchiya.boss_max_hp:
         errors.append("土屋の5回バリアが規定回数で壊れない")
 
     inaba = BlockBreaker(boss_profile=next(profile for profile in BOSS_PROFILES if profile.key == "inaba"))
-    for hit in range(3):
-        inaba.boss_collision_armed = True
-        critical_x, critical_y = inaba._critical_point()
-        inaba.ball.x, inaba.ball.y = critical_x, critical_y - inaba.ball_radius + .25
-        inaba.ball.vx, inaba.ball.vy = 0, 220
-        inaba._hit_boss()
-    if inaba.critical_hits != 3 or not inaba.boss_defeated:
-        errors.append("稲葉の頭上急所3回で撃破できない")
+    inaba.boss_collision_armed = True
+    critical_x, critical_y = inaba._critical_point()
+    inaba.ball.x, inaba.ball.y = critical_x, critical_y - inaba.ball_radius + .25
+    inaba.ball.vx, inaba.ball.vy = 0, 220
+    inaba._hit_boss()
+    if inaba.critical_hits != 1 or not inaba.boss_defeated:
+        errors.append("稲葉の頭上急所1回で撃破できない")
 
     meka = BlockBreaker(boss_profile=next(profile for profile in BOSS_PROFILES if profile.key == "meka_takemura"))
     meka.serving = False

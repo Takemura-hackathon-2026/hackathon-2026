@@ -67,7 +67,7 @@ class BossProfile:
 BOSS_PROFILES = (
     BossProfile("takemura", "Prof. Takemura", HOST / "assets" / "takemuraface_fc6.png", 100, "horizontal", 52.0),
     BossProfile("tuchiya", "Prof. Tuchiya", HOST / "assets" / "tsuchiyaface.png", 1, "horizontal", 52.0, barrier_hits_required=5, damage_per_hit=1),
-    BossProfile("inaba", "Prof. Inaba", HOST / "assets" / "inabaface.png", 3, "horizontal", 52.0, critical_hits_required=3, damage_per_hit=1),
+    BossProfile("inaba", "Prof. Inaba", HOST / "assets" / "inabaface.png", 1, "horizontal", 82.0, critical_hits_required=1, damage_per_hit=1),
     BossProfile("meka_takemura", "MEKA.TKMR", HOST / "assets" / "robo_takemuraface.png", 160, "horizontal", 110.0, final_boss=True, beam_attack=True),
     BossProfile("ohki", "Prof. Ohki", HOST / "assets" / "ookiface.png", 60, "figure8", 1.9, flip_horizontal=True),
     BossProfile("inagaki", "Prof. Inagaki", HOST / "assets" / "inagakiface.png", 100, "vibrate_horizontal", 68.0, vibration_amplitude=20.0, vibration_frequency=1.8),
@@ -1173,8 +1173,21 @@ class BlockBreaker:
         if not self.boss_profile.critical_hits_required:
             return False
         critical_x, critical_y = self._critical_point()
-        reach = self.ball_radius + 2.0
+        reach = self.ball_radius + 6.0
         return (self.ball.x - critical_x) ** 2 + (self.ball.y - critical_y) ** 2 <= reach ** 2
+
+    def _barrier_geometry(self) -> tuple[float, float, float]:
+        center_x = self.boss_x + self.boss_width / 2.0
+        center_y = self.boss_y + self.boss_height / 2.0
+        radius = max(self.boss_width, self.boss_height) / 2.0 + 7.0
+        return center_x, center_y, radius
+
+    def _ball_hits_barrier(self) -> bool:
+        if not self.boss_profile.barrier_hits_required or self.barrier_broken:
+            return False
+        center_x, center_y, radius = self._barrier_geometry()
+        distance = math.hypot(self.ball.x - center_x, self.ball.y - center_y)
+        return abs(distance - radius) <= self.ball_radius + 2.0
 
     def _boss_contact_normal(self) -> tuple[float, float, float, float]:
         """ボール中心に最も近い不透明輪郭点と、そこから外向きの法線を返す。"""
@@ -1207,21 +1220,28 @@ class BlockBreaker:
     def _hit_boss(self) -> bool:
         body_overlap = self._ball_overlaps_boss()
         critical_overlap = self._ball_hits_critical()
-        overlaps = body_overlap or critical_overlap
+        barrier_overlap = self._ball_hits_barrier()
+        overlaps = body_overlap or critical_overlap or barrier_overlap
         if not self.boss_collision_armed:
             if not overlaps:
                 self.boss_collision_armed = True
             return False
         if not overlaps or self.boss_defeated:
             return False
-        if critical_overlap and not body_overlap:
+        if barrier_overlap and not body_overlap and not critical_overlap:
+            center_x, center_y, radius = self._barrier_geometry()
+            nx, ny = self.ball.x - center_x, self.ball.y - center_y
+            length = math.hypot(nx, ny) or 1.0
+            nx, ny = nx / length, ny / length
+            contact_x, contact_y = center_x + nx * radius, center_y + ny * radius
+        elif critical_overlap and not body_overlap:
             critical_x, critical_y = self._critical_point()
             nx, ny, contact_x, contact_y = 0.0, -1.0, critical_x, critical_y
         else:
             nx, ny, contact_x, contact_y = self._boss_contact_normal()
         incoming = self.ball.vx * nx + self.ball.vy * ny
         # 法線方向へ離れている接触は、前フレームの押し出しが残っただけなので無視する。
-        if incoming >= 0.0:
+        if incoming >= 0.0 and not barrier_overlap:
             return False
         self.ball.vx -= 2.0 * incoming * nx
         self.ball.vy -= 2.0 * incoming * ny
@@ -1432,7 +1452,6 @@ class BlockBreaker:
             shield_center = (boss_x + self.boss_width // 2, boss_y + self.boss_height // 2)
             shield_radius = max(self.boss_width, self.boss_height) // 2 + 7
             cv2.circle(frame, shield_center, shield_radius, barrier_color, 2, lineType=cv2.LINE_8)
-            self._center_text(frame, f"BARRIER {self.barrier_hits}/{self.boss_profile.barrier_hits_required}", 174, TEXT, .34)
         if self.boss_profile.critical_hits_required and not self.boss_defeated:
             critical_x, critical_y = self._critical_point()
             marker_color = 0x06 if int(time.monotonic() * 7) % 2 else 0x16
@@ -1441,11 +1460,11 @@ class BlockBreaker:
                 (int(round(critical_x)), int(round(critical_y))),
                 marker_color,
                 cv2.MARKER_DIAMOND,
-                7,
-                1,
+                13,
+                2,
                 line_type=cv2.LINE_8,
             )
-            self._center_text(frame, f"WEAK {self.critical_hits}/{self.boss_profile.critical_hits_required}", 174, TEXT, .34)
+            cv2.circle(frame, (int(round(critical_x)), int(round(critical_y))), 8, marker_color, 1, lineType=cv2.LINE_8)
         if self.boss_profile.beam_attack and self.game_started and not self.serving and not self.boss_defeated:
             beam_warning = self.beam_phase >= self.beam_period - self.beam_warning_duration
             beam_active = self.beam_phase >= self.beam_period - self.beam_active_duration
