@@ -749,6 +749,8 @@ class SensorController:
         lateral_center_deadband: float = 0.045,
         debug_preview: bool = True,
         capture_decimate: int = 1,
+        flip_vertical: bool = False,
+        flip_horizontal: bool = False,
     ) -> None:
         if start_mode not in ("still", "passby", "arm-circle"):
             raise ValueError("開始モードはstill、passby、arm-circleのいずれか")
@@ -769,6 +771,8 @@ class SensorController:
         # 表示しない経路（sensor_agent）でプレビューを描くと、1フレームの処理が
         # 取得周期を超えて入力遅延になる。描画は見る側だけが有効にする。
         self.debug_preview = bool(debug_preview)
+        self.flip_vertical = bool(flip_vertical)
+        self.flip_horizontal = bool(flip_horizontal)
         self.start_mode = start_mode
         self.background_seconds = max(.2, background_seconds)
         self.min_area = max(1, min_area)
@@ -823,6 +827,15 @@ class SensorController:
 
     def read(self, now: float) -> InputState:
         source = self.capture.read()
+        if self.flip_vertical:
+            # センサーが上下逆に設置されている場合も、背景・人物・ジャンプを
+            # 正しい上下座標で一貫して判定する。
+            source = np.flipud(source)
+        if self.flip_horizontal:
+            # 左右の移動方向をゲーム画面と一致させる。
+            source = np.fliplr(source)
+        if self.flip_vertical or self.flip_horizontal:
+            source = np.ascontiguousarray(source)
         if self.started is None:
             self.started = now
         if self.roi is not None:
