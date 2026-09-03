@@ -18,7 +18,7 @@ HOST = Path(__file__).resolve().parent
 if str(HOST) not in sys.path:
     sys.path.insert(0, str(HOST))
 
-from block_breaker import SensorController  # noqa: E402
+from block_breaker import DEFAULT_SENSOR_SETTINGS, SensorController, load_sensor_calibration  # noqa: E402
 
 
 def parse_roi(value: str) -> tuple[int, int, int, int]:
@@ -42,8 +42,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-foreground-area", type=int, default=420)
     parser.add_argument("--depth-min-change-mm", type=float, default=0.0, help="深度の手前側変化量。0は背景ノイズから自動決定")
     parser.add_argument("--roi", type=parse_roi, default=None, help="検出ROI x,y,width,height")
-    parser.add_argument("--jump-rise-y-min", type=float, default=0.05, help="重心上昇の閾値（既定0.05）")
-    parser.add_argument("--jump-rise-bottom-min", type=float, default=0.04, help="下端上昇の閾値（既定0.04）")
+    parser.add_argument("--jump-rise-y-min", type=float, default=None, help="重心上昇の閾値（未指定時は校正値、既定0.05）")
+    parser.add_argument("--jump-rise-bottom-min", type=float, default=None, help="下端上昇の閾値（未指定時は校正値、既定0.04）")
+    parser.add_argument("--calibration", type=Path, default=None, help="校正済みcamera_calibration.json")
     parser.add_argument("--fps", type=float, default=30.0, help="読み取り周期（既定30）")
     parser.add_argument("--seconds", type=float, default=30.0, help="計測秒数。0以下は無期限")
     parser.add_argument("--frames", type=int, default=0, help="最大フレーム数。0は無制限")
@@ -55,13 +56,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    calibration_path = args.calibration or HOST.parent / "camera_calibration.json"
+    learned = load_sensor_calibration(calibration_path)
+    jump_rise_y_min = args.jump_rise_y_min if args.jump_rise_y_min is not None else learned.get(
+        "jump_rise_y_min", DEFAULT_SENSOR_SETTINGS["jump_rise_y_min"]
+    )
+    jump_rise_bottom_min = args.jump_rise_bottom_min if args.jump_rise_bottom_min is not None else learned.get(
+        "jump_rise_bottom_min", DEFAULT_SENSOR_SETTINGS["jump_rise_bottom_min"]
+    )
     if (
         args.sensor_width <= 0
         or args.sensor_height <= 0
         or args.background_seconds < 0
         or args.min_foreground_area <= 0
-        or args.jump_rise_y_min <= 0
-        or args.jump_rise_bottom_min <= 0
+        or not 0.0 < jump_rise_y_min <= 1.0
+        or not 0.0 < jump_rise_bottom_min <= 1.0
         or args.depth_min_change_mm < 0
         or args.fps <= 0
         or args.preview_scale <= 0
@@ -87,14 +96,14 @@ def main(argv: list[str] | None = None) -> int:
             args.background_seconds,
             args.min_foreground_area,
             args.roi,
-            args.jump_rise_y_min,
-            args.jump_rise_bottom_min,
+            jump_rise_y_min,
+            jump_rise_bottom_min,
             args.depth_min_change_mm,
         )
         print(
             "jump detector: "
-            f"source=structure-depth threshold_y={args.jump_rise_y_min:g} "
-            f"threshold_bottom={args.jump_rise_bottom_min:g} preview={'yes' if args.preview else 'no'}"
+            f"source=structure-depth threshold_y={jump_rise_y_min:g} "
+            f"threshold_bottom={jump_rise_bottom_min:g} preview={'yes' if args.preview else 'no'}"
         )
         print("背景学習後にジャンプしてください。終了: Ctrl-C" + (" / Q" if args.preview else ""))
         started = last = time.monotonic()

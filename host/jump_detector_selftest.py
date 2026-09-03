@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from block_breaker import DEFAULT_SENSOR_SETTINGS  # noqa: E402
 from jump_detector import build_parser, parse_roi  # noqa: E402
 
 
@@ -15,7 +16,9 @@ def main() -> int:
     args = build_parser().parse_args([])
     if args.sensor_width != 640 or args.sensor_height != 480 or args.depth_min_change_mm != 0.0:
         errors.append("STRUCTURE Sensorの既定値が不正")
-    if args.jump_rise_y_min != 0.05 or args.jump_rise_bottom_min != 0.04:
+    if args.jump_rise_y_min is not None or args.jump_rise_bottom_min is not None:
+        errors.append("未指定のジャンプ閾値を校正前に固定する")
+    if DEFAULT_SENSOR_SETTINGS["jump_rise_y_min"] != 0.05 or DEFAULT_SENSOR_SETTINGS["jump_rise_bottom_min"] != 0.04:
         errors.append("既定のジャンプ閾値が不正")
     args = build_parser().parse_args(["--jump-rise-y-min", "0.03", "--jump-rise-bottom-min", "0.025"])
     if args.jump_rise_y_min != 0.03 or args.jump_rise_bottom_min != 0.025:

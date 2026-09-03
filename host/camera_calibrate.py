@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 import zlib
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,7 +34,12 @@ for import_path in (HOST_ROOT, TEST_MODE_ROOT):
         sys.path.insert(0, str(import_path))
 
 from frame_source import StructureSensorSource, depth_preview  # noqa: E402
-from block_breaker import ForegroundGate  # noqa: E402
+from block_breaker import (  # noqa: E402
+    DEPTH_MASK_HISTORY_SIZE,
+    ForegroundGate,
+    temporal_mask_consensus,
+    valid_percentile,
+)
 from palettes import FC6, FC6_BLACK, FC6_LIMIT, FC6_WHITE, PaletteMode  # noqa: E402
 from test_mode import PI_COUNT, UdpFrameSender, parse_pi  # noqa: E402
 
@@ -291,6 +297,7 @@ class BackgroundModel:
     frame_count: int
     signal_type: str = "gray"
     min_change: float = 0.0
+    noise_p95_map: np.ndarray | None = None
 
     @property
     def ignore_mask(self) -> np.ndarray:
@@ -356,10 +363,13 @@ def build_background_model(
         if x + width > PROCESS_WIDTH or y + height > PROCESS_HEIGHT:
             raise ValueError(f"固定領域 {x},{y},{width},{height} が240x320を超える")
         fixed[y:y + height, x:x + width] = True
+    noise_p95_map: np.ndarray | None = None
     if signal_type == "depth":
         valid_noise = (stack > 0) & (median[None, :, :] > 0)
-        noise_values = np.abs(stack - median[None, :, :])[valid_noise]
+        deviations = np.abs(stack - median[None, :, :])
+        noise_values = deviations[valid_noise]
         noise_p95 = float(np.percentile(noise_values, 95.0)) if noise_values.size else 0.0
+        noise_p95_map = valid_percentile(deviations, valid_noise, 95.0)
     else:
         noise_p95 = float(np.percentile(np.abs(stack - median[None, :, :]), 95.0))
     return BackgroundModel(
@@ -371,6 +381,7 @@ def build_background_model(
         frame_count=len(frames),
         signal_type=signal_type,
         min_change=float(min_change),
+        noise_p95_map=noise_p95_map,
     )
 
 
@@ -406,10 +417,12 @@ class CandidateDetector:
         self.last_center: tuple[float, float] | None = None
         self.persistence = 0
         self.foreground_gate = ForegroundGate(min_area=420) if model.signal_type == "depth" else None
+        self.depth_mask_history: deque[np.ndarray] = deque(maxlen=DEPTH_MASK_HISTORY_SIZE)
 
     def reset(self) -> None:
         self.last_center = None
         self.persistence = 0
+        self.depth_mask_history.clear()
         if self.foreground_gate is not None:
             self.foreground_gate.reset()
 
@@ -417,10 +430,15 @@ class CandidateDetector:
         image = raw.astype(np.float32, copy=False)
         valid = (image > 0) & (self.model.median > 0)
         depth_gain = self.model.median - image
-        threshold = max(60.0, self.model.noise_p95 * 3.0, self.model.min_change)
+        base_threshold = max(60.0, self.model.min_change)
+        if self.model.noise_p95_map is None:
+            threshold: float | np.ndarray = max(base_threshold, self.model.noise_p95 * 3.0)
+        else:
+            threshold = np.maximum(base_threshold, self.model.noise_p95_map * 3.0)
         mask = ((valid & (depth_gain >= threshold)).astype(np.uint8) * 255)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+        mask = temporal_mask_consensus(mask, self.depth_mask_history)
         if self.foreground_gate is None:
             raise RuntimeError("深度用ForegroundGateが初期化されていない")
         body, contour, filtered_mask = self.foreground_gate.detect(mask, depth_gain, threshold)
@@ -431,7 +449,17 @@ class CandidateDetector:
         values = depth_gain[y:y + height, x:x + width][
             filtered_mask[y:y + height, x:x + width] > 0
         ]
-        background_score = float(np.median(values)) / max(threshold, 1.0) if values.size else 0.0
+        if values.size:
+            if np.isscalar(threshold):
+                score_threshold = float(threshold)
+            else:
+                component_thresholds = threshold[y:y + height, x:x + width][
+                    filtered_mask[y:y + height, x:x + width] > 0
+                ]
+                score_threshold = float(np.median(component_thresholds))
+            background_score = float(np.median(values)) / max(score_threshold, 1.0)
+        else:
+            background_score = 0.0
         measurement = Measurement(
             x=body.x,
             y=body.y,

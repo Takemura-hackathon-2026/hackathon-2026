@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 #include <csignal>
 #include <unistd.h>
 
@@ -27,6 +28,7 @@ struct Options {
   double fps = 30.0;
   int frames = 0;
   double seconds = 0.0;
+  int decimate = 1;
 };
 
 void stop_handler(int) { g_running = 0; }
@@ -37,6 +39,7 @@ void stop_handler(int) { g_running = 0; }
                               "  --width N       深度幅（既定640）\n"
                               "  --height N      深度高さ（既定480）\n"
                               "  --fps N         取得FPS（既定30）\n"
+                              "  --decimate N    N画素おきに間引いて送る（既定1=間引かない）\n"
                               "  --frames N      フレーム数（既定0=無期限）\n"
                               "  --seconds N     取得秒数（既定0=無期限）\n"
                               "  --help          このヘルプを表示");
@@ -84,6 +87,7 @@ Options parse_options(int argc, char** argv) {
                 << "  --width N       深度幅（既定640）\n"
                 << "  --height N      深度高さ（既定480）\n"
                 << "  --fps N         取得FPS（既定30）\n"
+                << "  --decimate N    N画素おきに間引いて送る（既定1=間引かない）\n"
                 << "  --frames N      フレーム数（既定0=無期限）\n"
                 << "  --seconds N     取得秒数（既定0=無期限）\n";
       std::exit(0);
@@ -94,6 +98,8 @@ Options parse_options(int argc, char** argv) {
       options.height = parse_int(next_value("--height"), "--height");
     } else if (argument == "--fps") {
       options.fps = parse_double(next_value("--fps"), "--fps");
+    } else if (argument == "--decimate") {
+      options.decimate = parse_int(next_value("--decimate"), "--decimate");
     } else if (argument == "--frames") {
       options.frames = parse_nonnegative_int(next_value("--frames"), "--frames");
     } else if (argument == "--seconds") {
@@ -103,6 +109,7 @@ Options parse_options(int argc, char** argv) {
     }
   }
   if (options.fps > 120.0) usage_error("--fpsは120以下");
+  if (options.decimate > 16) usage_error("--decimateは16以下");
   return options;
 }
 
@@ -123,13 +130,24 @@ void check_openni(openni::Status status, const std::string& operation) {
   throw std::runtime_error(operation + ": " + openni::OpenNI::getExtendedError());
 }
 
-void write_frame(std::uint32_t frame_id, const openni::VideoFrameRef& frame) {
+// 1行ぶんをN画素おきに詰める。最近傍縮小と同じ結果で、転送量を1/Nにする。
+void decimate_row(const std::uint16_t* source, std::uint16_t* destination, int destination_width, int step) {
+  for (int index = 0; index < destination_width; ++index) {
+    destination[index] = source[static_cast<std::size_t>(index) * step];
+  }
+}
+
+void write_frame(std::uint32_t frame_id, const openni::VideoFrameRef& frame, int decimate) {
   if (!frame.isValid() || frame.getData() == nullptr || frame.getWidth() <= 0 ||
       frame.getHeight() <= 0 || frame.getStrideInBytes() < frame.getWidth() * 2) {
     throw std::runtime_error("OpenNI2の深度フレームが不正");
   }
-  const std::uint32_t width = static_cast<std::uint32_t>(frame.getWidth());
-  const std::uint32_t height = static_cast<std::uint32_t>(frame.getHeight());
+  if (decimate < 1) throw std::runtime_error("間引き幅が不正");
+  const int step = decimate;
+  // 端数は切り捨てる。Python側は届いた幅高さをそのまま使う。
+  const std::uint32_t width = static_cast<std::uint32_t>(frame.getWidth() / step);
+  const std::uint32_t height = static_cast<std::uint32_t>(frame.getHeight() / step);
+  if (width == 0 || height == 0) throw std::runtime_error("間引き後の深度フレームが空");
   const std::uint64_t payload_size = static_cast<std::uint64_t>(width) * height * sizeof(std::uint16_t);
   if (payload_size > std::numeric_limits<std::uint32_t>::max()) {
     throw std::runtime_error("深度フレームが大きすぎる");
@@ -143,10 +161,19 @@ void write_frame(std::uint32_t frame_id, const openni::VideoFrameRef& frame) {
   write_u32(height);
   write_u32(static_cast<std::uint32_t>(payload_size));
   const auto* frame_data = static_cast<const std::uint8_t*>(frame.getData());
-  for (int row = 0; row < frame.getHeight(); ++row) {
-    const auto* data = frame_data + static_cast<std::size_t>(row) * frame.getStrideInBytes();
-    const std::size_t row_size = static_cast<std::size_t>(frame.getWidth()) * sizeof(std::uint16_t);
-    if (std::fwrite(data, row_size, 1, stdout) != 1) throw std::runtime_error("深度フレームを書けない");
+  const std::size_t row_size = static_cast<std::size_t>(width) * sizeof(std::uint16_t);
+  std::vector<std::uint16_t> row_buffer(step == 1 ? 0 : width);
+  for (std::uint32_t row = 0; row < height; ++row) {
+    const auto* data = frame_data + static_cast<std::size_t>(row) * step * frame.getStrideInBytes();
+    if (step == 1) {
+      if (std::fwrite(data, row_size, 1, stdout) != 1) throw std::runtime_error("深度フレームを書けない");
+      continue;
+    }
+    decimate_row(reinterpret_cast<const std::uint16_t*>(data), row_buffer.data(),
+                 static_cast<int>(width), step);
+    if (std::fwrite(row_buffer.data(), row_size, 1, stdout) != 1) {
+      throw std::runtime_error("深度フレームを書けない");
+    }
   }
   if (std::fflush(stdout) != 0) throw std::runtime_error("深度フレームをflushできない");
 }
@@ -217,7 +244,7 @@ int main(int argc, char** argv) {
       if (frame.getVideoMode().getPixelFormat() != openni::PIXEL_FORMAT_DEPTH_1_MM) {
         throw std::runtime_error("深度フレームの単位がmmではない");
       }
-      write_frame(static_cast<std::uint32_t>(frame_count), frame);
+      write_frame(static_cast<std::uint32_t>(frame_count), frame, options.decimate);
       ++frame_count;
     }
     stream.stop();

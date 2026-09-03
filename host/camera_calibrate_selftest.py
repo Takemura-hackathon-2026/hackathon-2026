@@ -134,6 +134,30 @@ def test_depth_near_candidate_is_detected() -> None:
     assert third.measurement.background_score > 1.0
 
 
+def test_depth_local_background_noise_does_not_raise_global_threshold() -> None:
+    """画面端だけの大きな揺れで中央人物の検知閾値を引き上げない。"""
+    background = np.full((PROCESS_HEIGHT, PROCESS_WIDTH), 2400, dtype=np.int32)
+    frames: list[np.ndarray] = []
+    for index in range(12):
+        frame = background.copy()
+        offset = 900 if index % 2 else -900
+        frame[:, :48] += offset
+        frame[:, 192:] -= offset
+        frames.append(frame.astype(np.uint16))
+    model = build_background_model(frames, signal_type="depth")
+    assert model.noise_p95_map is not None
+    assert float(model.noise_p95_map[160, 20]) > 100.0
+    assert float(model.noise_p95_map[160, 120]) == 0.0
+
+    person = background.astype(np.uint16)
+    person[40:280, 88:152] = 1400
+    detector = CandidateDetector(model)
+    detections = [detector.detect(person) for _ in range(3)]
+    assert detections[-1].candidate_valid
+    assert detections[-1].measurement is not None
+    assert abs(detections[-1].measurement.x - 0.5) <= 0.02
+
+
 def test_depth_game_gate_rejects_floor_door_side_and_small_noise() -> None:
     """ゲームと同じ床・左右端・形状・継続ゲートをキャリブレーションでも使う。"""
     background = np.full((PROCESS_HEIGHT, PROCESS_WIDTH), 2400, dtype=np.uint16)
@@ -298,6 +322,7 @@ def main() -> int:
         test_rotations()
         test_background_noise_is_not_candidate()
         test_depth_near_candidate_is_detected()
+        test_depth_local_background_noise_does_not_raise_global_threshold()
         test_depth_game_gate_rejects_floor_door_side_and_small_noise()
         valid_payload = test_valid_distribution_and_thresholds()
         test_insufficient_motion_is_invalid()
@@ -307,7 +332,7 @@ def main() -> int:
     except (AssertionError, ValueError, OSError, json.JSONDecodeError) as exc:
         print(f"selftest: 1 error: {exc}")
         return 1
-    print("selftest: 11 tests, 0 errors")
+    print("selftest: 12 tests, 0 errors")
     return 0
 
 

@@ -16,7 +16,13 @@ HOST = Path(__file__).resolve().parent
 if str(HOST) not in sys.path:
     sys.path.insert(0, str(HOST))
 
-from block_breaker import ForegroundGate, SensorController, parse_roi  # noqa: E402
+from block_breaker import (  # noqa: E402
+    DEFAULT_SENSOR_SETTINGS,
+    ForegroundGate,
+    SensorController,
+    load_sensor_calibration,
+    parse_roi,
+)
 from palettes import FC6_BLACK, FC6_LIGHT_GRAY, FC6_WHITE, PaletteMode  # noqa: E402
 from test_mode import CANVAS_HEIGHT, CANVAS_WIDTH, PI_COUNT, UdpFrameSender, parse_pi  # noqa: E402
 
@@ -87,8 +93,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="深度の手前側変化量。0はゲームと同じく背景ノイズから自動決定",
     )
     parser.add_argument("--roi", type=parse_roi, default=None, help="検出ROI x,y,width,height")
-    parser.add_argument("--jump-rise-y-min", type=float, default=0.05)
-    parser.add_argument("--jump-rise-bottom-min", type=float, default=0.04)
+    parser.add_argument("--jump-rise-y-min", type=float, default=None, help="未指定時は校正値、既定0.05")
+    parser.add_argument("--jump-rise-bottom-min", type=float, default=None, help="未指定時は校正値、既定0.04")
+    parser.add_argument("--calibration", type=Path, default=None, help="校正済みcamera_calibration.json")
     parser.add_argument("--fps", type=float, default=60.0)
     parser.add_argument("--frames", type=int, default=0)
     parser.add_argument("--seconds", type=float, default=0.0)
@@ -100,13 +107,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    calibration_path = args.calibration or HOST.parent / "camera_calibration.json"
+    learned = load_sensor_calibration(calibration_path)
+    jump_rise_y_min = args.jump_rise_y_min if args.jump_rise_y_min is not None else learned.get(
+        "jump_rise_y_min", DEFAULT_SENSOR_SETTINGS["jump_rise_y_min"]
+    )
+    jump_rise_bottom_min = args.jump_rise_bottom_min if args.jump_rise_bottom_min is not None else learned.get(
+        "jump_rise_bottom_min", DEFAULT_SENSOR_SETTINGS["jump_rise_bottom_min"]
+    )
     if (
         args.sensor_width <= 0
         or args.sensor_height <= 0
         or args.background_seconds < 0
         or args.min_foreground_area <= 0
-        or args.jump_rise_y_min <= 0
-        or args.jump_rise_bottom_min <= 0
+        or not 0.0 < jump_rise_y_min <= 1.0
+        or not 0.0 < jump_rise_bottom_min <= 1.0
         or args.depth_min_change_mm < 0
         or args.fps <= 0
         or args.frames < 0
@@ -133,8 +148,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             args.background_seconds,
             args.min_foreground_area,
             args.roi,
-            args.jump_rise_y_min,
-            args.jump_rise_bottom_min,
+            jump_rise_y_min,
+            jump_rise_bottom_min,
             args.depth_min_change_mm,
         )
         destinations = args.pi if args.pi else list(DEFAULT_PI)

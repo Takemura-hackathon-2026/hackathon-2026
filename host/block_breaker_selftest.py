@@ -2,7 +2,9 @@
 """合成深度フレームを含むブロック崩し・入力分類器検証。"""
 from __future__ import annotations
 
+import json
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -20,6 +22,8 @@ from block_breaker import (  # noqa: E402
     PersonTracker,
     SensorController,
     StillStartDetector,
+    load_sensor_calibration,
+    valid_percentile,
     GAME_COLORS,
     keyboard_action,
 )
@@ -93,8 +97,52 @@ def run_sensor_sequence(kind: str, event_frames: int = 4) -> tuple[list[object],
     return states, sensor
 
 
+def run_noisy_person_sequence() -> tuple[list[object], SensorController]:
+    """画面端だけ背景ノイズが大きい場合でも中央の人物を検出できるか確認する。"""
+    def frame(kind: str, phase: int) -> np.ndarray:
+        image = synthetic_depth(kind, phase).astype(np.int32)
+        offset = 900 if phase % 2 else -900
+        image[:, :160] += offset
+        image[:, 480:] -= offset
+        return np.clip(image, 1, 65535).astype(np.uint16)
+
+    capture = FakeDepthCapture(
+        [frame("background", phase) for phase in range(40)]
+        + [frame("person", 40 + phase) for phase in range(4)]
+    )
+    sensor = SensorController(
+        640,
+        480,
+        background_seconds=2.0,
+        min_area=420,
+        roi=None,
+        jump_rise_y_min=0.05,
+        jump_rise_bottom_min=0.04,
+        depth_min_change_mm=0.0,
+        capture=capture,
+    )
+    import time
+
+    started = time.monotonic()
+    states = [sensor.read(started + index * 0.05) for index in range(40)]
+    states.extend(sensor.read(started + 2.10 + index * 0.05) for index in range(4))
+    return states, sensor
+
+
 def main() -> int:
     errors: list[str] = []
+    percentile_values = np.asarray(
+        [[[1.0, 10.0, 5000.0]], [[100.0, 20.0, 5000.0]]],
+        dtype=np.float32,
+    )
+    percentile_valid = np.asarray(
+        [[[True, True, False]], [[True, True, False]]],
+        dtype=bool,
+    )
+    percentile_result = valid_percentile(percentile_values, percentile_valid, 95.0)
+    if not np.array_equal(percentile_result, np.asarray([[100.0, 20.0, 0.0]], dtype=np.float32)):
+        errors.append(f"無効深度を除外した画素別分位点が不正: {percentile_result.tolist()}")
+
     gate = ForegroundGate(min_area=420)
     shape = (180, 240)
     person_mask = np.zeros(shape, dtype=np.uint8)
@@ -189,6 +237,19 @@ def main() -> int:
         if sensor is not None:
             sensor.close()
 
+    sensor = None
+    try:
+        states, sensor = run_noisy_person_sequence()
+        if not any(state.body_present for state in states[40:]):
+            errors.append("局所的な背景ノイズが大きい場合に人物を検出しない")
+        if sensor.depth_noise_p95 <= 100.0 or sensor.depth_noise_p95_map is None:
+            errors.append("背景ノイズの画素別統計を保持しない")
+    except (RuntimeError, ValueError, OSError) as exc:
+        errors.append(f"局所ノイズ耐性テストが実行できない: {exc}")
+    finally:
+        if sensor is not None:
+            sensor.close()
+
     classifier = InputClassifier(samples=3)
     stance = BodyMeasurement(.5, .5, .9, .2, width=.22, height=.52, upper_width=.22)
     for step in range(3):
@@ -240,6 +301,51 @@ def main() -> int:
     )
     if one_frame_noise.lateral != 0:
         errors.append("1フレームの重心揺れを左右移動として確定する")
+
+    calibrated_classifier = InputClassifier(
+        samples=3,
+        lateral_left_delta_min=.25,
+        lateral_right_delta_min=.20,
+        lateral_center_deadband=.04,
+    )
+    for step in range(3):
+        calibrated_classifier.update(stance, 4.0 + step * .05)
+    if calibrated_classifier.update(BodyMeasurement(.30, .5, .9, .2), 4.2).lateral != 0:
+        errors.append("校正済みLEFT閾値より小さい移動を左右入力にする")
+    for index in range(6):
+        calibrated_classifier.update(BodyMeasurement(.20, .5, .9, .2), 4.3 + index * .05)
+    if calibrated_classifier.lateral != -1:
+        errors.append("校正済みLEFT閾値をゲーム入力へ適用しない")
+
+    with tempfile.TemporaryDirectory(prefix="sensor-calibration-selftest-") as temporary:
+        calibration_path = Path(temporary) / "camera_calibration.json"
+        calibration_path.write_text(
+            json.dumps(
+                {
+                    "valid": True,
+                    "thresholds": {
+                        "left": {"delta_min": .23},
+                        "right": {"delta_min": .19},
+                        "jump": {"rise_y_min": .031, "rise_bottom_min": .026},
+                        "start": {"center_tolerance": .11},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        calibrated = load_sensor_calibration(calibration_path)
+        expected_calibration = {
+            "lateral_left_delta_min": .23,
+            "lateral_right_delta_min": .19,
+            "jump_rise_y_min": .031,
+            "jump_rise_bottom_min": .026,
+            "center_tolerance": .11,
+        }
+        if calibrated != expected_calibration:
+            errors.append(f"校正JSONの左右・ジャンプ閾値を読み込まない: {calibrated}")
+        calibration_path.write_text(json.dumps({"valid": False, "thresholds": expected_calibration}), encoding="utf-8")
+        if load_sensor_calibration(calibration_path):
+            errors.append("無効な校正JSONを入力閾値へ適用する")
 
     raw_classifier = InputClassifier(samples=3)
     for step in range(3):
