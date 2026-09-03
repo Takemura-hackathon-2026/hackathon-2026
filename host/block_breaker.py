@@ -747,6 +747,7 @@ class SensorController:
         lateral_left_delta_min: float = 0.10,
         lateral_right_delta_min: float = 0.10,
         lateral_center_deadband: float = 0.045,
+        lateral_confirm_frames: int = 4,
         debug_preview: bool = True,
         capture_decimate: int = 1,
         flip_vertical: bool = False,
@@ -792,6 +793,7 @@ class SensorController:
                 "lateral_left_delta_min": lateral_left_delta_min,
                 "lateral_right_delta_min": lateral_right_delta_min,
                 "lateral_center_deadband": lateral_center_deadband,
+                "lateral_confirm_frames": lateral_confirm_frames,
                 "start_center_tolerance": start_center_tolerance,
                 "start_width_gain": start_width_gain,
                 "start_upper_width_gain": start_upper_width_gain,
@@ -824,6 +826,53 @@ class SensorController:
         self.person_tracker.release_active()
         self.passby_detector.reset()
         self.still_detector.reset()
+
+    def reset_background(self, now: float | None = None) -> None:
+        """現在の向きで背景深度と人物追跡を最初から学習し直す。"""
+        self.started = time.monotonic() if now is None else float(now)
+        self.depth_frames.clear()
+        self.depth_background = None
+        self.depth_noise_p95 = 0.0
+        self.depth_noise_p95_map = None
+        self.depth_mask_history.clear()
+        self.foreground_gate.reset()
+        self.person_tracker.reset()
+        self.passby_detector.reset()
+        self.still_detector.reset()
+        self.debug = None
+        self.mask = None
+        self.accepted_mask = None
+
+    def apply_runtime_settings(self, settings: dict[str, object], now: float | None = None) -> bool:
+        """GUIの実行時設定を反映し、向き変更時は背景を再学習する。
+
+        戻り値は背景再学習を開始した場合にTrue。
+        """
+        flip_vertical = bool(settings["flip_vertical"])
+        flip_horizontal = bool(settings["flip_horizontal"])
+        orientation_changed = (
+            flip_vertical != self.flip_vertical
+            or flip_horizontal != self.flip_horizontal
+        )
+        self.flip_vertical = flip_vertical
+        self.flip_horizontal = flip_horizontal
+        self.depth_min_change_mm = float(settings["depth_min_change_mm"])
+        self.min_area = int(settings["min_foreground_area"])
+        self.foreground_gate.min_area = self.min_area
+        for key in (
+            "lateral_left_delta_min",
+            "lateral_right_delta_min",
+            "lateral_center_deadband",
+            "lateral_confirm_frames",
+        ):
+            self.person_tracker.classifier_options[key] = settings[key]
+        # 既存trackの基準値と新しい閾値を混在させず、次のフレームから再校正する。
+        self.person_tracker.reset()
+        self.passby_detector.reset()
+        self.still_detector.reset()
+        if orientation_changed:
+            self.reset_background(now)
+        return orientation_changed
 
     def read(self, now: float) -> InputState:
         source = self.capture.read()

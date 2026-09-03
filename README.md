@@ -325,6 +325,22 @@ python3 host/block_breaker_selftest.py
 
 `host/camera_calibrate.py` はSTRUCTURE Sensorの深度背景を学習し、CENTER/STANCE、START/CIRCLE、LEFT、RIGHT、JUMP、VALIDATEの順に姿勢・移動・ジャンプを計測する。START/CIRCLEでは中央で🙆を保持し、人物幅・上半身幅・面積の増加を学習する。中央の基準は`--center-x/--center-y`、中央ゾーンは`--center-tolerance-*`、左右の境界は`--lateral-deadband`で指定できる。JUMPは秒数ではなく、`--jump-count`（既定3回）の立ち上がりイベントを一度ずつ数える。回転はROI・背景差分・計測より先に適用され、oyakiラッパーの標準は`none`とする。LEDへ送るのは既存FC6の192×384インデックス画像だけで、センサー映像やマスクは送らない。
 
+### Macリアルタイム調整GUI
+
+稼働中の`pi3-sensor.service`を止めずに、Macから向き・左右判定・人物検出感度を調整できる。
+
+```bash
+python3 host/sensor_calibration_ui.py
+```
+
+GUIはSSHで`pi3-sensor`のローカル実行時ソケットへ接続する。上下・左右反転、左/右移動閾値、中央不感帯、左右入力の確定フレーム数、深度差分閾値、最小人物領域を変更できる。「一時適用」は再起動まで、「適用して保存」は`sensor_runtime_config.json`へatomic writeして次回起動にも引き継ぐ。向き変更時は背景を自動再学習するため、画面から離れて実行する。
+
+右側には深度画像、人物候補、確定人物、現在X、基準X、左右閾値と、FPS・人物位置・左右入力・深度差・背景ノイズ等の取得値をリアルタイム表示する。既定のIPv6リンクローカルアドレスが変わった場合は「自動検出」で`en9`上の`pi3-sensor`を探す。GUIなしの疎通確認は次で行う。
+
+```bash
+python3 host/sensor_calibration_ui.py --probe
+```
+
 ローカルでセンサー・ネットワークなしの表示デモを実行する。各ステージ画面と背景/候補の代表PNGを指定先へ保存する。
 
 ```bash

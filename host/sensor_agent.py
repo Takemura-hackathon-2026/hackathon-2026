@@ -21,6 +21,14 @@ from block_breaker import (  # noqa: E402
     parse_roi,
 )
 from input_transport import InputStateSender, SensorControlReceiver, parse_endpoint  # noqa: E402
+from sensor_runtime import (  # noqa: E402
+    DEFAULT_CONFIG_PATH,
+    DEFAULT_SOCKET_PATH,
+    SensorRuntimeServer,
+    build_telemetry,
+    load_settings,
+    save_settings,
+)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -60,7 +68,11 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--lateral-left-delta-min", type=float, default=None, help="未指定時は校正値、既定0.10")
     result.add_argument("--lateral-right-delta-min", type=float, default=None, help="未指定時は校正値、既定0.10")
     result.add_argument("--lateral-center-deadband", type=float, default=None, help="未指定時は既定0.045")
+    result.add_argument("--lateral-confirm-frames", type=int, default=4, help="左右入力を確定する連続フレーム数")
     result.add_argument("--calibration", type=Path, default=None)
+    result.add_argument("--runtime-config", type=Path, default=DEFAULT_CONFIG_PATH)
+    result.add_argument("--runtime-socket", type=Path, default=DEFAULT_SOCKET_PATH)
+    result.add_argument("--telemetry-fps", type=float, default=8.0)
     result.add_argument("--seconds", type=float, default=0.0)
     result.add_argument("--frames", type=int, default=0)
     return result
@@ -79,6 +91,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         or not 0.0 <= args.start_still_tolerance < 1.0
         or args.passby_confirm_frames < 2
         or args.passby_rearm_frames < 2
+        or not 2 <= args.lateral_confirm_frames <= 12
+        or not 0.5 <= args.telemetry_fps <= 15.0
         or args.seconds < 0
         or args.frames < 0
         or not 1 <= args.capture_decimate <= 16
@@ -103,6 +117,23 @@ def main(argv: Iterable[str] | None = None) -> int:
     lateral_center_deadband = args.lateral_center_deadband if args.lateral_center_deadband is not None else DEFAULT_SENSOR_SETTINGS[
         "lateral_center_deadband"
     ]
+    try:
+        runtime_settings = load_settings(
+            args.runtime_config,
+            {
+                "flip_vertical": args.flip_vertical,
+                "flip_horizontal": args.flip_horizontal,
+                "lateral_left_delta_min": lateral_left_delta_min,
+                "lateral_right_delta_min": lateral_right_delta_min,
+                "lateral_center_deadband": lateral_center_deadband,
+                "lateral_confirm_frames": args.lateral_confirm_frames,
+                "depth_min_change_mm": args.depth_min_change_mm,
+                "min_foreground_area": args.min_foreground_area,
+            },
+        )
+    except (OSError, ValueError) as exc:
+        print(f"error: 実行時センサー設定を読み込めない: {exc}", file=sys.stderr)
+        return 2
     if (
         not all(
             value > 0.0 and value <= 1.0
@@ -120,6 +151,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     sensor: SensorController | None = None
     sender: InputStateSender | None = None
     control_receiver: SensorControlReceiver | None = None
+    runtime: SensorRuntimeServer | None = None
     try:
         destination = parse_endpoint(args.destination, "127.0.0.1")
         control_bind = parse_endpoint(args.control_bind, "0.0.0.0", default_port=5201)
@@ -127,11 +159,11 @@ def main(argv: Iterable[str] | None = None) -> int:
             args.sensor_width,
             args.sensor_height,
             args.sensor_background_seconds,
-            args.min_foreground_area,
+            int(runtime_settings["min_foreground_area"]),
             args.roi,
             jump_rise_y_min,
             jump_rise_bottom_min,
-            args.depth_min_change_mm,
+            float(runtime_settings["depth_min_change_mm"]),
             capture_fps=args.sensor_fps,
             start_mode=args.start_mode,
             passby_confirm_frames=args.passby_confirm_frames,
@@ -143,16 +175,19 @@ def main(argv: Iterable[str] | None = None) -> int:
             start_upper_width_gain=learned.get("upper_width_gain_min", DEFAULT_START_SETTINGS["upper_width_gain_min"]),
             start_upper_width_min=learned.get("upper_width_min", DEFAULT_START_SETTINGS["upper_width_min"]),
             start_area_gain=learned.get("area_gain_min", DEFAULT_START_SETTINGS["area_gain_min"]),
-            lateral_left_delta_min=lateral_left_delta_min,
-            lateral_right_delta_min=lateral_right_delta_min,
-            lateral_center_deadband=lateral_center_deadband,
+            lateral_left_delta_min=float(runtime_settings["lateral_left_delta_min"]),
+            lateral_right_delta_min=float(runtime_settings["lateral_right_delta_min"]),
+            lateral_center_deadband=float(runtime_settings["lateral_center_deadband"]),
+            lateral_confirm_frames=int(runtime_settings["lateral_confirm_frames"]),
             debug_preview=False,
             capture_decimate=args.capture_decimate,
-            flip_vertical=args.flip_vertical,
-            flip_horizontal=args.flip_horizontal,
+            flip_vertical=bool(runtime_settings["flip_vertical"]),
+            flip_horizontal=bool(runtime_settings["flip_horizontal"]),
         )
         sender = InputStateSender(destination)
         control_receiver = SensorControlReceiver(control_bind)
+        runtime = SensorRuntimeServer(args.runtime_socket, args.runtime_config, runtime_settings)
+        runtime.start()
     except (OSError, RuntimeError, ValueError) as exc:
         if sender is not None:
             sender.close()
@@ -160,6 +195,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             sensor.close()
         if control_receiver is not None:
             control_receiver.close()
+        if runtime is not None:
+            runtime.close()
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
@@ -178,11 +215,12 @@ def main(argv: Iterable[str] | None = None) -> int:
     print(
         f"sensor agent: destination={destination[0]}:{destination[1]} "
         f"sensor={args.sensor_width}x{args.sensor_height}@{args.sensor_fps:g} "
-        f"start_mode={args.start_mode} flip_vertical={args.flip_vertical} "
-        f"flip_horizontal={args.flip_horizontal}",
+        f"start_mode={args.start_mode} flip_vertical={runtime_settings['flip_vertical']} "
+        f"flip_horizontal={runtime_settings['flip_horizontal']} runtime={args.runtime_socket}",
         flush=True,
     )
     try:
+        last_telemetry = started
         while running and (args.frames <= 0 or sequence < args.frames):
             now = time.monotonic()
             if args.seconds > 0 and now - started >= args.seconds:
@@ -190,8 +228,39 @@ def main(argv: Iterable[str] | None = None) -> int:
             if control_receiver.poll_reselect():
                 sensor.reselect_player()
                 print("event=remote-reselect-player", flush=True)
+            if runtime is not None:
+                for command in runtime.pop_commands():
+                    name = command["command"]
+                    if name == "set":
+                        runtime_settings = dict(command["settings"])  # type: ignore[arg-type]
+                        relearned = sensor.apply_runtime_settings(runtime_settings, now)
+                        if bool(command.get("persist", False)):
+                            save_settings(args.runtime_config, runtime_settings)
+                        print(
+                            f"event=runtime-settings persist={int(bool(command.get('persist', False)))} "
+                            f"background_relearn={int(relearned)}",
+                            flush=True,
+                        )
+                    elif name == "relearn_background":
+                        sensor.reset_background(now)
+                        print("event=runtime-background-relearn", flush=True)
+                    elif name == "reselect_player":
+                        sensor.reselect_player()
+                        print("event=runtime-reselect-player", flush=True)
             state = sensor.read(now)
             sender.send(state, sequence)
+            if runtime is not None and now - last_telemetry >= 1.0 / args.telemetry_fps:
+                elapsed = max(now - started, 1e-9)
+                runtime.publish(
+                    build_telemetry(
+                        sensor,
+                        state,
+                        runtime_settings,
+                        sender.sent / elapsed,
+                        sequence,
+                    )
+                )
+                last_telemetry = now
             if sensor.stage != last_stage:
                 print(f"sensor_stage={sensor.stage}", flush=True)
                 last_stage = sensor.stage
@@ -214,6 +283,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             sensor.close()
         if control_receiver is not None:
             control_receiver.close()
+        if runtime is not None:
+            runtime.close()
     return 0
 
 
