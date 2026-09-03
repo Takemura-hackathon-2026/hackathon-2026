@@ -12,6 +12,7 @@ import ctypes
 import ctypes.util
 import json
 import math
+import random
 import signal
 import sys
 import time
@@ -76,11 +77,38 @@ GAME_COLORS = {
 LEFT_KEYS = frozenset((81, 2424832, 65361, 63234))
 RIGHT_KEYS = frozenset((83, 2555904, 65363, 63235))
 UP_KEYS = frozenset((82, 2490368, 65362, 63232))
-# OpenCVのwaitKeyExにはキー解放イベントがないため、キーリピート間を埋める最小限の保持時間を持たせる。
-# これを長くすると、キーを離した後も慣性のように動いて見える。
-# X11のキー状態取得が使えない環境でのフォールバック用。
-KEYBOARD_EVENT_HOLD_SECONDS = 0.08
-BOSS_IMAGE = HOST / "assets" / "takemuraface_fc6.png"
+# OpenCVのwaitKeyExにはキー解放イベントがないため、ネイティブのキー状態取得が
+# 使えない環境ではキーリピート間を埋めるフォールバック保持時間を持たせる。
+KEYBOARD_EVENT_HOLD_SECONDS = 0.20
+
+
+@dataclass(frozen=True)
+class BossProfile:
+    key: str
+    display_name: str
+    image: Path
+    max_hp: int
+    movement: str
+    move_speed: float
+    flip_horizontal: bool = False
+    final_boss: bool = False
+    beam_attack: bool = False
+    vibration_amplitude: float = 0.0
+    vibration_frequency: float = 0.0
+    barrier_hits_required: int = 0
+    critical_hits_required: int = 0
+    damage_per_hit: int = 10
+
+
+BOSS_PROFILES = (
+    BossProfile("takemura", "Prof. Takemura", HOST / "assets" / "takemuraface_fc6.png", 100, "horizontal", 52.0),
+    BossProfile("tuchiya", "Prof. Tuchiya", HOST / "assets" / "tsuchiyaface.png", 1, "horizontal", 52.0, barrier_hits_required=5, damage_per_hit=1),
+    BossProfile("inaba", "Prof. Inaba", HOST / "assets" / "inabaface.png", 1, "horizontal", 82.0, critical_hits_required=1, damage_per_hit=1),
+    BossProfile("meka_takemura", "MEKA.TKMR", HOST / "assets" / "robo_takemuraface.png", 160, "horizontal", 110.0, final_boss=True, beam_attack=True),
+    BossProfile("ohki", "Prof. Ohki", HOST / "assets" / "ookiface.png", 60, "figure8", 1.9, flip_horizontal=True),
+    BossProfile("inagaki", "Prof. Inagaki", HOST / "assets" / "inagakiface.png", 100, "vibrate_horizontal", 68.0, vibration_amplitude=20.0, vibration_frequency=1.8),
+)
+BOSS_IMAGES = tuple(profile.image for profile in BOSS_PROFILES)
 DEFAULT_START_SETTINGS = {
     "center_tolerance": 0.18,
     "width_gain_min": 0.06,
@@ -128,18 +156,31 @@ def valid_percentile(values: np.ndarray, valid: np.ndarray, percentile: float) -
     return np.where(counts > 0, result, 0.0).astype(np.float32)
 
 
-def load_boss_sprite(path: Path = BOSS_IMAGE) -> tuple[np.ndarray, np.ndarray]:
-    """透過PNGをFC6インデックス画像と不透明マスクへ変換する。"""
+def load_boss_sprite(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """RGB/RGBA PNGをFC6インデックス画像と不透明マスクへ変換する。"""
     source = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
     if source is None:
         raise RuntimeError(f"ボス画像を読み込めない: {path}")
-    if source.ndim != 3 or source.shape[2] != 4:
-        raise RuntimeError(f"ボス画像はRGBA PNGでなければならない: {path}")
+    if source.ndim != 3 or source.shape[2] not in (3, 4):
+        raise RuntimeError(f"ボス画像はRGB/RGBA PNGでなければならない: {path}")
     rgb = source[:, :, :3][:, :, ::-1].astype(np.int32)
     palette = np.asarray([color[:3] for color in FC6], dtype=np.int32)
     distance = np.sum((rgb[:, :, None, :] - palette[None, None, :, :]) ** 2, axis=3)
     indexed = np.argmin(distance, axis=2).astype(np.uint8)
-    return indexed, source[:, :, 3] > 0
+    if source.shape[2] == 4:
+        mask = source[:, :, 3] > 0
+    else:
+        # クリップボード由来のRGB画像は白背景になりやすいので、外周につながる
+        # 白領域だけを透明化し、顔の中の白目や装飾は残す。
+        white = np.all(source[:, :, :3] >= 245, axis=2).astype(np.uint8)
+        component_count, labels, stats, _ = cv2.connectedComponentsWithStats(white, connectivity=8)
+        if component_count > 1:
+            # 白い背景が外周に届かない画像でも、最大の白領域を背景として扱う。
+            background_label = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+            mask = labels != background_label
+        else:
+            mask = white == 0
+    return indexed, mask
 
 
 @dataclass(frozen=True)
@@ -1080,6 +1121,8 @@ def keyboard_action(key: int) -> str | None:
         return "launch"
     if ascii_key == ord("r"):
         return "reset"
+    if ascii_key == ord("x"):
+        return "debug_clear"
     if ascii_key == ord("q") or key == 27:
         return "quit"
     return None
@@ -1143,6 +1186,52 @@ class X11KeyboardState:
         self._lib = self._display = None
 
 
+class MacKeyboardState:
+    """macOSのCoreGraphicsで、キーリピートに依存せず押下状態を読む。"""
+
+    # macOSの仮想キーコード。矢印に加え、A/D/H/Lも受け付ける。
+    _LEFT_CODES = (123, 0, 4)   # ←, A, H
+    _RIGHT_CODES = (124, 2, 37)  # →, D, L
+
+    def __init__(self) -> None:
+        self._lib = None
+        self._key_state = None
+        if sys.platform != "darwin":
+            return
+        library = ctypes.util.find_library("CoreGraphics") or "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+        try:
+            lib = ctypes.CDLL(library)
+            key_state = lib.CGEventSourceKeyState
+            key_state.argtypes = [ctypes.c_int, ctypes.c_uint16]
+            key_state.restype = ctypes.c_bool
+            self._lib, self._key_state = lib, key_state
+        except (AttributeError, OSError):
+            self.close()
+
+    @property
+    def available(self) -> bool:
+        return self._key_state is not None
+
+    def lateral(self) -> int:
+        if not self.available:
+            return 0
+        pressed = lambda codes: any(self._key_state(0, code) for code in codes)
+        left, right = pressed(self._LEFT_CODES), pressed(self._RIGHT_CODES)
+        return -1 if left and not right else 1 if right and not left else 0
+
+    def close(self) -> None:
+        self._lib = self._key_state = None
+
+
+def create_keyboard_state() -> MacKeyboardState | X11KeyboardState:
+    """実行OSに合わせ、長押しを毎フレーム取得できる入力バックエンドを選ぶ。"""
+    mac = MacKeyboardState()
+    if mac.available:
+        return mac
+    x11 = X11KeyboardState()
+    return x11
+
+
 class BlockBreaker:
     paddle_width, paddle_height, paddle_y = 42.0, 6.0, 350.0
     ball_radius, paddle_speed, initial_speed = 3.0, 175.0, 175.0
@@ -1153,13 +1242,37 @@ class BlockBreaker:
     boss_transition_duration = .48  # 3回の点滅（点灯・消灯を3周期）
     boss_move_speed = 52.0
     clear_delay = 1.8
+    beam_period = 3.6
+    beam_warning_duration = 1.50
+    beam_active_duration = .10
 
-    def __init__(self) -> None:
-        sprite, mask = load_boss_sprite()
+    def __init__(
+        self,
+        boss_profile: BossProfile | None = None,
+        boss_image: Path | None = None,
+        auto_reset_on_clear: bool = True,
+    ) -> None:
+        if boss_profile is None:
+            if boss_image is None:
+                boss_profile = BOSS_PROFILES[0]
+            else:
+                boss_profile = next((profile for profile in BOSS_PROFILES if profile.image == boss_image), None)
+                if boss_profile is None:
+                    raise ValueError(f"未登録のボス画像: {boss_image}")
+        self.boss_profile = boss_profile
+        self.auto_reset_on_clear = auto_reset_on_clear
+        self.boss_image = boss_profile.image
+        self.boss_max_hp = boss_profile.max_hp
+        self.boss_move_speed = boss_profile.move_speed
+        self.boss_damage = boss_profile.damage_per_hit
+        sprite, mask = load_boss_sprite(self.boss_image)
         size = (round(sprite.shape[1] * self.boss_scale), round(sprite.shape[0] * self.boss_scale))
-        self.boss_sprite = cv2.resize(sprite, size, interpolation=cv2.INTER_NEAREST)
+        self._base_boss_sprite = cv2.resize(sprite, size, interpolation=cv2.INTER_NEAREST)
+        self._base_boss_mask = cv2.resize(mask.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST) > 0
+        self.boss_sprite = self._base_boss_sprite
         self.boss_sprite_msx16 = BOSS_FC6_TO_MSX16[self.boss_sprite]
-        self.boss_mask = cv2.resize(mask.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST) > 0
+        self.boss_mask = self._base_boss_mask
+        self._orientation_flipped = False
         self.boss_height, self.boss_width = self.boss_sprite.shape
         self.boss_x = (CANVAS_WIDTH - self.boss_width) / 2
         eroded = cv2.erode(self.boss_mask.astype(np.uint8), np.ones((3, 3), np.uint8))
@@ -1167,6 +1280,9 @@ class BlockBreaker:
         self.boss_edge_points = np.argwhere(self.boss_edge)
         self.lives = 3
         self.boss_hp = self.boss_max_hp
+        self.barrier_hits = 0
+        self.barrier_broken = not bool(boss_profile.barrier_hits_required)
+        self.critical_hits = 0
         self.boss_defeated = False
         self.paddle_x = 0.0
         self.ball = Ball(0.0, 0.0)
@@ -1181,14 +1297,40 @@ class BlockBreaker:
         self.boss_transition_remaining = 0.0
         self.boss_move_active = False
         self.boss_move_vx = self.boss_move_speed
+        self.boss_move_phase = 0.0
+        self.boss_base_x = self.boss_x
+        self.boss_base_y = self.boss_y
+        self.beam_phase = 0.0
         self.clear_remaining = 0.0
         self.game_over_until = 0.0
         self.reset(full=True)
+
+    def _set_boss_orientation(self) -> None:
+        """横顔ボスだけ、現在位置から画面中央を向くように左右反転する。"""
+        if not self.boss_profile.flip_horizontal:
+            return
+        should_flip = self.boss_x + self.boss_width / 2.0 < CANVAS_WIDTH / 2.0
+        if should_flip == self._orientation_flipped:
+            return
+        self._orientation_flipped = should_flip
+        if should_flip:
+            self.boss_sprite = np.ascontiguousarray(np.fliplr(self._base_boss_sprite))
+            self.boss_mask = np.ascontiguousarray(np.fliplr(self._base_boss_mask))
+        else:
+            self.boss_sprite = self._base_boss_sprite
+            self.boss_mask = self._base_boss_mask
+        self.boss_sprite_msx16 = BOSS_FC6_TO_MSX16[self.boss_sprite]
+        eroded = cv2.erode(self.boss_mask.astype(np.uint8), np.ones((3, 3), np.uint8))
+        self.boss_edge = self.boss_mask & (eroded == 0)
+        self.boss_edge_points = np.argwhere(self.boss_edge)
 
     def reset(self, full: bool = False) -> None:
         if full:
             self.lives = 3
             self.boss_hp = self.boss_max_hp
+            self.barrier_hits = 0
+            self.barrier_broken = not bool(self.boss_profile.barrier_hits_required)
+            self.critical_hits = 0
             self.boss_defeated = False
             self.game_started = False
             self.damage_effect_remaining = 0.0
@@ -1197,9 +1339,16 @@ class BlockBreaker:
             self.life_loss_slot = -1
             self.life_loss_event = False
             self.boss_x = (CANVAS_WIDTH - self.boss_width) / 2
+            self.boss_y = 34.0
+            self.boss_base_x = self.boss_x
+            self.boss_base_y = self.boss_y
             self.boss_transition_remaining = 0.0
-            self.boss_move_active = False
+            # ボスは登場直後から動き、HP半分到達時の点滅演出とは独立させる。
+            self.boss_move_active = True
             self.boss_move_vx = self.boss_move_speed
+            self.boss_move_phase = 0.0
+            self.beam_phase = 0.0
+            self._set_boss_orientation()
             self.clear_remaining = 0.0
             self.game_over_until = 0.0
         self.paddle_x = (CANVAS_WIDTH - self.paddle_width) / 2
@@ -1216,6 +1365,7 @@ class BlockBreaker:
     def _launch(self) -> None:
         self.serving = False
         self.game_started = True
+        self.beam_phase = 0.0
         self.life_loss_feedback_active = False
         self.life_loss_blink_elapsed = 0.0
         self.life_loss_slot = -1
@@ -1236,6 +1386,30 @@ class BlockBreaker:
             <= self.ball_radius ** 2
         )
         return bool(np.any(self.boss_mask[top:bottom, left:right] & circle))
+
+    def _critical_point(self) -> tuple[float, float]:
+        """稲葉の頭上に置く急所の中心座標。"""
+        return self.boss_x + self.boss_width / 2.0, max(26.0, self.boss_y - 5.0)
+
+    def _ball_hits_critical(self) -> bool:
+        if not self.boss_profile.critical_hits_required:
+            return False
+        critical_x, critical_y = self._critical_point()
+        reach = self.ball_radius + 6.0
+        return (self.ball.x - critical_x) ** 2 + (self.ball.y - critical_y) ** 2 <= reach ** 2
+
+    def _barrier_geometry(self) -> tuple[float, float, float]:
+        center_x = self.boss_x + self.boss_width / 2.0
+        center_y = self.boss_y + self.boss_height / 2.0
+        radius = max(self.boss_width, self.boss_height) / 2.0 + 7.0
+        return center_x, center_y, radius
+
+    def _ball_hits_barrier(self) -> bool:
+        if not self.boss_profile.barrier_hits_required or self.barrier_broken:
+            return False
+        center_x, center_y, radius = self._barrier_geometry()
+        distance = math.hypot(self.ball.x - center_x, self.ball.y - center_y)
+        return abs(distance - radius) <= self.ball_radius + 2.0
 
     def _boss_contact_normal(self) -> tuple[float, float, float, float]:
         """ボール中心に最も近い不透明輪郭点と、そこから外向きの法線を返す。"""
@@ -1266,26 +1440,49 @@ class BlockBreaker:
         return nx / length, ny / length, contact_x, contact_y
 
     def _hit_boss(self) -> bool:
-        overlaps = self._ball_overlaps_boss()
+        body_overlap = self._ball_overlaps_boss()
+        critical_overlap = self._ball_hits_critical()
+        barrier_overlap = self._ball_hits_barrier()
+        overlaps = body_overlap or critical_overlap or barrier_overlap
         if not self.boss_collision_armed:
             if not overlaps:
                 self.boss_collision_armed = True
             return False
         if not overlaps or self.boss_defeated:
             return False
-        nx, ny, contact_x, contact_y = self._boss_contact_normal()
+        if barrier_overlap and not body_overlap and not critical_overlap:
+            center_x, center_y, radius = self._barrier_geometry()
+            nx, ny = self.ball.x - center_x, self.ball.y - center_y
+            length = math.hypot(nx, ny) or 1.0
+            nx, ny = nx / length, ny / length
+            contact_x, contact_y = center_x + nx * radius, center_y + ny * radius
+        elif critical_overlap and not body_overlap:
+            critical_x, critical_y = self._critical_point()
+            nx, ny, contact_x, contact_y = 0.0, -1.0, critical_x, critical_y
+        else:
+            nx, ny, contact_x, contact_y = self._boss_contact_normal()
         incoming = self.ball.vx * nx + self.ball.vy * ny
         # 法線方向へ離れている接触は、前フレームの押し出しが残っただけなので無視する。
-        if incoming >= 0.0:
+        if incoming >= 0.0 and not barrier_overlap:
             return False
         self.ball.vx -= 2.0 * incoming * nx
         self.ball.vy -= 2.0 * incoming * ny
         # 輪郭からボール半径+1pxだけ外へ押し出し、同じ衝突を連続計上しない。
         self.ball.x = contact_x + nx * (self.ball_radius + 1.0)
         self.ball.y = contact_y + ny * (self.ball_radius + 1.0)
-        self.boss_hp = max(0, self.boss_hp - self.boss_damage)
         self.damage_effect_remaining = self.damage_effect_duration
-        if self.boss_hp <= self.boss_max_hp // 2 and not self.boss_move_active and self.boss_transition_remaining <= 0.0:
+        profile = self.boss_profile
+        if profile.barrier_hits_required and not self.barrier_broken:
+            self.barrier_hits += 1
+            if self.barrier_hits >= profile.barrier_hits_required:
+                self.barrier_broken = True
+            return True
+        if profile.critical_hits_required:
+            if not critical_overlap:
+                return True
+            self.critical_hits += 1
+        self.boss_hp = max(0, self.boss_hp - self.boss_damage)
+        if self.boss_hp <= self.boss_max_hp // 2 and self.boss_transition_remaining <= 0.0:
             self.boss_transition_remaining = self.boss_transition_duration
         if self.boss_hp == 0:
             self.boss_defeated = True
@@ -1309,8 +1506,18 @@ class BlockBreaker:
             self.life_loss_slot = self.lives
         self.serving = True
         self.boss_collision_armed = False
+        if self.boss_profile.barrier_hits_required and not self.barrier_broken:
+            self.barrier_hits = 0
         self.ball.vx = self.ball.vy = 0.0
         self._place_ball_at_mouth()
+
+    def debug_clear(self) -> None:
+        """キーボード試験用に、現在のボスを即時撃破する。"""
+        self.boss_hp = 0
+        self.boss_defeated = True
+        self.serving = True
+        self.ball.vx = self.ball.vy = 0.0
+        self.clear_remaining = 0.0
 
     def consume_life_loss_event(self) -> bool:
         """残機が残るミスを一度だけ取得する。ゲームオーバーではFalse。"""
@@ -1328,15 +1535,31 @@ class BlockBreaker:
             if self.boss_transition_remaining == 0.0:
                 self.boss_move_active = True
         if self.boss_move_active and not self.boss_defeated:
-            self.boss_x += self.boss_move_vx * dt
-            if self.boss_x <= 0.0:
-                self.boss_x, self.boss_move_vx = 0.0, abs(self.boss_move_vx)
-            elif self.boss_x + self.boss_width >= CANVAS_WIDTH:
-                self.boss_x = CANVAS_WIDTH - self.boss_width
-                self.boss_move_vx = -abs(self.boss_move_vx)
+            profile = self.boss_profile
+            if profile.movement == "figure8":
+                self.boss_move_phase = (self.boss_move_phase + profile.move_speed * dt) % (2 * math.pi)
+                x_amplitude = max(8.0, (CANVAS_WIDTH - self.boss_width) * .46)
+                y_amplitude = min(26.0, max(8.0, self.boss_height * .24))
+                self.boss_x = self.boss_base_x + x_amplitude * math.sin(self.boss_move_phase)
+                self.boss_y = self.boss_base_y + y_amplitude * math.sin(2.0 * self.boss_move_phase)
+                self.boss_x = min(max(0.0, self.boss_x), CANVAS_WIDTH - self.boss_width)
+                self.boss_y = min(max(26.0, self.boss_y), CANVAS_HEIGHT - self.boss_height - 4.0)
+            else:
+                self.boss_x += self.boss_move_vx * dt
+                if self.boss_x <= 0.0:
+                    self.boss_x, self.boss_move_vx = 0.0, abs(self.boss_move_vx)
+                elif self.boss_x + self.boss_width >= CANVAS_WIDTH:
+                    self.boss_x = CANVAS_WIDTH - self.boss_width
+                    self.boss_move_vx = -abs(self.boss_move_vx)
+                if profile.movement == "vibrate_horizontal":
+                    self.boss_move_phase = (self.boss_move_phase + profile.vibration_frequency * dt) % (2 * math.pi)
+                    amplitude = profile.vibration_amplitude or min(20.0, self.boss_height * .20)
+                    self.boss_y = self.boss_base_y + amplitude * math.sin(self.boss_move_phase)
+                    self.boss_y = min(max(26.0, self.boss_y), CANVAS_HEIGHT - self.boss_height - 4.0)
+            self._set_boss_orientation()
         if self.boss_defeated:
             self.clear_remaining = max(0.0, self.clear_remaining - dt)
-            if self.clear_remaining == 0.0:
+            if self.clear_remaining == 0.0 and self.auto_reset_on_clear:
                 self.reset(full=True)
             return
         if self.game_over_until:
@@ -1361,6 +1584,14 @@ class BlockBreaker:
             if controls.launch:
                 self._launch()
             return
+        if self.boss_profile.beam_attack:
+            self.beam_phase = (self.beam_phase + dt) % self.beam_period
+            beam_active = self.beam_phase >= self.beam_period - self.beam_active_duration
+            if beam_active:
+                beam_x = self.boss_x + self.boss_width / 2.0
+                if self.paddle_x - self.ball_radius <= beam_x <= self.paddle_x + self.paddle_width + self.ball_radius:
+                    self._lose_ball(now)
+                    return
         steps = max(1, min(8, math.ceil(math.hypot(self.ball.vx * dt, self.ball.vy * dt) / 2)))
         for _ in range(steps):
             ball = self.ball
@@ -1388,6 +1619,12 @@ class BlockBreaker:
         mask = np.zeros(frame.shape, np.uint8)
         cv2.putText(mask, text, origin, cv2.FONT_HERSHEY_SIMPLEX, scale, 255, 1, cv2.LINE_AA)
         frame[mask > 96] = color
+
+    @classmethod
+    def _center_text(cls, frame: np.ndarray, text: str, y: int, color: int, scale: float) -> None:
+        (width, _height), _baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
+        x = max(0, (CANVAS_WIDTH - width) // 2)
+        cls._text(frame, text, (x, y), color, scale)
 
     def render(
         self,
@@ -1426,7 +1663,7 @@ class BlockBreaker:
         boss_sprite = self.boss_sprite if palette_mode == PaletteMode.FC6 else self.boss_sprite_msx16
         boss_region[self.boss_mask] = boss_sprite[self.boss_mask]
         if self.boss_transition_remaining > 0.0:
-            # 点灯→消灯を3周期。点滅中はボスの位置を固定する。
+            # 点灯→消灯を3周期。ボスの移動は登場時から継続する。
             phase = int((self.boss_transition_duration - self.boss_transition_remaining) / (self.boss_transition_duration / 6))
             if phase in (0, 2, 4):
                 boss_region[self.boss_mask] = colors.flash
@@ -1435,18 +1672,58 @@ class BlockBreaker:
             phase = int((self.damage_effect_duration - self.damage_effect_remaining) / (self.damage_effect_duration / 4))
             if phase in (0, 2):
                 boss_region[self.boss_mask] = colors.flash
+        palette_color = (
+            (lambda index: index)
+            if palette_mode == PaletteMode.FC6
+            else (lambda index: int(BOSS_FC6_TO_MSX16[index]))
+        )
+        if self.boss_profile.barrier_hits_required and not self.barrier_broken:
+            barrier_color = palette_color(0x16 if (self.barrier_hits + int(time.monotonic() * 8)) % 2 else 0x0E)
+            shield_center = (boss_x + self.boss_width // 2, boss_y + self.boss_height // 2)
+            shield_radius = max(self.boss_width, self.boss_height) // 2 + 7
+            cv2.circle(frame, shield_center, shield_radius, barrier_color, 2, lineType=cv2.LINE_8)
+        if self.boss_profile.critical_hits_required and not self.boss_defeated:
+            critical_x, critical_y = self._critical_point()
+            marker_color = palette_color(0x06 if int(time.monotonic() * 7) % 2 else 0x16)
+            cv2.drawMarker(
+                frame,
+                (int(round(critical_x)), int(round(critical_y))),
+                marker_color,
+                cv2.MARKER_DIAMOND,
+                13,
+                2,
+                line_type=cv2.LINE_8,
+            )
+            cv2.circle(frame, (int(round(critical_x)), int(round(critical_y))), 8, marker_color, 1, lineType=cv2.LINE_8)
+        if self.boss_profile.beam_attack and self.game_started and not self.serving and not self.boss_defeated:
+            beam_warning = self.beam_phase >= self.beam_period - self.beam_warning_duration
+            beam_active = self.beam_phase >= self.beam_period - self.beam_active_duration
+            if beam_warning:
+                beam_x = int(round(self.boss_x + self.boss_width / 2.0))
+                beam_top = max(26, boss_y + self.boss_height)
+                beam_bottom = int(round(self.paddle_y))
+                if beam_active:
+                    frame[beam_top:beam_bottom, max(0, beam_x - 2):min(CANVAS_WIDTH, beam_x + 3)] = palette_color(0x06)
+                    frame[beam_top:beam_bottom, max(0, beam_x - 4):min(CANVAS_WIDTH, beam_x - 2)] = palette_color(0x0E)
+                    frame[beam_top:beam_bottom, max(0, beam_x + 3):min(CANVAS_WIDTH, beam_x + 5)] = palette_color(0x0E)
+                else:
+                    for line_y in range(beam_top, beam_bottom, 8):
+                        frame[line_y:line_y + 2, max(0, beam_x - 1):min(CANVAS_WIDTH, beam_x + 2)] = palette_color(0x0E)
+        # 名前は登場〜最初のスタート待ちだけ表示し、プレイ中の情報量を抑える。
+        if self.serving and not self.game_started and not self.boss_defeated:
+            self._center_text(frame, self.boss_profile.display_name, 150, colors.text, .42)
         x = int(round(self.paddle_x))
         frame[int(self.paddle_y):int(self.paddle_y + self.paddle_height), x:x + int(self.paddle_width)] = colors.paddle
         frame[int(self.paddle_y):int(self.paddle_y + 2), x:x + int(self.paddle_width)] = colors.paddle_edge
         if active_play:
             cv2.circle(frame, (int(round(self.ball.x)), int(round(self.ball.y))), int(self.ball_radius), colors.ball, -1, lineType=cv2.LINE_8)
         if self.boss_defeated:
-            self._text(frame, "BOSS DOWN", (39, 228), colors.clear, .68)
+            self._center_text(frame, "BOSS DOWN", 228, colors.clear, .68)
         elif self.game_over_until:
-            self._text(frame, "GAME OVER", (43, 228), colors.game_over, .72)
+            self._center_text(frame, "GAME OVER", 228, colors.game_over, .72)
         elif self.serving:
             if countdown is not None and countdown > 0:
-                self._text(frame, f"START IN {countdown}", (50, 232), colors.prompt, .58)
+                self._center_text(frame, f"START IN {countdown}", 232, colors.prompt, .58)
             else:
                 if start_mode == "still":
                     prompt = "STAND STILL TO START"
@@ -1454,17 +1731,417 @@ class BlockBreaker:
                     prompt = "WALK PAST TO START"
                 else:
                     prompt = "ARMS CIRCLE TO LAUNCH"
-                self._text(frame, prompt if sensor_stage == "READY" else "SENSOR CAL", (16, 232), colors.prompt, .42)
+                self._center_text(frame, prompt if sensor_stage == "READY" else "SENSOR CAL", 232, colors.prompt, .42)
             if sensor_stage == "BACKGROUND":
-                self._text(frame, "CLEAR SENSOR", (32, 252), colors.text, .40)
+                self._center_text(frame, "CLEAR SENSOR", 252, colors.text, .40)
             elif sensor_stage == "STANCE":
-                self._text(frame, "STAND STILL", (37, 252), colors.text, .40)
+                self._center_text(frame, "STAND STILL", 252, colors.text, .40)
             elif start_mode == "still" and start_hold_remaining is not None:
-                self._text(frame, f"HOLD {math.ceil(start_hold_remaining)}", (62, 252), colors.text, .40)
+                self._center_text(frame, f"HOLD {math.ceil(start_hold_remaining)}", 252, colors.text, .40)
         if boundaries:
             for y in (96, 192, 288):
                 frame[y:y + 1, :] = colors.dim
         return frame
+
+@dataclass
+class ClassicBlock:
+    x: float
+    y: float
+    width: float
+    height: float
+    color: int
+
+
+class ClassicThenBoss:
+    """穴あき通常面のあと、通常ボス3体→最終ボスの連戦へ進むゲーム本体。"""
+
+    paddle_width, paddle_height, paddle_y = BlockBreaker.paddle_width, BlockBreaker.paddle_height, BlockBreaker.paddle_y
+    ball_radius, paddle_speed, initial_speed = BlockBreaker.ball_radius, BlockBreaker.paddle_speed, BlockBreaker.initial_speed
+    stage_clear_delay = 1.8
+    warning_seconds = 1.5
+    final_warning_seconds = 1.5
+    victory_seconds = 4.0
+    normal_boss_count = 3
+    classic_rows = 4
+    classic_columns = 5
+    # 最初から縦に抜いた通路。ボールが奥まで入りやすく、連続してブロックを崩せる。
+    opening_columns = frozenset((1, 3))
+    block_colors = (0x00, 0x05, 0x0A, 0x0E, 0x12, 0x16, 0x1E, 0x22, 0x29, 0x2D)
+
+    def __init__(self) -> None:
+        self.phase = "classic"
+        self.blocks: list[ClassicBlock] = []
+        self.boss: BlockBreaker | None = None
+        self.score = 0
+        self.lives = 3
+        self.ball = Ball(0.0, 0.0)
+        self._paddle_x = 0.0
+        self._serving = True
+        self._game_started = False
+        self._game_over_until = 0.0
+        self._life_loss_event = False
+        self._stage_start_request = False
+        self.stage_clear_remaining = 0.0
+        self.warning_remaining = 0.0
+        self.warning_duration = self.warning_seconds
+        self.boss_order: list[BossProfile] = []
+        self.boss_index = -1
+        self.victory_remaining = 0.0
+        self.reset(full=True)
+
+    @property
+    def paddle_x(self) -> float:
+        return self.boss.paddle_x if self.boss is not None else self._paddle_x
+
+    @paddle_x.setter
+    def paddle_x(self, value: float) -> None:
+        if self.boss is not None:
+            self.boss.paddle_x = value
+        else:
+            self._paddle_x = value
+
+    @property
+    def serving(self) -> bool:
+        return self.boss.serving if self.boss is not None else self._serving
+
+    @property
+    def game_started(self) -> bool:
+        if self.phase == "warning":
+            return True
+        return self.boss.game_started if self.boss is not None else self._game_started
+
+    @property
+    def game_over_until(self) -> float:
+        return self.boss.game_over_until if self.boss is not None else self._game_over_until
+
+    def _make_blocks(self) -> list[ClassicBlock]:
+        columns, rows, margin, gap = self.classic_columns, self.classic_rows, 8, 2
+        width = (CANVAS_WIDTH - margin * 2 - gap * (columns - 1)) / columns
+        return [
+            ClassicBlock(
+                margin + column * (width + gap),
+                48 + row * 14,
+                width,
+                12,
+                self.block_colors[(row + column) % len(self.block_colors)],
+            )
+            for row in range(rows)
+            for column in range(columns)
+            if column not in self.opening_columns
+        ]
+
+    def reset(self, full: bool = False) -> None:
+        self.phase = "classic"
+        self.boss = None
+        self.score = 0
+        self.lives = 3
+        self._paddle_x = (CANVAS_WIDTH - self.paddle_width) / 2
+        self._serving = True
+        self._game_started = False
+        self._game_over_until = 0.0
+        self._life_loss_event = False
+        self._stage_start_request = False
+        self.stage_clear_remaining = 0.0
+        self.warning_remaining = 0.0
+        self.warning_duration = self.warning_seconds
+        self.boss_order = []
+        self.boss_index = -1
+        self.victory_remaining = 0.0
+        self.blocks = self._make_blocks()
+        self._place_ball_on_paddle()
+
+    def _place_ball_on_paddle(self) -> None:
+        self.ball = Ball(self._paddle_x + self.paddle_width / 2, self.paddle_y - self.ball_radius - 1)
+
+    def _move_paddle(self, dt: float, controls: GameInput) -> None:
+        if controls.paddle_center_x is not None and math.isfinite(float(controls.paddle_center_x)):
+            self._paddle_x = min(
+                max(0.0, float(controls.paddle_center_x) - self.paddle_width / 2),
+                CANVAS_WIDTH - self.paddle_width,
+            )
+        else:
+            self._paddle_x = min(
+                max(0.0, self._paddle_x + max(-1, min(1, controls.lateral)) * self.paddle_speed * dt),
+                CANVAS_WIDTH - self.paddle_width,
+            )
+
+    def _launch_classic(self) -> None:
+        self._serving = False
+        self._game_started = True
+        self.ball.vx, self.ball.vy = self.initial_speed * .52, -self.initial_speed * .86
+
+    def _hit_block(self, block: ClassicBlock) -> bool:
+        near_x = min(max(self.ball.x, block.x), block.x + block.width)
+        near_y = min(max(self.ball.y, block.y), block.y + block.height)
+        dx, dy = self.ball.x - near_x, self.ball.y - near_y
+        if dx * dx + dy * dy > self.ball_radius ** 2:
+            return False
+        if abs(dx) > abs(dy):
+            self.ball.vx = -self.ball.vx
+        else:
+            self.ball.vy = -self.ball.vy
+        return True
+
+    def _bounce_edges(self) -> None:
+        ball = self.ball
+        if ball.x - self.ball_radius < 0 or ball.x + self.ball_radius >= CANVAS_WIDTH:
+            ball.x = min(max(self.ball_radius, ball.x), CANVAS_WIDTH - self.ball_radius - 1)
+            ball.vx = -ball.vx
+        if ball.y - self.ball_radius < 26:
+            ball.y, ball.vy = 26 + self.ball_radius, abs(ball.vy)
+        if (
+            ball.vy > 0
+            and ball.y + self.ball_radius >= self.paddle_y
+            and ball.y - self.ball_radius <= self.paddle_y + self.paddle_height
+            and self._paddle_x - self.ball_radius <= ball.x <= self._paddle_x + self.paddle_width + self.ball_radius
+        ):
+            ball.y = self.paddle_y - self.ball_radius - 1
+            hit = (ball.x - (self._paddle_x + self.paddle_width / 2)) / (self.paddle_width / 2)
+            speed = min(300, math.hypot(ball.vx, ball.vy) * 1.015)
+            ball.vx = speed * hit * .92
+            ball.vy = -max(80, math.sqrt(max(1, speed * speed - ball.vx * ball.vx)))
+
+    def _lose_classic_ball(self, now: float) -> None:
+        self.lives -= 1
+        self._life_loss_event = self.lives > 0
+        self._serving = True
+        self.ball.vx = self.ball.vy = 0.0
+        if self.lives <= 0:
+            self._game_over_until = now + 1.8
+        self._place_ball_on_paddle()
+
+    def _start_random_boss(self) -> None:
+        normal_profiles = tuple(profile for profile in BOSS_PROFILES if not profile.final_boss)
+        final_profiles = tuple(profile for profile in BOSS_PROFILES if profile.final_boss)
+        count = min(self.normal_boss_count, len(normal_profiles))
+        self.boss_order = list(random.sample(normal_profiles, count)) + list(final_profiles)
+        self.boss_index = 0
+        self._start_boss(self.boss_order[self.boss_index])
+
+    def _start_boss(self, profile: BossProfile) -> None:
+        self.phase = "warning"
+        self.warning_duration = self.final_warning_seconds if profile.final_boss else self.warning_seconds
+        self.warning_remaining = self.warning_duration
+        self.lives = 3
+        self.boss = BlockBreaker(boss_profile=profile, auto_reset_on_clear=False)
+
+    def _advance_boss(self) -> None:
+        if self.boss_index + 1 < len(self.boss_order):
+            self.boss_index += 1
+            self._start_boss(self.boss_order[self.boss_index])
+            return
+        self.phase = "victory"
+        self.warning_remaining = 0.0
+        self.victory_remaining = self.victory_seconds
+        self._stage_start_request = False
+
+    def debug_clear(self) -> None:
+        """キーボード試験用に、現在の段階を即時クリアする。"""
+        if self.phase == "classic":
+            self.blocks.clear()
+            self.phase = "transition"
+            self.stage_clear_remaining = 0.0
+        elif self.phase == "transition":
+            self.stage_clear_remaining = 0.0
+        elif self.phase == "warning":
+            self.warning_remaining = 0.0
+            self._finish_warning()
+        elif self.phase == "boss" and self.boss is not None:
+            self.boss.debug_clear()
+
+    def _finish_warning(self) -> None:
+        self.phase = "boss"
+        self.warning_remaining = 0.0
+        self._stage_start_request = True
+
+    def consume_life_loss_event(self) -> bool:
+        if self.boss is not None:
+            event = self.boss.consume_life_loss_event()
+            self.lives = self.boss.lives
+            return event
+        event = self._life_loss_event
+        self._life_loss_event = False
+        return event
+
+    def consume_stage_start_request(self) -> bool:
+        event = self._stage_start_request
+        self._stage_start_request = False
+        return event
+
+    def step(self, dt: float, controls: GameInput, now: float) -> None:
+        dt = min(.04, max(0.0, dt))
+        if self.phase == "warning":
+            self.warning_remaining = max(0.0, self.warning_remaining - dt)
+            if self.warning_remaining == 0.0:
+                self._finish_warning()
+            return
+        if self.phase == "victory":
+            self.victory_remaining = max(0.0, self.victory_remaining - dt)
+            if self.victory_remaining == 0.0:
+                self.reset(full=True)
+            return
+        if self.boss is not None:
+            if self.boss.game_over_until and now >= self.boss.game_over_until:
+                self.reset(full=True)
+                return
+            self.boss.step(dt, controls, now)
+            if self.boss.boss_defeated and self.boss.clear_remaining == 0.0:
+                self._advance_boss()
+            return
+        if self.phase == "transition":
+            self.stage_clear_remaining = max(0.0, self.stage_clear_remaining - dt)
+            if self.stage_clear_remaining == 0.0:
+                self._start_random_boss()
+            return
+        if self._game_over_until:
+            if now >= self._game_over_until:
+                self.reset(full=True)
+            return
+        self._move_paddle(dt, controls)
+        if self._serving:
+            self._place_ball_on_paddle()
+            if controls.launch:
+                self._launch_classic()
+            return
+        steps = max(1, min(8, math.ceil(math.hypot(self.ball.vx * dt, self.ball.vy * dt) / 2)))
+        for _ in range(steps):
+            self.ball.x += self.ball.vx * dt / steps
+            self.ball.y += self.ball.vy * dt / steps
+            self._bounce_edges()
+            for index, block in enumerate(self.blocks):
+                if self._hit_block(block):
+                    del self.blocks[index]
+                    self.score += 10
+                    break
+            if not self.blocks:
+                self.phase = "transition"
+                self.stage_clear_remaining = self.stage_clear_delay
+                self._serving = True
+                self.ball.vx = self.ball.vy = 0.0
+                return
+            if self.ball.y - self.ball_radius > CANVAS_HEIGHT:
+                self._lose_classic_ball(now)
+                return
+
+    def _render_classic(
+        self,
+        sensor_stage: str,
+        boundaries: bool,
+        countdown: int | None,
+        start_mode: str,
+        start_hold_remaining: float | None,
+    ) -> np.ndarray:
+        frame = np.full((CANVAS_HEIGHT, CANVAS_WIDTH), SKY, np.uint8)
+        for index in range(30):
+            frame[30 + (index * 71 + 13) % 300, (index * 47 + 19) % CANVAS_WIDTH] = SKY_DOT
+        frame[22:24, :] = DIM
+        BlockBreaker._text(frame, f"SCORE {self.score:05d}", (6, 17), TEXT, .38)
+        for life in range(self.lives):
+            cv2.circle(frame, (164 + life * 11, 12), 3, int(TEXT), -1, lineType=cv2.LINE_8)
+        for block in self.blocks:
+            x0, y0 = int(round(block.x)), int(round(block.y))
+            x1, y1 = int(round(block.x + block.width)), int(round(block.y + block.height))
+            frame[y0:y1, x0:x1] = block.color
+            frame[y0:y0 + 2, x0:x1] = TEXT
+        x = int(round(self._paddle_x))
+        frame[int(self.paddle_y):int(self.paddle_y + self.paddle_height), x:x + int(self.paddle_width)] = PADDLE
+        frame[int(self.paddle_y):int(self.paddle_y + 2), x:x + int(self.paddle_width)] = PADDLE_EDGE
+        if self.phase != "transition" and not self._game_over_until:
+            cv2.circle(frame, (int(round(self.ball.x)), int(round(self.ball.y))), int(self.ball_radius), int(BALL), -1, lineType=cv2.LINE_8)
+        if self.phase == "transition":
+            BlockBreaker._center_text(frame, "STAGE CLEAR", 228, 0x12, .62)
+        elif self._game_over_until:
+            BlockBreaker._center_text(frame, "GAME OVER", 228, 0x06, .72)
+        elif self._serving:
+            if countdown is not None and countdown > 0:
+                BlockBreaker._center_text(frame, f"START IN {countdown}", 232, 0x0E, .58)
+            else:
+                prompt = "STAND STILL TO START" if start_mode == "still" else "WALK PAST TO START" if start_mode == "passby" else "ARMS CIRCLE TO LAUNCH"
+                BlockBreaker._center_text(frame, prompt if sensor_stage == "READY" else "SENSOR CAL", 232, 0x0E, .42)
+            if sensor_stage == "BACKGROUND":
+                BlockBreaker._center_text(frame, "CLEAR SENSOR", 252, TEXT, .40)
+            elif sensor_stage == "STANCE":
+                BlockBreaker._center_text(frame, "STAND STILL", 252, TEXT, .40)
+            elif start_mode == "still" and start_hold_remaining is not None:
+                BlockBreaker._center_text(frame, f"HOLD {math.ceil(start_hold_remaining)}", 252, TEXT, .40)
+        if boundaries:
+            for y in (96, 192, 288):
+                frame[y:y + 1, :] = DIM
+        return frame
+
+    def _render_warning(self) -> np.ndarray:
+        frame = np.full((CANVAS_HEIGHT, CANVAS_WIDTH), SKY, np.uint8)
+        for index in range(30):
+            frame[30 + (index * 71 + 13) % 300, (index * 47 + 19) % CANVAS_WIDTH] = SKY_DOT
+        elapsed = self.warning_duration - self.warning_remaining
+        final_boss = self.boss is not None and self.boss.boss_profile.final_boss
+        blink = int(elapsed / (.12 if final_boss else .20)) % 2 == 0
+        border = 5 if final_boss and blink else 3 if blink else 1
+        frame[:border, :] = 0x04
+        frame[-border:, :] = 0x04
+        frame[:, :border] = 0x04
+        frame[:, -border:] = 0x04
+        if self.boss is not None:
+            if final_boss:
+                # 最終ボスは中央に立ち絵を出し、走査線とFINAL表示を重ねて登場感を出す。
+                sprite = self.boss.boss_sprite
+                mask = self.boss.boss_mask
+                x = (CANVAS_WIDTH - self.boss.boss_width) // 2
+                y = 38
+                region = frame[y:y + self.boss.boss_height, x:x + self.boss.boss_width]
+                region[mask] = sprite[mask]
+                accent = 0x16 if blink else 0x0E
+                for line_y in range(30, 184, 12):
+                    frame[line_y:line_y + 1, 8:CANVAS_WIDTH - 8] = accent
+                BlockBreaker._center_text(frame, "FINAL BOSS", 218, TEXT if blink else 0x06, .60)
+                BlockBreaker._center_text(frame, self.boss.boss_profile.display_name, 252, TEXT, .46)
+            else:
+                BlockBreaker._center_text(frame, "WARNING", 206, TEXT if blink else 0x06, .78)
+                BlockBreaker._center_text(frame, self.boss.boss_profile.display_name, 246, TEXT, .48)
+        else:
+            BlockBreaker._center_text(frame, "WARNING", 206, TEXT if blink else 0x06, .78)
+        return frame
+
+    def _render_victory(self) -> np.ndarray:
+        frame = np.full((CANVAS_HEIGHT, CANVAS_WIDTH), SKY, np.uint8)
+        for index in range(30):
+            frame[30 + (index * 71 + 13) % 300, (index * 47 + 19) % CANVAS_WIDTH] = SKY_DOT
+        elapsed = self.victory_seconds - self.victory_remaining
+        pulse = int(elapsed / .16) % 2 == 0
+        border = 4 if pulse else 2
+        frame[:border, :] = 0x16
+        frame[-border:, :] = 0x16
+        frame[:, :border] = 0x16
+        frame[:, -border:] = 0x16
+        BlockBreaker._center_text(frame, "ALL BOSSES DOWN", 184, TEXT if pulse else 0x0E, .56)
+        BlockBreaker._center_text(frame, "STAGE COMPLETE", 222, TEXT, .48)
+        return frame
+
+    def render(
+        self,
+        sensor_stage: str,
+        boundaries: bool = False,
+        countdown: int | None = None,
+        start_mode: str = "arm-circle",
+        start_hold_remaining: float | None = None,
+        palette_mode: PaletteMode = PaletteMode.FC6,
+    ) -> np.ndarray:
+        if self.phase == "warning":
+            frame = self._render_warning()
+        elif self.phase == "victory":
+            frame = self._render_victory()
+        elif self.boss is not None:
+            frame = self.boss.render(
+                sensor_stage,
+                boundaries,
+                countdown,
+                start_mode,
+                start_hold_remaining,
+                palette_mode=PaletteMode.FC6,
+            )
+        else:
+            frame = self._render_classic(sensor_stage, boundaries, countdown, start_mode, start_hold_remaining)
+        return frame if palette_mode == PaletteMode.FC6 else BOSS_FC6_TO_MSX16[frame]
 
 
 def parse_roi(value: str) -> tuple[int, int, int, int]:
@@ -1777,8 +2454,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             sensor_control_sender.close()
         print(f"error: {exc}（開発用には --keyboard）", file=sys.stderr)
         return 2
-    keyboard_state = X11KeyboardState() if not args.no_preview else None
-    game, running, frame_id = BlockBreaker(), True, 0
+    keyboard_state = create_keyboard_state() if not args.no_preview else None
+    game, running, frame_id = ClassicThenBoss(), True, 0
     follower = PaddleFollower(
         CANVAS_WIDTH,
         game.paddle_width,
@@ -1818,7 +2495,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             flush=True,
         )
     if not args.no_preview:
-        print("keys: A/D or LEFT/RIGHT = paddle, SPACE/W/UP = launch, R = reset, Q/ESC = quit", flush=True)
+        print("keys: A/D or LEFT/RIGHT = paddle, SPACE/W/UP = launch, X = debug clear, R = reset, Q/ESC = quit", flush=True)
     last_sensor_stage: str | None = None
     last_lateral: int | None = None
     last_player_id: int | None = None
@@ -1913,7 +2590,8 @@ def main(argv: Iterable[str] | None = None) -> int:
                     print("event=life-lost remote-select=front-player wait=still-hold", flush=True)
                 else:
                     print("event=life-lost wait=manual-launch", flush=True)
-            if was_game_started and not game.game_started:
+            stage_start_requested = game.consume_stage_start_request()
+            if was_game_started and not game.game_started and not stage_start_requested:
                 countdown_remaining = 0.0
                 awaiting_player_hold = False
                 if sensor is not None:
@@ -1921,6 +2599,14 @@ def main(argv: Iterable[str] | None = None) -> int:
                 elif sensor_control_sender is not None:
                     sensor_control_sender.reselect_player()
                 print("event=round-reset select=front-player", flush=True)
+            if stage_start_requested:
+                countdown_remaining = 0.0
+                if sensor is not None:
+                    sensor.reselect_player()
+                    awaiting_player_hold = True
+                    print("event=stage-clear boss=random select=front-player wait=still-hold", flush=True)
+                else:
+                    print("event=stage-clear boss=random wait=manual-launch", flush=True)
             if was_serving and not game.serving:
                 print("event=game-launch", flush=True)
             manual_launch, last = False, now
@@ -1962,6 +2648,9 @@ def main(argv: Iterable[str] | None = None) -> int:
                     manual_launch = True
                 elif action == "reset":
                     game.reset(full=True)
+                elif action == "debug_clear":
+                    game.debug_clear()
+                    print("event=debug-clear", flush=True)
             frame_id += 1
             deadline += period
             sleep_time = deadline - time.monotonic()

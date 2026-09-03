@@ -11,8 +11,11 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from block_breaker import (  # noqa: E402
+    BOSS_IMAGES,
+    BOSS_PROFILES,
     BodyMeasurement,
     BlockBreaker,
+    ClassicThenBoss,
     ForegroundGate,
     GameInput,
     InputClassifier,
@@ -422,7 +425,7 @@ def main() -> int:
         errors.append("静止開始を同じ人物で連続発火する")
     if still.update(None, 6.2) != (False, None):
         errors.append("人物が消えた時に静止開始をリセットしない")
-    for key, expected in ((ord("a"), "left"), (83, "right"), (ord(" "), "launch"), (ord("r"), "reset")):
+    for key, expected in ((ord("a"), "left"), (83, "right"), (ord(" "), "launch"), (ord("r"), "reset"), (ord("x"), "debug_clear")):
         if keyboard_action(key) != expected:
             errors.append(f"キーボード操作の変換が不正: {key} -> {keyboard_action(key)}")
     game = BlockBreaker()
@@ -519,14 +522,14 @@ def main() -> int:
     game.ball.vx, game.ball.vy = 0, -220
     if not game._hit_boss() or game.boss_hp != 50:
         errors.append("HP半分到達時のボスダメージを処理しない")
-    if game.boss_move_active or game.boss_transition_remaining <= 0.0:
-        errors.append("HP半分到達時に3回点滅の待機へ入らない")
+    if not game.boss_move_active or game.boss_transition_remaining <= 0.0:
+        errors.append("HP半分到達時の点滅演出に入らない")
     game.serving = True
     x_before_move = game.boss_x
     for step in range(20):
         game.step(.04, GameInput(), .5 + step * .04)
     if not game.boss_move_active or game.boss_x == x_before_move:
-        errors.append("3回点滅後にボスが左右移動を開始しない")
+        errors.append("登場直後からボスが左右移動しない")
 
     game.reset(full=True)
     game.boss_hp = game.boss_damage
@@ -550,6 +553,111 @@ def main() -> int:
             errors.append("FC6の192x384フレームを維持しない")
             break
         game.step(1 / 60, GameInput(-1 if step % 60 < 30 else 1), .4 + step / 60)
+
+    sequence = ClassicThenBoss()
+    sequence.debug_clear()
+    sequence.step(.04, GameInput(), 0.0)
+    if sequence.phase != "warning":
+        errors.append("Xキーで通常面を即時クリアしない")
+    sequence.debug_clear()
+    if sequence.phase != "boss":
+        errors.append("XキーでWARNINGをスキップしない")
+    if sequence.boss is None:
+        errors.append("Xキーのデバッグクリア後にボスを生成しない")
+    else:
+        sequence.boss.debug_clear()
+        sequence.step(.04, GameInput(), .1)
+        if sequence.phase != "warning":
+            errors.append("Xキー相当のボス撃破後に次のWARNINGへ進まない")
+    sequence.reset(full=True)
+    expected_blocks = sequence.classic_rows * (sequence.classic_columns - len(sequence.opening_columns))
+    if len(sequence.blocks) != expected_blocks:
+        errors.append(f"通常面の穴あきブロック数が不正: {len(sequence.blocks)}")
+    block_columns = {
+        round((block.x - 8) / (block.width + 2))
+        for block in sequence.blocks
+    }
+    if block_columns & sequence.opening_columns:
+        errors.append("通常面の通路列にブロックを置く")
+    sequence._serving = False
+    sequence.blocks.clear()
+    sequence.step(.04, GameInput(), 10.0)
+    if sequence.phase != "transition" or sequence.stage_clear_remaining <= 0.0:
+        errors.append("通常面クリア後にボス遷移へ入らない")
+    for index in range(50):
+        sequence.step(.04, GameInput(), 10.1 + index * .04)
+    if sequence.phase != "warning":
+        errors.append("通常面クリア後に全ボス共通WARNINGへ入らない")
+    warning_frame = sequence.render("READY")
+    if not np.any(warning_frame == 0x04):
+        errors.append("ボス登場前のWARNING表示を描画しない")
+    for index in range(80):
+        sequence.step(.04, GameInput(), 12.1 + index * .04)
+    if sequence.boss is None or sequence.boss.boss_image not in BOSS_IMAGES:
+        errors.append("ボス戦で候補からボスを選ばない")
+    if sequence.lives != 3 or sequence.boss is None or sequence.boss.lives != 3:
+        errors.append("ステージ開始時に残機を3へ回復しない")
+    if len(sequence.boss_order) != sequence.normal_boss_count + 1:
+        errors.append("通常ボス3体＋最終ボスの連戦にならない")
+    elif not sequence.boss_order[-1].final_boss or any(profile.final_boss for profile in sequence.boss_order[:-1]):
+        errors.append("最終ボスをMEKA.TKMRだけに固定しない")
+    if not sequence.consume_stage_start_request():
+        errors.append("ボス戦開始時にプレイヤー選び直しを要求しない")
+    # 通常ボスを倒すと次のWARNINGへ進み、最後のMEKA.TKMR撃破後だけ勝利演出になる。
+    for index in range(len(sequence.boss_order) - 1):
+        assert sequence.boss is not None
+        sequence.boss.boss_defeated = True
+        sequence.boss.clear_remaining = .04
+        sequence.step(.04, GameInput(), 20.0 + index)
+        if sequence.phase != "warning" or sequence.boss_index != index + 1:
+            errors.append("ボス撃破後に次のWARNINGへ連戦しない")
+            break
+        for warning_step in range(130):
+            sequence.step(.04, GameInput(), 21.0 + index * 10 + warning_step * .04)
+    if sequence.phase != "boss" or sequence.boss is None or not sequence.boss.boss_profile.final_boss:
+        errors.append("最後のボスがMEKA.TKMRにならない")
+    else:
+        sequence.boss.boss_defeated = True
+        sequence.boss.clear_remaining = .04
+        sequence.step(.04, GameInput(), 60.0)
+        if sequence.phase != "victory":
+            errors.append("最終ボス撃破後に勝利演出へ進まない")
+    for profile in BOSS_PROFILES:
+        profile_game = BlockBreaker(boss_profile=profile)
+        if profile_game.boss_hp != profile.max_hp:
+            errors.append(f"{profile.display_name}の体力設定が反映されない")
+        if profile_game.boss_profile.display_name != profile.display_name:
+            errors.append(f"{profile.display_name}の表示名が反映されない")
+
+    # 土屋は5回のバリア、稲葉は頭上急所1回を通過して初めて撃破できる。
+    tuchiya = BlockBreaker(boss_profile=next(profile for profile in BOSS_PROFILES if profile.key == "tuchiya"))
+    shield_x, shield_y, shield_radius = tuchiya._barrier_geometry()
+    for hit in range(5):
+        tuchiya.boss_collision_armed = True
+        tuchiya.ball.x = shield_x
+        tuchiya.ball.y = shield_y - shield_radius - tuchiya.ball_radius + .25
+        tuchiya.ball.vx, tuchiya.ball.vy = 0, 220
+        tuchiya._hit_boss()
+    if not tuchiya.barrier_broken or tuchiya.boss_hp != tuchiya.boss_max_hp:
+        errors.append("土屋の5回バリアが規定回数で壊れない")
+
+    inaba = BlockBreaker(boss_profile=next(profile for profile in BOSS_PROFILES if profile.key == "inaba"))
+    inaba.boss_collision_armed = True
+    critical_x, critical_y = inaba._critical_point()
+    inaba.ball.x, inaba.ball.y = critical_x, critical_y - inaba.ball_radius + .25
+    inaba.ball.vx, inaba.ball.vy = 0, 220
+    inaba._hit_boss()
+    if inaba.critical_hits != 1 or not inaba.boss_defeated:
+        errors.append("稲葉の頭上急所1回で撃破できない")
+
+    meka = BlockBreaker(boss_profile=next(profile for profile in BOSS_PROFILES if profile.key == "meka_takemura"))
+    meka.serving = False
+    meka.game_started = True
+    meka.beam_phase = meka.beam_period - .05
+    meka.paddle_x = meka.boss_x + meka.boss_width / 2 - meka.paddle_width / 2
+    meka.step(.01, GameInput(), 1.0)
+    if meka.lives != 2 or not meka.consume_life_loss_event():
+        errors.append("MEKA.TKMRのビームがパドルに当たった時に残機を減らさない")
     for error in errors:
         print(f"ERROR: {error}")
     print(f"{len(errors)} errors")
