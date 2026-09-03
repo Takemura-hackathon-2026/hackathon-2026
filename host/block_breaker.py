@@ -1508,9 +1508,9 @@ class ClassicThenBoss:
     victory_seconds = 4.0
     normal_boss_count = 3
     classic_rows = 4
-    classic_columns = 7
+    classic_columns = 6
     # 最初から縦に抜いた通路。ボールが奥まで入りやすく、連続してブロックを崩せる。
-    opening_columns = frozenset((1, 4, 6))
+    opening_columns = frozenset((1, 3, 5))
     block_colors = (0x00, 0x05, 0x0A, 0x0E, 0x12, 0x16, 0x1E, 0x22, 0x29, 0x2D)
 
     def __init__(self) -> None:
