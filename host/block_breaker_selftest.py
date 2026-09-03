@@ -459,6 +459,8 @@ def main() -> int:
         sequence.step(.04, GameInput(), 12.1 + index * .04)
     if sequence.boss is None or sequence.boss.boss_image not in BOSS_IMAGES:
         errors.append("ボス戦で候補からボスを選ばない")
+    if sequence.lives != 3 or sequence.boss is None or sequence.boss.lives != 3:
+        errors.append("ステージ開始時に残機を3へ回復しない")
     if len(sequence.boss_order) != sequence.normal_boss_count + 1:
         errors.append("通常ボス3体＋最終ボスの連戦にならない")
     elif not sequence.boss_order[-1].final_boss or any(profile.final_boss for profile in sequence.boss_order[:-1]):
@@ -516,7 +518,7 @@ def main() -> int:
     meka = BlockBreaker(boss_profile=next(profile for profile in BOSS_PROFILES if profile.key == "meka_takemura"))
     meka.serving = False
     meka.game_started = True
-    meka.beam_phase = meka.beam_period - .20
+    meka.beam_phase = meka.beam_period - .05
     meka.paddle_x = meka.boss_x + meka.boss_width / 2 - meka.paddle_width / 2
     meka.step(.01, GameInput(), 1.0)
     if meka.lives != 2 or not meka.consume_life_loss_event():

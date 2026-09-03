@@ -1667,6 +1667,7 @@ class ClassicThenBoss:
         self.phase = "warning"
         self.warning_duration = self.final_warning_seconds if profile.final_boss else self.warning_seconds
         self.warning_remaining = self.warning_duration
+        self.lives = 3
         self.boss = BlockBreaker(boss_profile=profile, auto_reset_on_clear=False)
 
     def _advance_boss(self) -> None:
@@ -1686,7 +1687,9 @@ class ClassicThenBoss:
 
     def consume_life_loss_event(self) -> bool:
         if self.boss is not None:
-            return self.boss.consume_life_loss_event()
+            event = self.boss.consume_life_loss_event()
+            self.lives = self.boss.lives
+            return event
         event = self._life_loss_event
         self._life_loss_event = False
         return event
