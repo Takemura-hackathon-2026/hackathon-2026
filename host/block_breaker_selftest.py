@@ -401,14 +401,14 @@ def main() -> int:
     game.ball.vx, game.ball.vy = 0, -220
     if not game._hit_boss() or game.boss_hp != 50:
         errors.append("HP半分到達時のボスダメージを処理しない")
-    if game.boss_move_active or game.boss_transition_remaining <= 0.0:
-        errors.append("HP半分到達時に3回点滅の待機へ入らない")
+    if not game.boss_move_active or game.boss_transition_remaining <= 0.0:
+        errors.append("HP半分到達時の点滅演出に入らない")
     game.serving = True
     x_before_move = game.boss_x
     for step in range(20):
         game.step(.04, GameInput(), .5 + step * .04)
     if not game.boss_move_active or game.boss_x == x_before_move:
-        errors.append("3回点滅後にボスが左右移動を開始しない")
+        errors.append("登場直後からボスが左右移動しない")
 
     game.reset(full=True)
     game.boss_hp = game.boss_damage
@@ -459,8 +459,8 @@ def main() -> int:
         sequence.step(.04, GameInput(), 12.1 + index * .04)
     if sequence.boss is None or sequence.boss.boss_image not in BOSS_IMAGES:
         errors.append("ボス戦で候補からボスを選ばない")
-    if len(sequence.boss_order) != len(BOSS_PROFILES):
-        errors.append("ボス連戦の人数が4体にならない")
+    if len(sequence.boss_order) != sequence.normal_boss_count + 1:
+        errors.append("通常ボス3体＋最終ボスの連戦にならない")
     elif not sequence.boss_order[-1].final_boss or any(profile.final_boss for profile in sequence.boss_order[:-1]):
         errors.append("最終ボスをMEKA.TKMRだけに固定しない")
     if not sequence.consume_stage_start_request():
@@ -490,6 +490,37 @@ def main() -> int:
             errors.append(f"{profile.display_name}の体力設定が反映されない")
         if profile_game.boss_profile.display_name != profile.display_name:
             errors.append(f"{profile.display_name}の表示名が反映されない")
+
+    # 土屋は5回のバリア、稲葉は頭上急所3回を通過して初めて撃破できる。
+    tuchiya = BlockBreaker(boss_profile=next(profile for profile in BOSS_PROFILES if profile.key == "tuchiya"))
+    top_point = tuchiya.boss_edge_points[np.argmin(tuchiya.boss_edge_points[:, 0])]
+    for hit in range(5):
+        tuchiya.boss_collision_armed = True
+        tuchiya.ball.x = tuchiya.boss_x + float(top_point[1])
+        tuchiya.ball.y = tuchiya.boss_y + float(top_point[0]) - tuchiya.ball_radius + .25
+        tuchiya.ball.vx, tuchiya.ball.vy = 0, 220
+        tuchiya._hit_boss()
+    if not tuchiya.barrier_broken or tuchiya.boss_hp != tuchiya.boss_max_hp:
+        errors.append("土屋の5回バリアが規定回数で壊れない")
+
+    inaba = BlockBreaker(boss_profile=next(profile for profile in BOSS_PROFILES if profile.key == "inaba"))
+    for hit in range(3):
+        inaba.boss_collision_armed = True
+        critical_x, critical_y = inaba._critical_point()
+        inaba.ball.x, inaba.ball.y = critical_x, critical_y - inaba.ball_radius + .25
+        inaba.ball.vx, inaba.ball.vy = 0, 220
+        inaba._hit_boss()
+    if inaba.critical_hits != 3 or not inaba.boss_defeated:
+        errors.append("稲葉の頭上急所3回で撃破できない")
+
+    meka = BlockBreaker(boss_profile=next(profile for profile in BOSS_PROFILES if profile.key == "meka_takemura"))
+    meka.serving = False
+    meka.game_started = True
+    meka.beam_phase = meka.beam_period - .20
+    meka.paddle_x = meka.boss_x + meka.boss_width / 2 - meka.paddle_width / 2
+    meka.step(.01, GameInput(), 1.0)
+    if meka.lives != 2 or not meka.consume_life_loss_event():
+        errors.append("MEKA.TKMRのビームがパドルに当たった時に残機を減らさない")
     for error in errors:
         print(f"ERROR: {error}")
     print(f"{len(errors)} errors")
