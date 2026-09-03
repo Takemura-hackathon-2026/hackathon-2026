@@ -1508,6 +1508,7 @@ class ClassicThenBoss:
     victory_seconds = 4.0
     normal_boss_count = 3
     classic_rows = 4
+    classic_columns = 7
     # 最初から縦に抜いた通路。ボールが奥まで入りやすく、連続してブロックを崩せる。
     opening_columns = frozenset((1, 4, 6))
     block_colors = (0x00, 0x05, 0x0A, 0x0E, 0x12, 0x16, 0x1E, 0x22, 0x29, 0x2D)
@@ -1559,7 +1560,7 @@ class ClassicThenBoss:
         return self.boss.game_over_until if self.boss is not None else self._game_over_until
 
     def _make_blocks(self) -> list[ClassicBlock]:
-        columns, rows, margin, gap = 8, self.classic_rows, 8, 2
+        columns, rows, margin, gap = self.classic_columns, self.classic_rows, 8, 2
         width = (CANVAS_WIDTH - margin * 2 - gap * (columns - 1)) / columns
         return [
             ClassicBlock(

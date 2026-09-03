@@ -434,7 +434,7 @@ def main() -> int:
         game.step(1 / 60, GameInput(-1 if step % 60 < 30 else 1), .4 + step / 60)
 
     sequence = ClassicThenBoss()
-    expected_blocks = sequence.classic_rows * (8 - len(sequence.opening_columns))
+    expected_blocks = sequence.classic_rows * (sequence.classic_columns - len(sequence.opening_columns))
     if len(sequence.blocks) != expected_blocks:
         errors.append(f"通常面の穴あきブロック数が不正: {len(sequence.blocks)}")
     block_columns = {
