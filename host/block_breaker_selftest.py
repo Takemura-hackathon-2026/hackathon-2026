@@ -10,6 +10,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from block_breaker import (  # noqa: E402
     BOSS_IMAGES,
+    BOSS_PROFILES,
     BodyMeasurement,
     BlockBreaker,
     ClassicThenBoss,
@@ -449,10 +450,23 @@ def main() -> int:
         errors.append("通常面クリア後にボス遷移へ入らない")
     for index in range(50):
         sequence.step(.04, GameInput(), 10.1 + index * .04)
+    if sequence.phase != "warning":
+        errors.append("通常面クリア後に全ボス共通WARNINGへ入らない")
+    warning_frame = sequence.render("READY")
+    if not np.any(warning_frame == 0x04):
+        errors.append("ボス登場前のWARNING表示を描画しない")
+    for index in range(80):
+        sequence.step(.04, GameInput(), 12.1 + index * .04)
     if sequence.boss is None or sequence.boss.boss_image not in BOSS_IMAGES:
-        errors.append("ボス戦で4体の候補からボスを選ばない")
+        errors.append("ボス戦で候補からボスを選ばない")
     if not sequence.consume_stage_start_request():
         errors.append("ボス戦開始時にプレイヤー選び直しを要求しない")
+    for profile in BOSS_PROFILES:
+        profile_game = BlockBreaker(boss_profile=profile)
+        if profile_game.boss_hp != profile.max_hp:
+            errors.append(f"{profile.display_name}の体力設定が反映されない")
+        if profile_game.boss_profile.display_name != profile.display_name:
+            errors.append(f"{profile.display_name}の表示名が反映されない")
     for error in errors:
         print(f"ERROR: {error}")
     print(f"{len(errors)} errors")

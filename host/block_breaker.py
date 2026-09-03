@@ -41,16 +41,29 @@ TEXT, DIM = FC6_WHITE, 0x31
 LEFT_KEYS = frozenset((81, 2424832, 65361, 63234))
 RIGHT_KEYS = frozenset((83, 2555904, 65363, 63235))
 UP_KEYS = frozenset((82, 2490368, 65362, 63232))
-# OpenCVのwaitKeyExにはキー解放イベントがないため、キーリピート間を埋める最小限の保持時間を持たせる。
-# これを長くすると、キーを離した後も慣性のように動いて見える。
-# X11のキー状態取得が使えない環境でのフォールバック用。
-KEYBOARD_EVENT_HOLD_SECONDS = 0.08
-BOSS_IMAGES = (
-    HOST / "assets" / "takemuraface_fc6.png",
-    HOST / "assets" / "inagakiface.png",
-    HOST / "assets" / "ookiface.png",
-    HOST / "assets" / "robo_takemuraface.png",
+# OpenCVのwaitKeyExにはキー解放イベントがないため、ネイティブのキー状態取得が
+# 使えない環境ではキーリピート間を埋めるフォールバック保持時間を持たせる。
+KEYBOARD_EVENT_HOLD_SECONDS = 0.20
+
+
+@dataclass(frozen=True)
+class BossProfile:
+    key: str
+    display_name: str
+    image: Path
+    max_hp: int
+    movement: str
+    move_speed: float
+    flip_horizontal: bool = False
+
+
+BOSS_PROFILES = (
+    BossProfile("takemura", "Takemura", HOST / "assets" / "takemuraface_fc6.png", 100, "horizontal", 52.0),
+    BossProfile("meka_takemura", "MEKA.TKMR", HOST / "assets" / "robo_takemuraface.png", 160, "horizontal", 110.0),
+    BossProfile("ohki", "Ohki", HOST / "assets" / "ookiface.png", 60, "figure8", 1.9, True),
+    BossProfile("inagaki", "Inagaki", HOST / "assets" / "inagakiface.png", 100, "vibrate_horizontal", 68.0),
 )
+BOSS_IMAGES = tuple(profile.image for profile in BOSS_PROFILES)
 DEFAULT_START_SETTINGS = {
     "center_tolerance": 0.18,
     "width_gain_min": 0.06,
@@ -929,6 +942,52 @@ class X11KeyboardState:
         self._lib = self._display = None
 
 
+class MacKeyboardState:
+    """macOSのCoreGraphicsで、キーリピートに依存せず押下状態を読む。"""
+
+    # macOSの仮想キーコード。矢印に加え、A/D/H/Lも受け付ける。
+    _LEFT_CODES = (123, 0, 4)   # ←, A, H
+    _RIGHT_CODES = (124, 2, 37)  # →, D, L
+
+    def __init__(self) -> None:
+        self._lib = None
+        self._key_state = None
+        if sys.platform != "darwin":
+            return
+        library = ctypes.util.find_library("CoreGraphics") or "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+        try:
+            lib = ctypes.CDLL(library)
+            key_state = lib.CGEventSourceKeyState
+            key_state.argtypes = [ctypes.c_int, ctypes.c_uint16]
+            key_state.restype = ctypes.c_bool
+            self._lib, self._key_state = lib, key_state
+        except (AttributeError, OSError):
+            self.close()
+
+    @property
+    def available(self) -> bool:
+        return self._key_state is not None
+
+    def lateral(self) -> int:
+        if not self.available:
+            return 0
+        pressed = lambda codes: any(self._key_state(0, code) for code in codes)
+        left, right = pressed(self._LEFT_CODES), pressed(self._RIGHT_CODES)
+        return -1 if left and not right else 1 if right and not left else 0
+
+    def close(self) -> None:
+        self._lib = self._key_state = None
+
+
+def create_keyboard_state() -> MacKeyboardState | X11KeyboardState:
+    """実行OSに合わせ、長押しを毎フレーム取得できる入力バックエンドを選ぶ。"""
+    mac = MacKeyboardState()
+    if mac.available:
+        return mac
+    x11 = X11KeyboardState()
+    return x11
+
+
 class BlockBreaker:
     paddle_width, paddle_height, paddle_y = 42.0, 6.0, 350.0
     ball_radius, paddle_speed, initial_speed = 3.0, 175.0, 175.0
@@ -940,12 +999,25 @@ class BlockBreaker:
     boss_move_speed = 52.0
     clear_delay = 1.8
 
-    def __init__(self, boss_image: Path | None = None) -> None:
-        self.boss_image = boss_image or BOSS_IMAGES[0]
+    def __init__(self, boss_profile: BossProfile | None = None, boss_image: Path | None = None) -> None:
+        if boss_profile is None:
+            if boss_image is None:
+                boss_profile = BOSS_PROFILES[0]
+            else:
+                boss_profile = next((profile for profile in BOSS_PROFILES if profile.image == boss_image), None)
+                if boss_profile is None:
+                    raise ValueError(f"未登録のボス画像: {boss_image}")
+        self.boss_profile = boss_profile
+        self.boss_image = boss_profile.image
+        self.boss_max_hp = boss_profile.max_hp
+        self.boss_move_speed = boss_profile.move_speed
         sprite, mask = load_boss_sprite(self.boss_image)
         size = (round(sprite.shape[1] * self.boss_scale), round(sprite.shape[0] * self.boss_scale))
-        self.boss_sprite = cv2.resize(sprite, size, interpolation=cv2.INTER_NEAREST)
-        self.boss_mask = cv2.resize(mask.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST) > 0
+        self._base_boss_sprite = cv2.resize(sprite, size, interpolation=cv2.INTER_NEAREST)
+        self._base_boss_mask = cv2.resize(mask.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST) > 0
+        self.boss_sprite = self._base_boss_sprite
+        self.boss_mask = self._base_boss_mask
+        self._orientation_flipped = False
         self.boss_height, self.boss_width = self.boss_sprite.shape
         self.boss_x = (CANVAS_WIDTH - self.boss_width) / 2
         eroded = cv2.erode(self.boss_mask.astype(np.uint8), np.ones((3, 3), np.uint8))
@@ -967,9 +1039,30 @@ class BlockBreaker:
         self.boss_transition_remaining = 0.0
         self.boss_move_active = False
         self.boss_move_vx = self.boss_move_speed
+        self.boss_move_phase = 0.0
+        self.boss_base_x = self.boss_x
+        self.boss_base_y = self.boss_y
         self.clear_remaining = 0.0
         self.game_over_until = 0.0
         self.reset(full=True)
+
+    def _set_boss_orientation(self) -> None:
+        """横顔ボスだけ、現在位置から画面中央を向くように左右反転する。"""
+        if not self.boss_profile.flip_horizontal:
+            return
+        should_flip = self.boss_x + self.boss_width / 2.0 < CANVAS_WIDTH / 2.0
+        if should_flip == self._orientation_flipped:
+            return
+        self._orientation_flipped = should_flip
+        if should_flip:
+            self.boss_sprite = np.ascontiguousarray(np.fliplr(self._base_boss_sprite))
+            self.boss_mask = np.ascontiguousarray(np.fliplr(self._base_boss_mask))
+        else:
+            self.boss_sprite = self._base_boss_sprite
+            self.boss_mask = self._base_boss_mask
+        eroded = cv2.erode(self.boss_mask.astype(np.uint8), np.ones((3, 3), np.uint8))
+        self.boss_edge = self.boss_mask & (eroded == 0)
+        self.boss_edge_points = np.argwhere(self.boss_edge)
 
     def reset(self, full: bool = False) -> None:
         if full:
@@ -983,9 +1076,14 @@ class BlockBreaker:
             self.life_loss_slot = -1
             self.life_loss_event = False
             self.boss_x = (CANVAS_WIDTH - self.boss_width) / 2
+            self.boss_y = 34.0
+            self.boss_base_x = self.boss_x
+            self.boss_base_y = self.boss_y
             self.boss_transition_remaining = 0.0
             self.boss_move_active = False
             self.boss_move_vx = self.boss_move_speed
+            self.boss_move_phase = 0.0
+            self._set_boss_orientation()
             self.clear_remaining = 0.0
             self.game_over_until = 0.0
         self.paddle_x = (CANVAS_WIDTH - self.paddle_width) / 2
@@ -1114,12 +1212,26 @@ class BlockBreaker:
             if self.boss_transition_remaining == 0.0:
                 self.boss_move_active = True
         if self.boss_move_active and not self.boss_defeated:
-            self.boss_x += self.boss_move_vx * dt
-            if self.boss_x <= 0.0:
-                self.boss_x, self.boss_move_vx = 0.0, abs(self.boss_move_vx)
-            elif self.boss_x + self.boss_width >= CANVAS_WIDTH:
-                self.boss_x = CANVAS_WIDTH - self.boss_width
-                self.boss_move_vx = -abs(self.boss_move_vx)
+            profile = self.boss_profile
+            if profile.movement == "figure8":
+                self.boss_move_phase = (self.boss_move_phase + profile.move_speed * dt) % (2 * math.pi)
+                x_amplitude = max(8.0, (CANVAS_WIDTH - self.boss_width) * .46)
+                y_amplitude = min(26.0, max(8.0, self.boss_height * .24))
+                self.boss_x = self.boss_base_x + x_amplitude * math.sin(self.boss_move_phase)
+                self.boss_y = self.boss_base_y + y_amplitude * math.sin(2.0 * self.boss_move_phase)
+                self.boss_x = min(max(0.0, self.boss_x), CANVAS_WIDTH - self.boss_width)
+                self.boss_y = min(max(26.0, self.boss_y), CANVAS_HEIGHT - self.boss_height - 4.0)
+            else:
+                self.boss_x += self.boss_move_vx * dt
+                if self.boss_x <= 0.0:
+                    self.boss_x, self.boss_move_vx = 0.0, abs(self.boss_move_vx)
+                elif self.boss_x + self.boss_width >= CANVAS_WIDTH:
+                    self.boss_x = CANVAS_WIDTH - self.boss_width
+                    self.boss_move_vx = -abs(self.boss_move_vx)
+                if profile.movement == "vibrate_horizontal":
+                    self.boss_move_phase = (self.boss_move_phase + profile.move_speed * dt) % (2 * math.pi)
+                    self.boss_y = self.boss_base_y + min(12.0, self.boss_height * .12) * math.sin(self.boss_move_phase * 4.0)
+            self._set_boss_orientation()
         if self.boss_defeated:
             self.clear_remaining = max(0.0, self.clear_remaining - dt)
             if self.clear_remaining == 0.0:
@@ -1175,6 +1287,12 @@ class BlockBreaker:
         cv2.putText(mask, text, origin, cv2.FONT_HERSHEY_SIMPLEX, scale, 255, 1, cv2.LINE_AA)
         frame[mask > 96] = color
 
+    @classmethod
+    def _center_text(cls, frame: np.ndarray, text: str, y: int, color: int, scale: float) -> None:
+        (width, _height), _baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
+        x = max(0, (CANVAS_WIDTH - width) // 2)
+        cls._text(frame, text, (x, y), color, scale)
+
     def render(
         self,
         sensor_stage: str,
@@ -1218,18 +1336,19 @@ class BlockBreaker:
             phase = int((self.damage_effect_duration - self.damage_effect_remaining) / (self.damage_effect_duration / 4))
             if phase in (0, 2):
                 boss_region[self.boss_mask] = FC6_WHITE
+        self._center_text(frame, self.boss_profile.display_name, 150, TEXT, .42)
         x = int(round(self.paddle_x))
         frame[int(self.paddle_y):int(self.paddle_y + self.paddle_height), x:x + int(self.paddle_width)] = PADDLE
         frame[int(self.paddle_y):int(self.paddle_y + 2), x:x + int(self.paddle_width)] = PADDLE_EDGE
         if active_play:
             cv2.circle(frame, (int(round(self.ball.x)), int(round(self.ball.y))), int(self.ball_radius), int(BALL), -1, lineType=cv2.LINE_8)
         if self.boss_defeated:
-            self._text(frame, "BOSS DOWN", (39, 228), 0x12, .68)
+            self._center_text(frame, "BOSS DOWN", 228, 0x12, .68)
         elif self.game_over_until:
-            self._text(frame, "GAME OVER", (43, 228), 0x06, .72)
+            self._center_text(frame, "GAME OVER", 228, 0x06, .72)
         elif self.serving:
             if countdown is not None and countdown > 0:
-                self._text(frame, f"START IN {countdown}", (50, 232), 0x0E, .58)
+                self._center_text(frame, f"START IN {countdown}", 232, 0x0E, .58)
             else:
                 if start_mode == "still":
                     prompt = "STAND STILL TO START"
@@ -1237,18 +1356,17 @@ class BlockBreaker:
                     prompt = "WALK PAST TO START"
                 else:
                     prompt = "ARMS CIRCLE TO LAUNCH"
-                self._text(frame, prompt if sensor_stage == "READY" else "SENSOR CAL", (16, 232), 0x0E, .42)
+                self._center_text(frame, prompt if sensor_stage == "READY" else "SENSOR CAL", 232, 0x0E, .42)
             if sensor_stage == "BACKGROUND":
-                self._text(frame, "CLEAR SENSOR", (32, 252), TEXT, .40)
+                self._center_text(frame, "CLEAR SENSOR", 252, TEXT, .40)
             elif sensor_stage == "STANCE":
-                self._text(frame, "STAND STILL", (37, 252), TEXT, .40)
+                self._center_text(frame, "STAND STILL", 252, TEXT, .40)
             elif start_mode == "still" and start_hold_remaining is not None:
-                self._text(frame, f"HOLD {math.ceil(start_hold_remaining)}", (62, 252), TEXT, .40)
+                self._center_text(frame, f"HOLD {math.ceil(start_hold_remaining)}", 252, TEXT, .40)
         if boundaries:
             for y in (96, 192, 288):
                 frame[y:y + 1, :] = DIM
         return frame
-
 
 @dataclass
 class ClassicBlock:
@@ -1265,6 +1383,7 @@ class ClassicThenBoss:
     paddle_width, paddle_height, paddle_y = BlockBreaker.paddle_width, BlockBreaker.paddle_height, BlockBreaker.paddle_y
     ball_radius, paddle_speed, initial_speed = BlockBreaker.ball_radius, BlockBreaker.paddle_speed, BlockBreaker.initial_speed
     stage_clear_delay = 1.8
+    warning_seconds = 2.8
     # 最初から縦に抜いた通路。ボールが奥まで入りやすく、連続してブロックを崩せる。
     opening_columns = frozenset((1, 4, 6))
     block_colors = (0x00, 0x05, 0x0A, 0x0E, 0x12, 0x16, 0x1E, 0x22, 0x29, 0x2D)
@@ -1283,6 +1402,7 @@ class ClassicThenBoss:
         self._life_loss_event = False
         self._stage_start_request = False
         self.stage_clear_remaining = 0.0
+        self.warning_remaining = 0.0
         self.reset(full=True)
 
     @property
@@ -1302,6 +1422,8 @@ class ClassicThenBoss:
 
     @property
     def game_started(self) -> bool:
+        if self.phase == "warning":
+            return True
         return self.boss.game_started if self.boss is not None else self._game_started
 
     @property
@@ -1336,6 +1458,7 @@ class ClassicThenBoss:
         self._life_loss_event = False
         self._stage_start_request = False
         self.stage_clear_remaining = 0.0
+        self.warning_remaining = 0.0
         self.blocks = self._make_blocks()
         self._place_ball_on_paddle()
 
@@ -1400,8 +1523,13 @@ class ClassicThenBoss:
         self._place_ball_on_paddle()
 
     def _start_random_boss(self) -> None:
+        self.phase = "warning"
+        self.warning_remaining = self.warning_seconds
+        self.boss = BlockBreaker(boss_profile=random.choice(BOSS_PROFILES))
+
+    def _finish_warning(self) -> None:
         self.phase = "boss"
-        self.boss = BlockBreaker(random.choice(BOSS_IMAGES))
+        self.warning_remaining = 0.0
         self._stage_start_request = True
 
     def consume_life_loss_event(self) -> bool:
@@ -1418,6 +1546,11 @@ class ClassicThenBoss:
 
     def step(self, dt: float, controls: GameInput, now: float) -> None:
         dt = min(.04, max(0.0, dt))
+        if self.phase == "warning":
+            self.warning_remaining = max(0.0, self.warning_remaining - dt)
+            if self.warning_remaining == 0.0:
+                self._finish_warning()
+            return
         if self.boss is not None:
             if (self.boss.boss_defeated and self.boss.clear_remaining <= dt) or (
                 self.boss.game_over_until and now >= self.boss.game_over_until
@@ -1487,24 +1620,40 @@ class ClassicThenBoss:
         if self.phase != "transition" and not self._game_over_until:
             cv2.circle(frame, (int(round(self.ball.x)), int(round(self.ball.y))), int(self.ball_radius), int(BALL), -1, lineType=cv2.LINE_8)
         if self.phase == "transition":
-            BlockBreaker._text(frame, "STAGE CLEAR", (30, 228), 0x12, .62)
+            BlockBreaker._center_text(frame, "STAGE CLEAR", 228, 0x12, .62)
         elif self._game_over_until:
-            BlockBreaker._text(frame, "GAME OVER", (43, 228), 0x06, .72)
+            BlockBreaker._center_text(frame, "GAME OVER", 228, 0x06, .72)
         elif self._serving:
             if countdown is not None and countdown > 0:
-                BlockBreaker._text(frame, f"START IN {countdown}", (50, 232), 0x0E, .58)
+                BlockBreaker._center_text(frame, f"START IN {countdown}", 232, 0x0E, .58)
             else:
                 prompt = "STAND STILL TO START" if start_mode == "still" else "WALK PAST TO START" if start_mode == "passby" else "ARMS CIRCLE TO LAUNCH"
-                BlockBreaker._text(frame, prompt if sensor_stage == "READY" else "SENSOR CAL", (16, 232), 0x0E, .42)
+                BlockBreaker._center_text(frame, prompt if sensor_stage == "READY" else "SENSOR CAL", 232, 0x0E, .42)
             if sensor_stage == "BACKGROUND":
-                BlockBreaker._text(frame, "CLEAR SENSOR", (32, 252), TEXT, .40)
+                BlockBreaker._center_text(frame, "CLEAR SENSOR", 252, TEXT, .40)
             elif sensor_stage == "STANCE":
-                BlockBreaker._text(frame, "STAND STILL", (37, 252), TEXT, .40)
+                BlockBreaker._center_text(frame, "STAND STILL", 252, TEXT, .40)
             elif start_mode == "still" and start_hold_remaining is not None:
-                BlockBreaker._text(frame, f"HOLD {math.ceil(start_hold_remaining)}", (62, 252), TEXT, .40)
+                BlockBreaker._center_text(frame, f"HOLD {math.ceil(start_hold_remaining)}", 252, TEXT, .40)
         if boundaries:
             for y in (96, 192, 288):
                 frame[y:y + 1, :] = DIM
+        return frame
+
+    def _render_warning(self) -> np.ndarray:
+        frame = np.full((CANVAS_HEIGHT, CANVAS_WIDTH), SKY, np.uint8)
+        for index in range(30):
+            frame[30 + (index * 71 + 13) % 300, (index * 47 + 19) % CANVAS_WIDTH] = SKY_DOT
+        elapsed = self.warning_seconds - self.warning_remaining
+        blink = int(elapsed / .20) % 2 == 0
+        border = 3 if blink else 1
+        frame[:border, :] = 0x04
+        frame[-border:, :] = 0x04
+        frame[:, :border] = 0x04
+        frame[:, -border:] = 0x04
+        BlockBreaker._center_text(frame, "WARNING", 206, TEXT if blink else 0x06, .78)
+        if self.boss is not None:
+            BlockBreaker._center_text(frame, self.boss.boss_profile.display_name, 246, TEXT, .48)
         return frame
 
     def render(
@@ -1515,6 +1664,8 @@ class ClassicThenBoss:
         start_mode: str = "arm-circle",
         start_hold_remaining: float | None = None,
     ) -> np.ndarray:
+        if self.phase == "warning":
+            return self._render_warning()
         if self.boss is not None:
             return self.boss.render(sensor_stage, boundaries, countdown, start_mode, start_hold_remaining)
         return self._render_classic(sensor_stage, boundaries, countdown, start_mode, start_hold_remaining)
@@ -1697,7 +1848,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     except (RuntimeError, ValueError) as exc:
         print(f"error: {exc}（開発用には --keyboard）", file=sys.stderr)
         return 2
-    keyboard_state = X11KeyboardState() if not args.no_preview else None
+    keyboard_state = create_keyboard_state() if not args.no_preview else None
     game, running, frame_id = ClassicThenBoss(), True, 0
     follower = PaddleFollower(
         CANVAS_WIDTH,
