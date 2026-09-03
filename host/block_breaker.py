@@ -55,11 +55,12 @@ class BossProfile:
     movement: str
     move_speed: float
     flip_horizontal: bool = False
+    final_boss: bool = False
 
 
 BOSS_PROFILES = (
     BossProfile("takemura", "Takemura", HOST / "assets" / "takemuraface_fc6.png", 100, "horizontal", 52.0),
-    BossProfile("meka_takemura", "MEKA.TKMR", HOST / "assets" / "robo_takemuraface.png", 160, "horizontal", 110.0),
+    BossProfile("meka_takemura", "MEKA.TKMR", HOST / "assets" / "robo_takemuraface.png", 160, "horizontal", 110.0, False, True),
     BossProfile("ohki", "Ohki", HOST / "assets" / "ookiface.png", 60, "figure8", 1.9, True),
     BossProfile("inagaki", "Inagaki", HOST / "assets" / "inagakiface.png", 100, "vibrate_horizontal", 68.0),
 )
@@ -999,7 +1000,12 @@ class BlockBreaker:
     boss_move_speed = 52.0
     clear_delay = 1.8
 
-    def __init__(self, boss_profile: BossProfile | None = None, boss_image: Path | None = None) -> None:
+    def __init__(
+        self,
+        boss_profile: BossProfile | None = None,
+        boss_image: Path | None = None,
+        auto_reset_on_clear: bool = True,
+    ) -> None:
         if boss_profile is None:
             if boss_image is None:
                 boss_profile = BOSS_PROFILES[0]
@@ -1008,6 +1014,7 @@ class BlockBreaker:
                 if boss_profile is None:
                     raise ValueError(f"未登録のボス画像: {boss_image}")
         self.boss_profile = boss_profile
+        self.auto_reset_on_clear = auto_reset_on_clear
         self.boss_image = boss_profile.image
         self.boss_max_hp = boss_profile.max_hp
         self.boss_move_speed = boss_profile.move_speed
@@ -1234,7 +1241,7 @@ class BlockBreaker:
             self._set_boss_orientation()
         if self.boss_defeated:
             self.clear_remaining = max(0.0, self.clear_remaining - dt)
-            if self.clear_remaining == 0.0:
+            if self.clear_remaining == 0.0 and self.auto_reset_on_clear:
                 self.reset(full=True)
             return
         if self.game_over_until:
@@ -1336,7 +1343,9 @@ class BlockBreaker:
             phase = int((self.damage_effect_duration - self.damage_effect_remaining) / (self.damage_effect_duration / 4))
             if phase in (0, 2):
                 boss_region[self.boss_mask] = FC6_WHITE
-        self._center_text(frame, self.boss_profile.display_name, 150, TEXT, .42)
+        # 名前は登場〜最初のスタート待ちだけ表示し、プレイ中の情報量を抑える。
+        if self.serving and not self.game_started and not self.boss_defeated:
+            self._center_text(frame, self.boss_profile.display_name, 150, TEXT, .42)
         x = int(round(self.paddle_x))
         frame[int(self.paddle_y):int(self.paddle_y + self.paddle_height), x:x + int(self.paddle_width)] = PADDLE
         frame[int(self.paddle_y):int(self.paddle_y + 2), x:x + int(self.paddle_width)] = PADDLE_EDGE
@@ -1378,12 +1387,14 @@ class ClassicBlock:
 
 
 class ClassicThenBoss:
-    """穴あき通常面をクリアすると、ランダムなボス戦へ進むゲーム本体。"""
+    """穴あき通常面のあと、通常ボス3体→最終ボスの連戦へ進むゲーム本体。"""
 
     paddle_width, paddle_height, paddle_y = BlockBreaker.paddle_width, BlockBreaker.paddle_height, BlockBreaker.paddle_y
     ball_radius, paddle_speed, initial_speed = BlockBreaker.ball_radius, BlockBreaker.paddle_speed, BlockBreaker.initial_speed
     stage_clear_delay = 1.8
     warning_seconds = 2.8
+    final_warning_seconds = 5.0
+    victory_seconds = 4.0
     classic_rows = 4
     # 最初から縦に抜いた通路。ボールが奥まで入りやすく、連続してブロックを崩せる。
     opening_columns = frozenset((1, 4, 6))
@@ -1404,6 +1415,10 @@ class ClassicThenBoss:
         self._stage_start_request = False
         self.stage_clear_remaining = 0.0
         self.warning_remaining = 0.0
+        self.warning_duration = self.warning_seconds
+        self.boss_order: list[BossProfile] = []
+        self.boss_index = -1
+        self.victory_remaining = 0.0
         self.reset(full=True)
 
     @property
@@ -1460,6 +1475,10 @@ class ClassicThenBoss:
         self._stage_start_request = False
         self.stage_clear_remaining = 0.0
         self.warning_remaining = 0.0
+        self.warning_duration = self.warning_seconds
+        self.boss_order = []
+        self.boss_index = -1
+        self.victory_remaining = 0.0
         self.blocks = self._make_blocks()
         self._place_ball_on_paddle()
 
@@ -1524,9 +1543,27 @@ class ClassicThenBoss:
         self._place_ball_on_paddle()
 
     def _start_random_boss(self) -> None:
+        normal_profiles = tuple(profile for profile in BOSS_PROFILES if not profile.final_boss)
+        final_profiles = tuple(profile for profile in BOSS_PROFILES if profile.final_boss)
+        self.boss_order = list(random.sample(normal_profiles, len(normal_profiles))) + list(final_profiles)
+        self.boss_index = 0
+        self._start_boss(self.boss_order[self.boss_index])
+
+    def _start_boss(self, profile: BossProfile) -> None:
         self.phase = "warning"
-        self.warning_remaining = self.warning_seconds
-        self.boss = BlockBreaker(boss_profile=random.choice(BOSS_PROFILES))
+        self.warning_duration = self.final_warning_seconds if profile.final_boss else self.warning_seconds
+        self.warning_remaining = self.warning_duration
+        self.boss = BlockBreaker(boss_profile=profile, auto_reset_on_clear=False)
+
+    def _advance_boss(self) -> None:
+        if self.boss_index + 1 < len(self.boss_order):
+            self.boss_index += 1
+            self._start_boss(self.boss_order[self.boss_index])
+            return
+        self.phase = "victory"
+        self.warning_remaining = 0.0
+        self.victory_remaining = self.victory_seconds
+        self._stage_start_request = False
 
     def _finish_warning(self) -> None:
         self.phase = "boss"
@@ -1552,13 +1589,18 @@ class ClassicThenBoss:
             if self.warning_remaining == 0.0:
                 self._finish_warning()
             return
+        if self.phase == "victory":
+            self.victory_remaining = max(0.0, self.victory_remaining - dt)
+            if self.victory_remaining == 0.0:
+                self.reset(full=True)
+            return
         if self.boss is not None:
-            if (self.boss.boss_defeated and self.boss.clear_remaining <= dt) or (
-                self.boss.game_over_until and now >= self.boss.game_over_until
-            ):
+            if self.boss.game_over_until and now >= self.boss.game_over_until:
                 self.reset(full=True)
                 return
             self.boss.step(dt, controls, now)
+            if self.boss.boss_defeated and self.boss.clear_remaining == 0.0:
+                self._advance_boss()
             return
         if self.phase == "transition":
             self.stage_clear_remaining = max(0.0, self.stage_clear_remaining - dt)
@@ -1645,16 +1687,48 @@ class ClassicThenBoss:
         frame = np.full((CANVAS_HEIGHT, CANVAS_WIDTH), SKY, np.uint8)
         for index in range(30):
             frame[30 + (index * 71 + 13) % 300, (index * 47 + 19) % CANVAS_WIDTH] = SKY_DOT
-        elapsed = self.warning_seconds - self.warning_remaining
-        blink = int(elapsed / .20) % 2 == 0
-        border = 3 if blink else 1
+        elapsed = self.warning_duration - self.warning_remaining
+        final_boss = self.boss is not None and self.boss.boss_profile.final_boss
+        blink = int(elapsed / (.12 if final_boss else .20)) % 2 == 0
+        border = 5 if final_boss and blink else 3 if blink else 1
         frame[:border, :] = 0x04
         frame[-border:, :] = 0x04
         frame[:, :border] = 0x04
         frame[:, -border:] = 0x04
-        BlockBreaker._center_text(frame, "WARNING", 206, TEXT if blink else 0x06, .78)
         if self.boss is not None:
-            BlockBreaker._center_text(frame, self.boss.boss_profile.display_name, 246, TEXT, .48)
+            if final_boss:
+                # 最終ボスは中央に立ち絵を出し、走査線とFINAL表示を重ねて登場感を出す。
+                sprite = self.boss.boss_sprite
+                mask = self.boss.boss_mask
+                x = (CANVAS_WIDTH - self.boss.boss_width) // 2
+                y = 38
+                region = frame[y:y + self.boss.boss_height, x:x + self.boss.boss_width]
+                region[mask] = sprite[mask]
+                accent = 0x16 if blink else 0x0E
+                for line_y in range(30, 184, 12):
+                    frame[line_y:line_y + 1, 8:CANVAS_WIDTH - 8] = accent
+                BlockBreaker._center_text(frame, "FINAL BOSS", 218, TEXT if blink else 0x06, .60)
+                BlockBreaker._center_text(frame, self.boss.boss_profile.display_name, 252, TEXT, .46)
+            else:
+                BlockBreaker._center_text(frame, "WARNING", 206, TEXT if blink else 0x06, .78)
+                BlockBreaker._center_text(frame, self.boss.boss_profile.display_name, 246, TEXT, .48)
+        else:
+            BlockBreaker._center_text(frame, "WARNING", 206, TEXT if blink else 0x06, .78)
+        return frame
+
+    def _render_victory(self) -> np.ndarray:
+        frame = np.full((CANVAS_HEIGHT, CANVAS_WIDTH), SKY, np.uint8)
+        for index in range(30):
+            frame[30 + (index * 71 + 13) % 300, (index * 47 + 19) % CANVAS_WIDTH] = SKY_DOT
+        elapsed = self.victory_seconds - self.victory_remaining
+        pulse = int(elapsed / .16) % 2 == 0
+        border = 4 if pulse else 2
+        frame[:border, :] = 0x16
+        frame[-border:, :] = 0x16
+        frame[:, :border] = 0x16
+        frame[:, -border:] = 0x16
+        BlockBreaker._center_text(frame, "ALL BOSSES DOWN", 184, TEXT if pulse else 0x0E, .56)
+        BlockBreaker._center_text(frame, "STAGE COMPLETE", 222, TEXT, .48)
         return frame
 
     def render(
@@ -1667,6 +1741,8 @@ class ClassicThenBoss:
     ) -> np.ndarray:
         if self.phase == "warning":
             return self._render_warning()
+        if self.phase == "victory":
+            return self._render_victory()
         if self.boss is not None:
             return self.boss.render(sensor_stage, boundaries, countdown, start_mode, start_hold_remaining)
         return self._render_classic(sensor_stage, boundaries, countdown, start_mode, start_hold_remaining)

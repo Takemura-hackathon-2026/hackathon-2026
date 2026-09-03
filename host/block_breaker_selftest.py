@@ -459,8 +459,31 @@ def main() -> int:
         sequence.step(.04, GameInput(), 12.1 + index * .04)
     if sequence.boss is None or sequence.boss.boss_image not in BOSS_IMAGES:
         errors.append("ボス戦で候補からボスを選ばない")
+    if len(sequence.boss_order) != len(BOSS_PROFILES):
+        errors.append("ボス連戦の人数が4体にならない")
+    elif not sequence.boss_order[-1].final_boss or any(profile.final_boss for profile in sequence.boss_order[:-1]):
+        errors.append("最終ボスをMEKA.TKMRだけに固定しない")
     if not sequence.consume_stage_start_request():
         errors.append("ボス戦開始時にプレイヤー選び直しを要求しない")
+    # 通常ボスを倒すと次のWARNINGへ進み、最後のMEKA.TKMR撃破後だけ勝利演出になる。
+    for index in range(len(sequence.boss_order) - 1):
+        assert sequence.boss is not None
+        sequence.boss.boss_defeated = True
+        sequence.boss.clear_remaining = .04
+        sequence.step(.04, GameInput(), 20.0 + index)
+        if sequence.phase != "warning" or sequence.boss_index != index + 1:
+            errors.append("ボス撃破後に次のWARNINGへ連戦しない")
+            break
+        for warning_step in range(130):
+            sequence.step(.04, GameInput(), 21.0 + index * 10 + warning_step * .04)
+    if sequence.phase != "boss" or sequence.boss is None or not sequence.boss.boss_profile.final_boss:
+        errors.append("最後のボスがMEKA.TKMRにならない")
+    else:
+        sequence.boss.boss_defeated = True
+        sequence.boss.clear_remaining = .04
+        sequence.step(.04, GameInput(), 60.0)
+        if sequence.phase != "victory":
+            errors.append("最終ボス撃破後に勝利演出へ進まない")
     for profile in BOSS_PROFILES:
         profile_game = BlockBreaker(boss_profile=profile)
         if profile_game.boss_hp != profile.max_hp:
