@@ -1419,13 +1419,9 @@ class BlockBreaker:
                 boss_region[self.boss_mask] = FC6_WHITE
         if self.boss_profile.barrier_hits_required and not self.barrier_broken:
             barrier_color = 0x16 if (self.barrier_hits + int(time.monotonic() * 8)) % 2 else 0x0E
-            cv2.rectangle(
-                frame,
-                (max(0, boss_x - 3), max(24, boss_y - 3)),
-                (min(CANVAS_WIDTH - 1, boss_x + self.boss_width + 2), min(CANVAS_HEIGHT - 1, boss_y + self.boss_height + 2)),
-                barrier_color,
-                1,
-            )
+            shield_center = (boss_x + self.boss_width // 2, boss_y + self.boss_height // 2)
+            shield_radius = max(self.boss_width, self.boss_height) // 2 + 7
+            cv2.circle(frame, shield_center, shield_radius, barrier_color, 2, lineType=cv2.LINE_8)
             self._center_text(frame, f"BARRIER {self.barrier_hits}/{self.boss_profile.barrier_hits_required}", 174, TEXT, .34)
         if self.boss_profile.critical_hits_required and not self.boss_defeated:
             critical_x, critical_y = self._critical_point()
