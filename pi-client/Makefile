@@ -11,16 +11,22 @@ LDFLAGS ?= -L$(RGB_LIBDIR) -l$(RGB_LIBRARY_NAME) -lrt -lm -lpthread -lz
 
 all: pi_client
 
+chain8_test: chain8_test.o $(RGB_LIBRARY)
+	$(CXX) $< -o $@ $(LDFLAGS)
+
 pi_client: pi_client.o $(RGB_LIBRARY)
 	$(CXX) $< -o $@ $(LDFLAGS)
 
 pi_client.o: pi_client.cc
 	$(CXX) -I$(RGB_INCDIR) $(CXXFLAGS) -c -o $@ $<
 
+chain8_test.o: chain8_test.cc
+	$(CXX) -I$(RGB_INCDIR) $(CXXFLAGS) -c -o $@ $<
+
 $(RGB_LIBRARY):
 	$(MAKE) -C $(RGB_LIBDIR)
 
 clean:
-	rm -f pi_client pi_client.o
+	rm -f pi_client pi_client.o chain8_test chain8_test.o
 
 .PHONY: all clean

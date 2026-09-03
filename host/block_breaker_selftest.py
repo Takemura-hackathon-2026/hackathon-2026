@@ -11,8 +11,10 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from block_breaker import (  # noqa: E402
+    BOSS_IMAGES,
     BodyMeasurement,
     BlockBreaker,
+    ClassicThenBoss,
     ForegroundGate,
     GameInput,
     InputClassifier,
@@ -550,6 +552,28 @@ def main() -> int:
             errors.append("FC6の192x384フレームを維持しない")
             break
         game.step(1 / 60, GameInput(-1 if step % 60 < 30 else 1), .4 + step / 60)
+
+    sequence = ClassicThenBoss()
+    expected_blocks = 6 * (8 - len(sequence.opening_columns))
+    if len(sequence.blocks) != expected_blocks:
+        errors.append(f"通常面の穴あきブロック数が不正: {len(sequence.blocks)}")
+    block_columns = {
+        round((block.x - 8) / (block.width + 2))
+        for block in sequence.blocks
+    }
+    if block_columns & sequence.opening_columns:
+        errors.append("通常面の通路列にブロックを置く")
+    sequence._serving = False
+    sequence.blocks.clear()
+    sequence.step(.04, GameInput(), 10.0)
+    if sequence.phase != "transition" or sequence.stage_clear_remaining <= 0.0:
+        errors.append("通常面クリア後にボス遷移へ入らない")
+    for index in range(50):
+        sequence.step(.04, GameInput(), 10.1 + index * .04)
+    if sequence.boss is None or sequence.boss.boss_image not in BOSS_IMAGES:
+        errors.append("ボス戦で4体の候補からボスを選ばない")
+    if not sequence.consume_stage_start_request():
+        errors.append("ボス戦開始時にプレイヤー選び直しを要求しない")
     for error in errors:
         print(f"ERROR: {error}")
     print(f"{len(errors)} errors")

@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "led-matrix.h"
+#include "panel_calibration.h"
 
 namespace {
 
@@ -153,6 +154,7 @@ int main(int argc, char *argv[]) {
   bool verbose = false;
   bool rotate180 = false;  // パネルを上下逆に取り付けた個体向け
   int health_port = kHealthPort;
+  const char *panel_calibration_path = nullptr;
   for (int i = 1; i < argc; ++i) {
     if (strcmp(argv[i], "--target-id") == 0 && i + 1 < argc) {
       target_id = atoi(argv[++i]);
@@ -164,10 +166,18 @@ int main(int argc, char *argv[]) {
       rotate180 = true;
     } else if (strcmp(argv[i], "--health-port") == 0 && i + 1 < argc) {
       health_port = atoi(argv[++i]);
+    } else if (strcmp(argv[i], "--panel-calibration") == 0 && i + 1 < argc) {
+      panel_calibration_path = argv[++i];
     }
   }
   if (target_id < 0 || target_id > 3) {
     fprintf(stderr, "error: --target-id は 0〜3 で指定する\n");
+    return 1;
+  }
+  panel_calibration::PanelCalibration panel_calibration;
+  if (panel_calibration_path != nullptr &&
+      !panel_calibration.Load(panel_calibration_path, matrix_options.parallel,
+                              matrix_options.chain_length)) {
     return 1;
   }
 
@@ -205,9 +215,10 @@ int main(int argc, char *argv[]) {
   signal(SIGINT, StopHandler);
   signal(SIGTERM, StopHandler);
 
-  printf("pi-client: target_id=%d port=%d %dx%d (chain=%d parallel=%d) rotate180=%s\n",
+  printf("pi-client: target_id=%d port=%d %dx%d (chain=%d parallel=%d) rotate180=%s calibration=%s\n",
          target_id, port, kCanvasWidth, kSliceHeight, matrix_options.chain_length,
-         matrix_options.parallel, rotate180 ? "yes" : "no");
+         matrix_options.parallel, rotate180 ? "yes" : "no",
+         panel_calibration_path != nullptr ? panel_calibration_path : "off");
   fflush(stdout);
 
   FrameAssembler assembler;
@@ -370,7 +381,12 @@ int main(int argc, char *argv[]) {
         // 上下逆に取り付けたパネルは、描画時に点対称へ写す。
         const int dx = rotate180 ? (kCanvasWidth - 1 - x) : x;
         const int dy = rotate180 ? (kSliceHeight - 1 - y) : y;
-        canvas->SetPixel(dx, dy, rgb[0], rgb[1], rgb[2]);
+        std::uint8_t red = rgb[0];
+        std::uint8_t green = rgb[1];
+        std::uint8_t blue = rgb[2];
+        // 補正は論理座標ではなく、実際に描くHUB75上のパネル位置に適用する。
+        panel_calibration.Apply(dx, dy, &red, &green, &blue);
+        canvas->SetPixel(dx, dy, red, green, blue);
       }
     }
     canvas = matrix->SwapOnVSync(canvas);

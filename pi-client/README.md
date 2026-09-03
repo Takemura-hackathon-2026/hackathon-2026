@@ -81,6 +81,44 @@ PiのIPと`target_id`は`192.168.10.101`→`0`、`.102`→`1`、`.103`→`2`、`
 既定のパネル輝度は40%で、全体を低めに抑えている。既定のパネル構成は 32×32・`chain_length=6`・`parallel=3`（= 192×96）、
 `hardware_mapping=regular`。
 
+## 8枚直列の単体確認
+
+3台構成へ組み替える前に、HUB75のP0出力だけへ32×32パネルを8枚直列でつなぎ、
+番号付きテストを行える。`chain8_test`はP0だけを使い、各パネルへ1〜8の番号と
+異なる背景色を低輝度で表示する。通常の`pi_client`サービスは停止してから実行する。
+
+```bash
+make chain8_test
+sudo ./chain8_test --led-chain=8 --led-parallel=1 \
+  --led-pwm-bits=7 --led-slowdown-gpio=4 --led-brightness=10
+```
+
+配線は電源断状態で行い、パネル1枚、2枚、4枚、8枚の順に増やして確認する。番号が
+途中から欠ける・順番が違う・乱れる場合は、直前に追加したパネルとそのHUB75ケーブルを外して確認する。
+
+## パネルごとの色補正
+
+パネルの個体差は、HUB75の出力レーンとチェーン位置ごとのRGB倍率で補正できる。まず
+`panel_calibration.example.conf`をPi上へコピーして編集する。形式は
+`lane chain R G B`で、`lane`はP0/P1/P2を`0/1/2`、`chain`はPiから数えて`0`始まりで指定する。
+倍率は`0`〜`2`で、色が強いチャンネルは1未満、弱いチャンネルは1超へ少しずつ調整する。
+
+```bash
+cp panel_calibration.example.conf panel_calibration.conf
+sudo ./pi_client --target-id 0 --panel-calibration "$PWD/panel_calibration.conf"
+```
+
+調整中は、制御Piから対象の表示Piだけへ同じ単色を送る。白→グレー→赤→緑→青の順に
+中心付近の明るさ・色味を見比べる。ディスプレーPiの`target_id`は通常どおり保持する。
+
+```bash
+python3 host/test_mode/panel_calibration.py --pi 192.168.10.101:5000 \
+  --target-id 0 --color white
+```
+
+補正値を変えたらPiの表示クライアントを再起動して再確認する。スマートフォン撮影で判断する場合は、
+自動露出・自動ホワイトバランスをロックする。自動補正なしの色彩計があれば、その測定値を基準にする。
+
 ## 死活報告
 
 1 秒ごとに 1 行の ASCII テキストを UDP で送る。宛先は受信パケットの送信元から学習するため、
