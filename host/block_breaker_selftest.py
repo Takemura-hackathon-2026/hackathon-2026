@@ -318,7 +318,7 @@ def main() -> int:
         errors.append("静止開始を同じ人物で連続発火する")
     if still.update(None, 6.2) != (False, None):
         errors.append("人物が消えた時に静止開始をリセットしない")
-    for key, expected in ((ord("a"), "left"), (83, "right"), (ord(" "), "launch"), (ord("r"), "reset")):
+    for key, expected in ((ord("a"), "left"), (83, "right"), (ord(" "), "launch"), (ord("r"), "reset"), (ord("x"), "debug_clear")):
         if keyboard_action(key) != expected:
             errors.append(f"キーボード操作の変換が不正: {key} -> {keyboard_action(key)}")
     game = BlockBreaker()
@@ -434,6 +434,21 @@ def main() -> int:
         game.step(1 / 60, GameInput(-1 if step % 60 < 30 else 1), .4 + step / 60)
 
     sequence = ClassicThenBoss()
+    sequence.debug_clear()
+    sequence.step(.04, GameInput(), 0.0)
+    if sequence.phase != "warning":
+        errors.append("Xキーで通常面を即時クリアしない")
+    sequence.debug_clear()
+    if sequence.phase != "boss":
+        errors.append("XキーでWARNINGをスキップしない")
+    if sequence.boss is None:
+        errors.append("Xキーのデバッグクリア後にボスを生成しない")
+    else:
+        sequence.boss.debug_clear()
+        sequence.step(.04, GameInput(), .1)
+        if sequence.phase != "warning":
+            errors.append("Xキー相当のボス撃破後に次のWARNINGへ進まない")
+    sequence.reset(full=True)
     expected_blocks = sequence.classic_rows * (sequence.classic_columns - len(sequence.opening_columns))
     if len(sequence.blocks) != expected_blocks:
         errors.append(f"通常面の穴あきブロック数が不正: {len(sequence.blocks)}")

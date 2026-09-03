@@ -901,6 +901,8 @@ def keyboard_action(key: int) -> str | None:
         return "launch"
     if ascii_key == ord("r"):
         return "reset"
+    if ascii_key == ord("x"):
+        return "debug_clear"
     if ascii_key == ord("q") or key == 27:
         return "quit"
     return None
@@ -1266,6 +1268,14 @@ class BlockBreaker:
             self.barrier_hits = 0
         self.ball.vx = self.ball.vy = 0.0
         self._place_ball_at_mouth()
+
+    def debug_clear(self) -> None:
+        """キーボード試験用に、現在のボスを即時撃破する。"""
+        self.boss_hp = 0
+        self.boss_defeated = True
+        self.serving = True
+        self.ball.vx = self.ball.vy = 0.0
+        self.clear_remaining = 0.0
 
     def consume_life_loss_event(self) -> bool:
         """残機が残るミスを一度だけ取得する。ゲームオーバーではFalse。"""
@@ -1676,6 +1686,20 @@ class ClassicThenBoss:
         self.victory_remaining = self.victory_seconds
         self._stage_start_request = False
 
+    def debug_clear(self) -> None:
+        """キーボード試験用に、現在の段階を即時クリアする。"""
+        if self.phase == "classic":
+            self.blocks.clear()
+            self.phase = "transition"
+            self.stage_clear_remaining = 0.0
+        elif self.phase == "transition":
+            self.stage_clear_remaining = 0.0
+        elif self.phase == "warning":
+            self.warning_remaining = 0.0
+            self._finish_warning()
+        elif self.phase == "boss" and self.boss is not None:
+            self.boss.debug_clear()
+
     def _finish_warning(self) -> None:
         self.phase = "boss"
         self.warning_remaining = 0.0
@@ -2078,7 +2102,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             flush=True,
         )
     if not args.no_preview:
-        print("keys: A/D or LEFT/RIGHT = paddle, SPACE/W/UP = launch, R = reset, Q/ESC = quit", flush=True)
+        print("keys: A/D or LEFT/RIGHT = paddle, SPACE/W/UP = launch, X = debug clear, R = reset, Q/ESC = quit", flush=True)
     last_sensor_stage: str | None = None
     last_lateral: int | None = None
     last_player_id: int | None = None
@@ -2198,6 +2222,9 @@ def main(argv: Iterable[str] | None = None) -> int:
                     manual_launch = True
                 elif action == "reset":
                     game.reset(full=True)
+                elif action == "debug_clear":
+                    game.debug_clear()
+                    print("event=debug-clear", flush=True)
             frame_id += 1
             deadline += period
             sleep_time = deadline - time.monotonic()
