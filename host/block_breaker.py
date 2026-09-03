@@ -1021,8 +1021,8 @@ class BlockBreaker:
     boss_move_speed = 52.0
     clear_delay = 1.8
     beam_period = 3.6
-    beam_warning_duration = .60
-    beam_active_duration = .28
+    beam_warning_duration = 1.50
+    beam_active_duration = .10
 
     def __init__(
         self,
