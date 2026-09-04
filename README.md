@@ -123,6 +123,8 @@ ssh takemuralab@192.168.10.102 'systemctl status pi-client@2.service --no-pager'
 ## 文書
 
 - [`spec.md`](spec.md): 現行仕様の唯一の正典
+- [`docs/SYSTEM_ARCHITECTURE.md`](docs/SYSTEM_ARCHITECTURE.md): 現行構成・データフロー・処理ロジック図
+- [`docs/presentation/system-architecture-light.pptx`](docs/presentation/system-architecture-light.pptx): PowerPoint用の軽量構成図
 - [`docs/outdated_README.md`](docs/outdated_README.md): 退避した旧README
 - [`docs/outdated_spec.md`](docs/outdated_spec.md): 退避した旧開発計画書
 - [`docs/outdated_SYSTEM_ARCHITECTURE.md`](docs/outdated_SYSTEM_ARCHITECTURE.md): 退避した旧構成図
