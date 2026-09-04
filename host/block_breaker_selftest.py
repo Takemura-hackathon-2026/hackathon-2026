@@ -795,7 +795,9 @@ def main() -> int:
     beam_x = int(round(meka.boss_x + meka.boss_width / 2.0))
     if meka.lives != 3 or meka.serving or meka.beam_hit_remaining <= 0.0:
         errors.append("MEKA.TKMRのビーム被弾を残機減少前の演出状態へ移さない")
-    if int(beam_frame[int(meka.paddle_y) - 8, beam_x]) != 0x06:
+    # 着弾点の近傍は衝撃波の内周色 (0x0E) がレーザーへ重なるため、
+    # 衝撃波より上にあるレーザー本体を検査する。
+    if int(beam_frame[int(meka.paddle_y) - 20, beam_x]) != 0x06:
         errors.append("MEKA.TKMRのビーム被弾中にレーザー本体を表示しない")
     if meka.consume_life_loss_event():
         errors.append("MEKA.TKMRのビーム被弾直後に次球開始イベントを出す")
