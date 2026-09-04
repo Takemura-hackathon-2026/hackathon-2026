@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
 import tempfile
 from pathlib import Path
@@ -632,14 +633,148 @@ def main() -> int:
     # 土屋は5回のバリア、稲葉は頭上急所1回を通過して初めて撃破できる。
     tuchiya = BlockBreaker(boss_profile=next(profile for profile in BOSS_PROFILES if profile.key == "tuchiya"))
     shield_x, shield_y, shield_radius = tuchiya._barrier_geometry()
+    # 口元から内側を通ってバリアを抜ける初回射出は、攻撃として数えない。
+    tuchiya.boss_collision_armed = True
+    tuchiya._hit_boss()
+    if tuchiya.barrier_hits != 0:
+        errors.append("土屋の口元射出をバリア攻撃として数える")
+    # バリアの外へ出た後にだけ、バリア輪への接触を数える。
+    tuchiya.ball.x = shield_x
+    tuchiya.ball.y = shield_y - shield_radius - tuchiya.ball_radius - tuchiya.barrier_rearm_margin - 1
+    tuchiya.ball.vx, tuchiya.ball.vy = 0, 220
+    tuchiya._hit_boss()
+    if tuchiya.barrier_launch_immunity:
+        errors.append("土屋の球がバリア外へ出ても攻撃判定を有効化しない")
+    # バリアがある間、顔への接触はバリア回数を増やさない。
+    tuchiya.boss_collision_armed = True
+    tuchiya.ball.x = tuchiya.boss_x + tuchiya.boss_width / 2
+    tuchiya.ball.y = tuchiya.boss_y + tuchiya.boss_height / 2
+    tuchiya.ball.vx, tuchiya.ball.vy = 0, -220
+    tuchiya._hit_boss()
+    if tuchiya.barrier_hits != 0:
+        errors.append("土屋の顔への接触をバリア攻撃として数える")
+    # 左右の浅い角度からの高速衝突も、バリア外へ離れた後の新しい攻撃として数える。
+    for side in (-1, 1):
+        angled = BlockBreaker(boss_profile=next(profile for profile in BOSS_PROFILES if profile.key == "tuchiya"))
+        center_x, center_y, radius = angled._barrier_geometry()
+        distance = radius + angled.ball_radius - .25
+        angled.barrier_launch_immunity = False
+        angled.barrier_hit_armed = True
+        angled.boss_collision_armed = True
+        angled.ball.x = center_x + side * distance * .80
+        angled.ball.y = center_y - distance * .60
+        angled.ball.vx, angled.ball.vy = -side * 280, 210
+        angled._hit_boss()
+        if angled.barrier_hits != 1:
+            errors.append(f"土屋の{'左' if side < 0 else '右'}側高速バリア衝突を数えない")
+    # 1物理ステップで衝突帯を横切る高速球も、経路上の接点で反射・計上する。
+    swept = BlockBreaker(boss_profile=next(profile for profile in BOSS_PROFILES if profile.key == "tuchiya"))
+    center_x, center_y, radius = swept._barrier_geometry()
+    normal_x, normal_y = .80, -.60
+    outer_distance = radius + swept.ball_radius + 8.0
+    inner_distance = radius - swept.ball_radius - 3.0
+    previous = (center_x + normal_x * outer_distance, center_y + normal_y * outer_distance)
+    swept.barrier_launch_immunity = False
+    swept.barrier_hit_armed = True
+    swept.boss_collision_armed = True
+    swept.ball.x = center_x + normal_x * inner_distance
+    swept.ball.y = center_y + normal_y * inner_distance
+    swept.ball.vx, swept.ball.vy = -normal_x * 300, -normal_y * 300
+    swept._hit_boss(previous)
+    if swept.barrier_hits != 1:
+        errors.append("土屋の高速通過バリア衝突を数えない")
+    swept_distance = math.hypot(swept.ball.x - center_x, swept.ball.y - center_y)
+    if swept_distance <= radius + swept.ball_radius + 2.0:
+        errors.append("土屋の高速バリア反射後に球を衝突帯の外へ押し出さない")
+    # ボス移動で停止球にバリアが重なっただけでは、ヒットを増やさない。
+    stationary = BlockBreaker(boss_profile=next(profile for profile in BOSS_PROFILES if profile.key == "tuchiya"))
+    center_x, center_y, radius = stationary._barrier_geometry()
+    stationary.barrier_launch_immunity = False
+    stationary.barrier_hit_armed = True
+    stationary.boss_collision_armed = True
+    stationary.ball.x = center_x
+    stationary.ball.y = center_y - radius - stationary.ball_radius + .25
+    stationary.ball.vx = stationary.ball.vy = 0
+    stationary._hit_boss((stationary.ball.x, stationary.ball.y))
+    if stationary.barrier_hits != 0:
+        errors.append("土屋の停止球へのバリア重なりを攻撃として数える")
+    # ボス移動で前フレーム位置が現在の円に入って見える場合でも、内向きの球は
+    # 衝突として扱う。線分交差だけに依存するとこのケースがすり抜ける。
+    moved_boss = BlockBreaker(boss_profile=next(profile for profile in BOSS_PROFILES if profile.key == "tuchiya"))
+    center_x, center_y, radius = moved_boss._barrier_geometry()
+    moved_boss.barrier_launch_immunity = False
+    moved_boss.barrier_hit_armed = True
+    moved_boss.boss_collision_armed = True
+    moved_boss.ball.x = center_x + radius + moved_boss.ball_radius - .25
+    moved_boss.ball.y = center_y
+    moved_boss.ball.vx, moved_boss.ball.vy = -280, 0
+    moved_boss._hit_boss((moved_boss.ball.x, moved_boss.ball.y))
+    if moved_boss.barrier_hits != 1 or moved_boss.ball.vx <= 0:
+        errors.append("土屋の移動中ボスへの内向きバリア衝突を反射・計上しない")
+    # 高速反射後は、16pxの待ち距離を要求せず衝突帯を抜けた時点で次の有効接触を
+    # 受け付ける。待ち距離を大きくすると、浅い角度の高速往復でカウントが欠ける。
+    rapid_return = BlockBreaker(boss_profile=next(profile for profile in BOSS_PROFILES if profile.key == "tuchiya"))
+    center_x, center_y, radius = rapid_return._barrier_geometry()
+    rapid_return.barrier_launch_immunity = False
+    rapid_return.barrier_hit_armed = True
+    rapid_return.boss_collision_armed = True
+    rapid_return.ball.x = center_x + radius + rapid_return.ball_radius - .25
+    rapid_return.ball.y = center_y
+    rapid_return.ball.vx, rapid_return.ball.vy = -280, 0
+    rapid_return._hit_boss()
+    rapid_return.boss_collision_armed = True
+    rapid_return._hit_boss((rapid_return.ball.x, rapid_return.ball.y))
+    if not rapid_return.barrier_hit_armed:
+        errors.append("土屋の高速バリア反射後に接触帯外で再アームしない")
+    rapid_return.boss_collision_armed = True
+    rapid_return.ball.x = center_x - radius - rapid_return.ball_radius + .25
+    rapid_return.ball.y = center_y
+    rapid_return.ball.vx, rapid_return.ball.vy = 280, 0
+    rapid_return._hit_boss()
+    if rapid_return.barrier_hits != 2:
+        errors.append("土屋の高速往復バリア衝突を2回目に計上しない")
+    # 横からの反射後は衝突帯の外へ離れ、張り付き・連続点滅を起こさない。
+    side_bounce = BlockBreaker(boss_profile=next(profile for profile in BOSS_PROFILES if profile.key == "tuchiya"))
+    center_x, center_y, radius = side_bounce._barrier_geometry()
+    side_bounce.barrier_launch_immunity = False
+    side_bounce.barrier_hit_armed = True
+    side_bounce.boss_collision_armed = True
+    side_bounce.ball.x = center_x + radius + side_bounce.ball_radius - .25
+    side_bounce.ball.y = center_y
+    side_bounce.ball.vx, side_bounce.ball.vy = -280, 0
+    side_bounce._hit_boss()
+    separation = math.hypot(side_bounce.ball.x - center_x, side_bounce.ball.y - center_y)
+    if separation <= radius + side_bounce.ball_radius + 2.0:
+        errors.append("土屋の横バリア反射後に球を衝突帯の外へ押し出さない")
+    side_bounce.damage_effect_remaining = 0.0
+    side_bounce.boss_collision_armed = True
+    side_bounce._hit_boss()
+    if side_bounce.barrier_hits != 1 or side_bounce.damage_effect_remaining != 0.0:
+        errors.append("土屋の横バリア反射後に張り付き衝突を再計上する")
     for hit in range(5):
+        # 前回のバリア命中から16px以上離れた、新しい攻撃だけを受け付ける。
+        tuchiya.ball.x = shield_x
+        tuchiya.ball.y = shield_y - shield_radius - tuchiya.ball_radius - tuchiya.barrier_rearm_margin - 1
+        tuchiya.ball.vx, tuchiya.ball.vy = 0, 220
+        tuchiya._hit_boss()
         tuchiya.boss_collision_armed = True
         tuchiya.ball.x = shield_x
         tuchiya.ball.y = shield_y - shield_radius - tuchiya.ball_radius + .25
         tuchiya.ball.vx, tuchiya.ball.vy = 0, 220
         tuchiya._hit_boss()
+        if hit == 0:
+            # 反射直後に同じ場所で再判定しても、同一ヒットを重複計上しない。
+            tuchiya.boss_collision_armed = True
+            tuchiya._hit_boss()
+            if tuchiya.barrier_hits != 1:
+                errors.append("土屋のバリア衝突を1回で重複計上する")
+        if hit < 4 and tuchiya.barrier_broken:
+            errors.append("土屋のバリアが5回未満で壊れる")
     if not tuchiya.barrier_broken or tuchiya.boss_hp != tuchiya.boss_max_hp:
         errors.append("土屋の5回バリアが規定回数で壊れない")
+    tuchiya._lose_ball(99.0)
+    if tuchiya.barrier_broken or tuchiya.barrier_hits != 0 or not tuchiya.barrier_launch_immunity:
+        errors.append("土屋がボールロスト後にバリアを完全復活しない")
 
     inaba = BlockBreaker(boss_profile=next(profile for profile in BOSS_PROFILES if profile.key == "inaba"))
     inaba.boss_collision_armed = True
@@ -656,8 +791,18 @@ def main() -> int:
     meka.beam_phase = meka.beam_period - .05
     meka.paddle_x = meka.boss_x + meka.boss_width / 2 - meka.paddle_width / 2
     meka.step(.01, GameInput(), 1.0)
+    beam_frame = meka.render("READY")
+    beam_x = int(round(meka.boss_x + meka.boss_width / 2.0))
+    if meka.lives != 3 or meka.serving or meka.beam_hit_remaining <= 0.0:
+        errors.append("MEKA.TKMRのビーム被弾を残機減少前の演出状態へ移さない")
+    if int(beam_frame[int(meka.paddle_y) - 8, beam_x]) != 0x06:
+        errors.append("MEKA.TKMRのビーム被弾中にレーザー本体を表示しない")
+    if meka.consume_life_loss_event():
+        errors.append("MEKA.TKMRのビーム被弾直後に次球開始イベントを出す")
+    for step in range(math.ceil(meka.beam_hit_duration / .04)):
+        meka.step(.04, GameInput(), 1.01 + step * .04)
     if meka.lives != 2 or not meka.consume_life_loss_event():
-        errors.append("MEKA.TKMRのビームがパドルに当たった時に残機を減らさない")
+        errors.append("MEKA.TKMRのビーム演出後に残機を減らさない")
     for error in errors:
         print(f"ERROR: {error}")
     print(f"{len(errors)} errors")

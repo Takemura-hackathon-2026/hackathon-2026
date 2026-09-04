@@ -1245,6 +1245,8 @@ class BlockBreaker:
     beam_period = 3.6
     beam_warning_duration = 1.50
     beam_active_duration = .10
+    beam_hit_duration = .42
+    barrier_rearm_margin = 16.0
 
     def __init__(
         self,
@@ -1282,6 +1284,11 @@ class BlockBreaker:
         self.boss_hp = self.boss_max_hp
         self.barrier_hits = 0
         self.barrier_broken = not bool(boss_profile.barrier_hits_required)
+        # 口元はバリアの内側にある。最初の射出で内側からバリアを抜ける時は、
+        # 顔・バリアのどちらも攻撃として扱わない。
+        self.barrier_launch_immunity = bool(boss_profile.barrier_hits_required)
+        # バリアを1回当てた後は、衝突帯の外へ出るまで次のヒットを受け付けない。
+        self.barrier_hit_armed = False
         self.critical_hits = 0
         self.boss_defeated = False
         self.paddle_x = 0.0
@@ -1301,6 +1308,7 @@ class BlockBreaker:
         self.boss_base_x = self.boss_x
         self.boss_base_y = self.boss_y
         self.beam_phase = 0.0
+        self.beam_hit_remaining = 0.0
         self.clear_remaining = 0.0
         self.game_over_until = 0.0
         self.reset(full=True)
@@ -1330,6 +1338,8 @@ class BlockBreaker:
             self.boss_hp = self.boss_max_hp
             self.barrier_hits = 0
             self.barrier_broken = not bool(self.boss_profile.barrier_hits_required)
+            self.barrier_launch_immunity = bool(self.boss_profile.barrier_hits_required)
+            self.barrier_hit_armed = False
             self.critical_hits = 0
             self.boss_defeated = False
             self.game_started = False
@@ -1348,6 +1358,7 @@ class BlockBreaker:
             self.boss_move_vx = self.boss_move_speed
             self.boss_move_phase = 0.0
             self.beam_phase = 0.0
+            self.beam_hit_remaining = 0.0
             self._set_boss_orientation()
             self.clear_remaining = 0.0
             self.game_over_until = 0.0
@@ -1366,6 +1377,7 @@ class BlockBreaker:
         self.serving = False
         self.game_started = True
         self.beam_phase = 0.0
+        self.beam_hit_remaining = 0.0
         self.life_loss_feedback_active = False
         self.life_loss_blink_elapsed = 0.0
         self.life_loss_slot = -1
@@ -1411,6 +1423,52 @@ class BlockBreaker:
         distance = math.hypot(self.ball.x - center_x, self.ball.y - center_y)
         return abs(distance - radius) <= self.ball_radius + 2.0
 
+    def _swept_barrier_contact(
+        self, previous_position: tuple[float, float] | None
+    ) -> tuple[float, float, float, float] | None:
+        """外側からバリアへ入る球の経路と外周との最初の接点を返す。"""
+        if previous_position is None:
+            return None
+        center_x, center_y, radius = self._barrier_geometry()
+        collision_radius = radius + self.ball_radius + 2.0
+        start_x, start_y = previous_position
+        start_dx, start_dy = start_x - center_x, start_y - center_y
+        if start_dx * start_dx + start_dy * start_dy <= collision_radius * collision_radius:
+            return None
+        move_x, move_y = self.ball.x - start_x, self.ball.y - start_y
+        move_length_sq = move_x * move_x + move_y * move_y
+        if move_length_sq <= 1e-9:
+            return None
+        linear = 2.0 * (start_dx * move_x + start_dy * move_y)
+        constant = start_dx * start_dx + start_dy * start_dy - collision_radius * collision_radius
+        discriminant = linear * linear - 4.0 * move_length_sq * constant
+        if discriminant < -1e-7:
+            return None
+        root = math.sqrt(max(0.0, discriminant))
+        roots = ((-linear - root) / (2.0 * move_length_sq), (-linear + root) / (2.0 * move_length_sq))
+        contact_t = next((value for value in roots if 0.0 <= value <= 1.0), None)
+        if contact_t is None:
+            return None
+        contact_outer_x = start_x + move_x * contact_t
+        contact_outer_y = start_y + move_y * contact_t
+        normal_x, normal_y = contact_outer_x - center_x, contact_outer_y - center_y
+        normal_length = math.hypot(normal_x, normal_y) or 1.0
+        normal_x, normal_y = normal_x / normal_length, normal_y / normal_length
+        return normal_x, normal_y, center_x + normal_x * radius, center_y + normal_y * radius
+
+    def _is_outside_barrier_rearm_zone(self) -> bool:
+        """口元から射出した球がバリアの外へ完全に出たかを返す。"""
+        center_x, center_y, radius = self._barrier_geometry()
+        distance = math.hypot(self.ball.x - center_x, self.ball.y - center_y)
+        return distance > radius + self.ball_radius + self.barrier_rearm_margin
+
+    def _is_outside_barrier_contact_zone(self) -> bool:
+        """直前のバリア衝突から離れ、新しい接触を受け付けられるかを返す。"""
+        center_x, center_y, radius = self._barrier_geometry()
+        distance = math.hypot(self.ball.x - center_x, self.ball.y - center_y)
+        # _ball_hits_barrier() と同じ衝突帯の外へ出れば、反射後の連続接触ではない。
+        return distance > radius + self.ball_radius + 2.0
+
     def _boss_contact_normal(self) -> tuple[float, float, float, float]:
         """ボール中心に最も近い不透明輪郭点と、そこから外向きの法線を返す。"""
         if len(self.boss_edge_points) == 0:
@@ -1439,18 +1497,41 @@ class BlockBreaker:
             nx, ny, length = -self.ball.vx, -self.ball.vy, speed
         return nx / length, ny / length, contact_x, contact_y
 
-    def _hit_boss(self) -> bool:
+    def _hit_boss(self, previous_position: tuple[float, float] | None = None) -> bool:
+        if self.barrier_launch_immunity:
+            if not self._is_outside_barrier_rearm_zone():
+                return False
+            self.barrier_launch_immunity = False
+            self.barrier_hit_armed = True
+        elif (
+            self.boss_profile.barrier_hits_required
+            and not self.barrier_broken
+            and not self.barrier_hit_armed
+            and self._is_outside_barrier_contact_zone()
+        ):
+            self.barrier_hit_armed = True
+        barrier_active = bool(self.boss_profile.barrier_hits_required and not self.barrier_broken)
+        swept_barrier_contact = self._swept_barrier_contact(previous_position) if barrier_active else None
+        barrier_overlap = self._ball_hits_barrier()
         body_overlap = self._ball_overlaps_boss()
         critical_overlap = self._ball_hits_critical()
-        barrier_overlap = self._ball_hits_barrier()
-        overlaps = body_overlap or critical_overlap or barrier_overlap
+        barrier_contact = barrier_overlap or swept_barrier_contact is not None
+        overlaps = body_overlap or critical_overlap or barrier_contact
         if not self.boss_collision_armed:
             if not overlaps:
                 self.boss_collision_armed = True
             return False
+        # バリアが有効な間は、顔に直接重なっても顔への当たり判定を使わない。
+        # バリア輪に届いていない球はここで止める。
+        if barrier_active and not barrier_contact:
+            return False
         if not overlaps or self.boss_defeated:
             return False
-        if barrier_overlap and not body_overlap and not critical_overlap:
+        # バリアが有効な間は、顔の輪郭と重なって見える位置でも必ず
+        # 円形バリアを先に判定する。顔の法線で反射させない。
+        if swept_barrier_contact is not None:
+            nx, ny, contact_x, contact_y = swept_barrier_contact
+        elif barrier_contact:
             center_x, center_y, radius = self._barrier_geometry()
             nx, ny = self.ball.x - center_x, self.ball.y - center_y
             length = math.hypot(nx, ny) or 1.0
@@ -1462,21 +1543,41 @@ class BlockBreaker:
         else:
             nx, ny, contact_x, contact_y = self._boss_contact_normal()
         incoming = self.ball.vx * nx + self.ball.vy * ny
+        if barrier_contact:
+            # 基本は前フレームからの線分と円の交差で高速球を拾う。ただし、ボスが
+            # 同じフレームに移動すると、前フレームの球が「現在の」円の内側に見えて
+            # 線分交差を作れないことがある。その場合も、球が円の内側へ向かう速度を
+            # 持っていれば実際の接触として反射する。停止球・外向きの球は除外するため、
+            # 張り付きや連続点滅には戻らない。
+            barrier_entry = swept_barrier_contact is not None or incoming < -1e-6
+            if not barrier_entry:
+                return False
+        else:
+            barrier_entry = False
+        # 反射後にバリア外へ向かう球を再び内側へ跳ね返さない。これを許すと
+        # 横方向の衝突で円周に張り付き、毎フレーム点滅する。
         # 法線方向へ離れている接触は、前フレームの押し出しが残っただけなので無視する。
-        if incoming >= 0.0 and not barrier_overlap:
+        if incoming >= 0.0 and not barrier_contact:
             return False
         self.ball.vx -= 2.0 * incoming * nx
         self.ball.vy -= 2.0 * incoming * ny
-        # 輪郭からボール半径+1pxだけ外へ押し出し、同じ衝突を連続計上しない。
-        self.ball.x = contact_x + nx * (self.ball_radius + 1.0)
-        self.ball.y = contact_y + ny * (self.ball_radius + 1.0)
-        self.damage_effect_remaining = self.damage_effect_duration
+        # バリア衝突では衝突帯（半径+2px）の外まで押し出す。
+        # 余白が足りないと、横方向の反射で次フレームも円周に触れ続ける。
+        separation = self.ball_radius + 3.0 if barrier_contact else self.ball_radius + 1.0
+        self.ball.x = contact_x + nx * separation
+        self.ball.y = contact_y + ny * separation
         profile = self.boss_profile
         if profile.barrier_hits_required and not self.barrier_broken:
-            self.barrier_hits += 1
-            if self.barrier_hits >= profile.barrier_hits_required:
-                self.barrier_broken = True
+            # 顔への接触をバリア攻撃として数えない。バリア輪へ外側から
+            # 当たった時だけ1回とし、反射後は衝突帯の外へ出るまで再アームしない。
+            if barrier_entry and self.barrier_hit_armed:
+                self.barrier_hits += 1
+                self.barrier_hit_armed = False
+                self.damage_effect_remaining = self.damage_effect_duration
+                if self.barrier_hits >= profile.barrier_hits_required:
+                    self.barrier_broken = True
             return True
+        self.damage_effect_remaining = self.damage_effect_duration
         if profile.critical_hits_required:
             if not critical_overlap:
                 return True
@@ -1492,6 +1593,7 @@ class BlockBreaker:
         return True
 
     def _lose_ball(self, now: float) -> None:
+        self.beam_hit_remaining = 0.0
         self.lives -= 1
         # main() が次球用カウントダウンを始めるための一度きりのイベント。
         self.life_loss_event = self.lives > 0
@@ -1506,8 +1608,11 @@ class BlockBreaker:
             self.life_loss_slot = self.lives
         self.serving = True
         self.boss_collision_armed = False
-        if self.boss_profile.barrier_hits_required and not self.barrier_broken:
+        if self.boss_profile.barrier_hits_required:
             self.barrier_hits = 0
+            self.barrier_broken = False
+            self.barrier_launch_immunity = True
+            self.barrier_hit_armed = False
         self.ball.vx = self.ball.vy = 0.0
         self._place_ball_at_mouth()
 
@@ -1528,6 +1633,13 @@ class BlockBreaker:
     def step(self, dt: float, controls: GameInput, now: float) -> None:
         dt = min(.04, max(0.0, dt))
         self.damage_effect_remaining = max(0.0, self.damage_effect_remaining - dt)
+        # ビーム被弾は、レーザーと着弾エフェクトを見せてから残機を減らす。
+        # ここでゲーム進行を止めることで、表示中にビームが消えたり二重被弾したりしない。
+        if self.beam_hit_remaining > 0.0:
+            self.beam_hit_remaining = max(0.0, self.beam_hit_remaining - dt)
+            if self.beam_hit_remaining == 0.0:
+                self._lose_ball(now)
+            return
         if self.life_loss_feedback_active:
             self.life_loss_blink_elapsed += dt
         if self.boss_transition_remaining > 0.0:
@@ -1590,11 +1702,13 @@ class BlockBreaker:
             if beam_active:
                 beam_x = self.boss_x + self.boss_width / 2.0
                 if self.paddle_x - self.ball_radius <= beam_x <= self.paddle_x + self.paddle_width + self.ball_radius:
-                    self._lose_ball(now)
+                    self.beam_hit_remaining = self.beam_hit_duration
+                    self.ball.vx = self.ball.vy = 0.0
                     return
         steps = max(1, min(8, math.ceil(math.hypot(self.ball.vx * dt, self.ball.vy * dt) / 2)))
         for _ in range(steps):
             ball = self.ball
+            previous_position = (ball.x, ball.y)
             ball.x += ball.vx * dt / steps
             ball.y += ball.vy * dt / steps
             if ball.x - self.ball_radius < 0 or ball.x + self.ball_radius >= CANVAS_WIDTH:
@@ -1608,7 +1722,7 @@ class BlockBreaker:
                 speed = min(300, math.hypot(ball.vx, ball.vy) * 1.015)
                 ball.vx = speed * hit * .92
                 ball.vy = -max(80, math.sqrt(max(1, speed * speed - ball.vx * ball.vx)))
-            if self._hit_boss():
+            if self._hit_boss(previous_position):
                 return
             if ball.y - self.ball_radius > CANVAS_HEIGHT:
                 self._lose_ball(now)
@@ -1634,6 +1748,7 @@ class BlockBreaker:
         start_mode: str = "arm-circle",
         start_hold_remaining: float | None = None,
         palette_mode: PaletteMode = PaletteMode.FC6,
+        debug_overlay: bool = False,
     ) -> np.ndarray:
         colors = GAME_COLORS[palette_mode]
         frame = np.full((CANVAS_HEIGHT, CANVAS_WIDTH), colors.sky, np.uint8)
@@ -1647,7 +1762,12 @@ class BlockBreaker:
         if fill:
             hp_color = colors.hp_high if self.boss_hp > 50 else colors.hp_mid if self.boss_hp > 20 else colors.hp_low
             frame[hp_y + 2:hp_y + hp_height - 2, hp_x + 2:hp_x + 2 + fill] = hp_color
-        active_play = not self.serving and not self.boss_defeated and not self.game_over_until
+        active_play = (
+            not self.serving
+            and not self.boss_defeated
+            and not self.game_over_until
+            and self.beam_hit_remaining <= 0.0
+        )
         show_lives = self.game_started and not self.boss_defeated and not self.game_over_until
         if show_lives:
             for life in range(self.lives):
@@ -1682,6 +1802,14 @@ class BlockBreaker:
             shield_center = (boss_x + self.boss_width // 2, boss_y + self.boss_height // 2)
             shield_radius = max(self.boss_width, self.boss_height) // 2 + 7
             cv2.circle(frame, shield_center, shield_radius, barrier_color, 2, lineType=cv2.LINE_8)
+            if debug_overlay:
+                self._text(
+                    frame,
+                    f"SHIELD {self.barrier_hits}/{self.boss_profile.barrier_hits_required}",
+                    (7, 33),
+                    colors.text,
+                    .30,
+                )
         if self.boss_profile.critical_hits_required and not self.boss_defeated:
             critical_x, critical_y = self._critical_point()
             marker_color = palette_color(0x06 if int(time.monotonic() * 7) % 2 else 0x16)
@@ -1697,7 +1825,10 @@ class BlockBreaker:
             cv2.circle(frame, (int(round(critical_x)), int(round(critical_y))), 8, marker_color, 1, lineType=cv2.LINE_8)
         if self.boss_profile.beam_attack and self.game_started and not self.serving and not self.boss_defeated:
             beam_warning = self.beam_phase >= self.beam_period - self.beam_warning_duration
-            beam_active = self.beam_phase >= self.beam_period - self.beam_active_duration
+            beam_active = (
+                self.beam_phase >= self.beam_period - self.beam_active_duration
+                or self.beam_hit_remaining > 0.0
+            )
             if beam_warning:
                 beam_x = int(round(self.boss_x + self.boss_width / 2.0))
                 beam_top = max(26, boss_y + self.boss_height)
@@ -1709,6 +1840,11 @@ class BlockBreaker:
                 else:
                     for line_y in range(beam_top, beam_bottom, 8):
                         frame[line_y:line_y + 2, max(0, beam_x - 1):min(CANVAS_WIDTH, beam_x + 2)] = palette_color(0x0E)
+                if self.beam_hit_remaining > 0.0:
+                    impact_x, impact_y = beam_x, int(round(self.paddle_y))
+                    pulse = 7 + int((self.beam_hit_remaining / self.beam_hit_duration) * 6)
+                    cv2.circle(frame, (impact_x, impact_y), pulse, palette_color(0x06), 2, lineType=cv2.LINE_8)
+                    cv2.circle(frame, (impact_x, impact_y), max(2, pulse - 5), palette_color(0x0E), 1, lineType=cv2.LINE_8)
         # 名前は登場〜最初のスタート待ちだけ表示し、プレイ中の情報量を抑える。
         if self.serving and not self.game_started and not self.boss_defeated:
             self._center_text(frame, self.boss_profile.display_name, 150, colors.text, .42)
@@ -1925,6 +2061,16 @@ class ClassicThenBoss:
         self.lives = 3
         self.boss = BlockBreaker(boss_profile=profile, auto_reset_on_clear=False)
 
+    def start_debug_boss(self, key: str) -> None:
+        """指定ボスだけを、通常面・WARNINGなしでデバッグ開始する。"""
+        profile = next((candidate for candidate in BOSS_PROFILES if candidate.key == key), None)
+        if profile is None:
+            raise ValueError(f"未登録のデバッグボス: {key}")
+        self._start_boss(profile)
+        self.phase = "boss"
+        self.warning_remaining = 0.0
+        self._stage_start_request = False
+
     def _advance_boss(self) -> None:
         if self.boss_index + 1 < len(self.boss_order):
             self.boss_index += 1
@@ -2125,6 +2271,7 @@ class ClassicThenBoss:
         start_mode: str = "arm-circle",
         start_hold_remaining: float | None = None,
         palette_mode: PaletteMode = PaletteMode.FC6,
+        debug_overlay: bool = False,
     ) -> np.ndarray:
         if self.phase == "warning":
             frame = self._render_warning()
@@ -2138,6 +2285,7 @@ class ClassicThenBoss:
                 start_mode,
                 start_hold_remaining,
                 palette_mode=PaletteMode.FC6,
+                debug_overlay=debug_overlay,
             )
         else:
             frame = self._render_classic(sensor_stage, boundaries, countdown, start_mode, start_hold_remaining)
@@ -2212,6 +2360,11 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--palette", choices=("fc6", "msx16"), default="fc6", help="送出パレット（既定FC6）")
     result.add_argument("--frames", type=int, default=0)
     result.add_argument("--seconds", type=float, default=0.0)
+    result.add_argument(
+        "--debug-boss",
+        choices=tuple(profile.key for profile in BOSS_PROFILES),
+        help="通常面・WARNINGを省き、指定ボスだけをデバッグ開始する",
+    )
     result.add_argument("--send", action="store_true")
     result.add_argument("--pi", action="append", default=[], metavar="HOST[:PORT]")
     result.add_argument("--chunk-size", type=int, default=1200)
@@ -2456,6 +2609,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         return 2
     keyboard_state = create_keyboard_state() if not args.no_preview else None
     game, running, frame_id = ClassicThenBoss(), True, 0
+    if args.debug_boss:
+        game.start_debug_boss(args.debug_boss)
     follower = PaddleFollower(
         CANVAS_WIDTH,
         game.paddle_width,
@@ -2482,6 +2637,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         f"start_mode={args.start_mode} countdown={args.start_countdown_seconds:.1f}s",
         flush=True,
     )
+    if args.debug_boss:
+        print(f"debug_boss={args.debug_boss}", flush=True)
     if args.start_mode == "arm-circle" and learned_start:
         print(f"start calibration=learned path={calibration_path}", flush=True)
     elif args.start_mode == "arm-circle":
@@ -2618,6 +2775,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 args.start_mode,
                 body.start_hold_remaining,
                 palette_mode=output_palette,
+                debug_overlay=bool(args.debug_boss),
             )
             palette_limit = FC6_LIMIT if output_palette == PaletteMode.FC6 else MSX16_LIMIT
             if (
